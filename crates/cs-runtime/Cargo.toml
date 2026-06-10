@@ -94,9 +94,11 @@ web-modules = ["web", "cs-web/modules"]
 # grpc-respond-error!). Reuses cs-web's hyper transport + the
 # cs-actor mailbox bridge, so it implies `web` (and thus `actor`).
 # Default off — gRPC framing + trailers are only needed by the
-# etcd-compatible store (crab-watchstore). TLS/mTLS for gRPC is a
-# separate concern; this serves insecure h2c (which etcd permits).
-grpc = ["web", "cs-web/grpc"]
+# etcd-compatible store (crab-watchstore). Enables BOTH the h2c
+# transport (`cs-web/grpc`) and the TLS/mTLS variant
+# (`cs-web/grpc-tls`): `grpc-serve-tls` + `grpc-request-peer-identity`
+# (cw-u4a.21) ride alongside the cleartext `grpc-serve`.
+grpc = ["web", "cs-web/grpc", "cs-web/grpc-tls"]
 
 # ----- (crab …) stdlib modules — see .spec-workflow/specs/stdlib-modules
 #

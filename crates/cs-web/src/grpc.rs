@@ -65,6 +65,18 @@ use tokio::sync::mpsc;
 
 use crate::WebError;
 
+// TLS / mutual-TLS for the gRPC transport (cw-u4a.21). Additive over
+// the h2c path above: the same `GrpcHandler` + `GrpcBody` run, with a
+// rustls-terminated stream replacing the cleartext one.
+#[cfg(feature = "grpc-tls")]
+use rustls::server::WebPkiClientVerifier;
+#[cfg(feature = "grpc-tls")]
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
+#[cfg(feature = "grpc-tls")]
+use std::path::Path;
+#[cfg(feature = "grpc-tls")]
+use tokio_rustls::TlsAcceptor;
+
 /// A de-framed gRPC request message handed to the handler.
 ///
 /// `path` is the HTTP/2 `:path`, e.g. `/etcdserverpb.KV/Range`.
@@ -76,6 +88,15 @@ use crate::WebError;
 pub struct GrpcRequest {
     pub path: String,
     pub message: Bytes,
+    /// The verified peer (client-certificate) identity for this call,
+    /// or `None` on a non-TLS (h2c) connection, or a TLS connection
+    /// with no client certificate. Set by [`serve_grpc_tls`] once the
+    /// mTLS handshake has completed and rustls has verified the client
+    /// cert chains to the configured CA: the leaf cert's first SAN
+    /// (DNS, then URI, then IP), else its Subject CN. This is the
+    /// etcd-Auth-over-TLS hook (`.26`) — the Scheme handler reads it
+    /// via `grpc-request-peer-identity`.
+    pub peer_identity: Option<Arc<str>>,
 }
 
 // ---------------------------------------------------------------
@@ -387,6 +408,7 @@ fn build_response(rx: mpsc::UnboundedReceiver<GrpcFrame>) -> Response<GrpcBody> 
 async fn handle_call(
     handler: ArcGrpcHandler,
     req: http::Request<Incoming>,
+    peer_identity: Option<Arc<str>>,
 ) -> Result<Response<GrpcBody>, Infallible> {
     let path = req.uri().path().to_string();
     let call_id = next_call_id();
@@ -411,6 +433,7 @@ async fn handle_call(
         GrpcRequest {
             path,
             message: first,
+            peer_identity,
         },
         sink,
     );
@@ -481,7 +504,9 @@ where
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req: http::Request<Incoming>| {
                 let handler = Arc::clone(&handler);
-                async move { handle_call(handler, req).await }
+                // h2c is cleartext: there is no client certificate, so the
+                // per-call peer identity is always `None`.
+                async move { handle_call(handler, req, None).await }
             });
             // Prior-knowledge h2c: serve HTTP/2 directly on the
             // cleartext socket. `TokioExecutor` lets request futures
@@ -506,6 +531,240 @@ pub async fn bind_grpc(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), We
         .map_err(|e| WebError::Bind { addr, source: e })?;
     let local = listener.local_addr()?;
     Ok((listener, local))
+}
+
+// ---------------------------------------------------------------
+// TLS / mutual-TLS (mTLS) gRPC transport (cw-u4a.21).
+//
+// Same `GrpcHandler` + `GrpcBody` machinery as the h2c path above; the
+// only difference is the socket is rustls-terminated and, when mTLS is
+// required, the client certificate is verified against a CA bundle
+// before any gRPC frame is read. ALPN is fixed to `h2` (gRPC is always
+// HTTP/2). The verified peer identity is surfaced per call via
+// `GrpcRequest::peer_identity` — the etcd-Auth-over-TLS hook.
+// ---------------------------------------------------------------
+
+/// Build a rustls [`ServerConfig`](RustlsServerConfig) for the gRPC TLS
+/// path from PEM files on disk.
+///
+/// - `cert_pem` / `key_pem` — this server's certificate chain + private
+///   key (the leaf should carry a SAN matching the endpoint clients dial,
+///   e.g. `IP:127.0.0.1` / `DNS:localhost`).
+/// - `ca_pem` — the trust anchor(s) for verifying *client* certificates.
+/// - `require_client_cert`:
+///   - `true` → **mutual TLS, require-and-verify**: a connection that
+///     presents no client certificate, or one that does not chain to
+///     `ca_pem`, is rejected at the TLS layer (rustls'
+///     [`WebPkiClientVerifier`], with no anonymous fallback).
+///   - `false` → **plain server TLS** (`with_no_client_auth`): the wire
+///     is encrypted but no client certificate is requested, so
+///     `GrpcRequest::peer_identity` is always `None`.
+///
+/// ALPN is set to `h2` only — a gRPC client MUST negotiate HTTP/2.
+#[cfg(feature = "grpc-tls")]
+pub fn grpc_server_tls_config(
+    cert_pem: impl AsRef<Path>,
+    key_pem: impl AsRef<Path>,
+    ca_pem: impl AsRef<Path>,
+    require_client_cert: bool,
+) -> Result<Arc<RustlsServerConfig>, WebError> {
+    // rustls needs a crypto provider installed before any builder runs;
+    // idempotent, so racing servers/tests are fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert_bytes = std::fs::read(cert_pem.as_ref())
+        .map_err(|e| WebError::Tls(format!("read server cert: {e}")))?;
+    let certs = rustls_pemfile::certs(&mut cert_bytes.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| WebError::Tls(format!("parse server cert pem: {e}")))?;
+    if certs.is_empty() {
+        return Err(WebError::Tls("no server certs in PEM".into()));
+    }
+    let key_bytes = std::fs::read(key_pem.as_ref())
+        .map_err(|e| WebError::Tls(format!("read server key: {e}")))?;
+    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())
+        .map_err(|e| WebError::Tls(format!("parse server key pem: {e}")))?
+        .ok_or_else(|| WebError::Tls("no private key in server PEM".into()))?;
+
+    let mut cfg = if require_client_cert {
+        // mTLS: build a CA trust store and require a verified client cert.
+        let ca_bytes =
+            std::fs::read(ca_pem.as_ref()).map_err(|e| WebError::Tls(format!("read ca: {e}")))?;
+        let mut roots = RootCertStore::empty();
+        for ca in rustls_pemfile::certs(&mut ca_bytes.as_slice()) {
+            let ca = ca.map_err(|e| WebError::Tls(format!("parse ca pem: {e}")))?;
+            roots
+                .add(ca)
+                .map_err(|e| WebError::Tls(format!("add ca root: {e}")))?;
+        }
+        if roots.is_empty() {
+            return Err(WebError::Tls("no CA certs in PEM".into()));
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| WebError::Tls(format!("client cert verifier: {e}")))?;
+        RustlsServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| WebError::Tls(format!("server config (mtls): {e}")))?
+    } else {
+        // Plain server TLS: encrypt, but don't request a client cert.
+        RustlsServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| WebError::Tls(format!("server config (tls): {e}")))?
+    };
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// Extract a stable identity string from the verified peer (client)
+/// certificate of a completed TLS connection, or `None` if the peer
+/// presented no certificate.
+///
+/// Preference order (the etcd-Auth identity contract): the leaf cert's
+/// first Subject Alternative Name of type DNS, then URI, then IP; if it
+/// has no usable SAN, its Subject Common Name (CN). The chain itself was
+/// already verified by rustls' [`WebPkiClientVerifier`] — this only
+/// reads the now-trusted leaf to name it.
+#[cfg(feature = "grpc-tls")]
+fn extract_peer_identity(conn: &rustls::ServerConnection) -> Option<String> {
+    let certs = conn.peer_certificates()?;
+    let leaf = certs.first()?;
+    identity_from_cert_der(leaf.as_ref())
+}
+
+/// SAN/CN identity from a single DER-encoded X.509 certificate. Split
+/// out from [`extract_peer_identity`] so it is unit-testable without a
+/// live TLS connection.
+#[cfg(feature = "grpc-tls")]
+fn identity_from_cert_der(der: &[u8]) -> Option<String> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    // SAN first: prefer DNS, then URI, then IP (RFC 5280 GeneralName).
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        let mut dns = None;
+        let mut uri = None;
+        let mut ip = None;
+        for gn in &san.value.general_names {
+            match gn {
+                GeneralName::DNSName(d) if dns.is_none() => dns = Some((*d).to_string()),
+                GeneralName::URI(u) if uri.is_none() => uri = Some((*u).to_string()),
+                GeneralName::IPAddress(b) if ip.is_none() => ip = Some(format_ip(b)),
+                _ => {}
+            }
+        }
+        if let Some(v) = dns.or(uri).or(ip) {
+            return Some(v);
+        }
+    }
+    // Fall back to the Subject CN. Bind into a local so the iterator
+    // temporary (which borrows `cert`) is dropped at the `;`, before
+    // `cert` itself — otherwise it outlives `cert` as a tail temporary.
+    let subject = cert.subject();
+    let cn = subject
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(|s| s.to_string());
+    cn
+}
+
+/// Format a SAN `iPAddress` octet string (4 bytes → IPv4 dotted, 16 →
+/// IPv6) for use as an identity string.
+#[cfg(feature = "grpc-tls")]
+fn format_ip(b: &[u8]) -> String {
+    match b.len() {
+        4 => std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string(),
+        16 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(b);
+            std::net::Ipv6Addr::from(o).to_string()
+        }
+        _ => b.iter().map(|x| format!("{x:02x}")).collect(),
+    }
+}
+
+/// Run an mTLS/TLS gRPC accept loop on `listener`, terminating TLS with
+/// `tls_config` (build it with [`grpc_server_tls_config`]) and serving
+/// every request through `handler` exactly as the h2c [`serve_grpc`]
+/// does — unary and streaming alike.
+///
+/// Each accepted TCP connection runs its TLS handshake on its own tokio
+/// task (a slow or failed handshake never blocks the accept loop). When
+/// the config requires a client certificate, rustls rejects any peer
+/// that fails verification *before* a single gRPC frame is read. After
+/// the handshake the verified peer identity is captured once and handed
+/// to the handler on every call of that connection
+/// ([`GrpcRequest::peer_identity`]).
+///
+/// `shutdown` is an optional future that breaks the accept loop when it
+/// resolves. Returns the number of TCP connections accepted (a failed
+/// handshake counts here but never reaches the handler).
+#[cfg(feature = "grpc-tls")]
+pub async fn serve_grpc_tls<F>(
+    listener: TcpListener,
+    tls_config: Arc<RustlsServerConfig>,
+    handler: ArcGrpcHandler,
+    shutdown: Option<F>,
+) -> Result<u64, WebError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let acceptor = TlsAcceptor::from(tls_config);
+    let mut count: u64 = 0;
+    let mut shutdown = shutdown.map(Box::pin);
+    loop {
+        let next = match shutdown.as_mut() {
+            Some(s) => tokio::select! {
+                _ = s => break,
+                a = listener.accept() => a,
+            },
+            None => listener.accept().await,
+        };
+        let (stream, _peer) = match next {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("cs-web grpc-tls: accept error: {e}");
+                continue;
+            }
+        };
+        count = count.wrapping_add(1);
+
+        let handler = Arc::clone(&handler);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                // A handshake failure here is exactly the require-and-verify
+                // rejection (missing/invalid client cert): the connection
+                // never reaches the gRPC handler.
+                Err(e) => {
+                    eprintln!("cs-web grpc-tls: handshake error: {e}");
+                    return;
+                }
+            };
+            // Handshake done + (for mTLS) client cert verified. Name the
+            // peer once; every call on this connection shares the identity.
+            let peer_identity: Option<Arc<str>> =
+                extract_peer_identity(tls_stream.get_ref().1).map(Arc::from);
+            let io = TokioIo::new(tls_stream);
+            let svc = service_fn(move |req: http::Request<Incoming>| {
+                let handler = Arc::clone(&handler);
+                let peer_identity = peer_identity.clone();
+                async move { handle_call(handler, req, peer_identity).await }
+            });
+            // gRPC is always HTTP/2; ALPN negotiated `h2` during the
+            // handshake. Serve it over the TLS-wrapped stream.
+            if let Err(err) = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await
+            {
+                eprintln!("cs-web grpc-tls: connection error: {err}");
+            }
+        });
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

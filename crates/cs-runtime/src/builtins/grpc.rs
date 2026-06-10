@@ -27,7 +27,14 @@
 //! (grpc-serve "127.0.0.1:2379" handler-pid)        => 1
 //! (grpc-serve "127.0.0.1:0"    handler-pid 5000)   => 2  ; opt arg accepted (unused)
 //!
-//! ; Stop the server. Idempotent.
+//! ; Start a TLS / mutual-TLS gRPC server (cw-u4a.21). Same handler
+//! ; contract; the socket is rustls-terminated. With require-client-cert?
+//! ; = #t it is mTLS (a client without a cert chaining to ca-pem is
+//! ; rejected at the TLS layer); with #f it is plain server TLS.
+//! (grpc-serve-tls "127.0.0.1:2379" handler-pid
+//!                 "server.crt" "server.key" "ca.crt" #t)  => 3
+//!
+//! ; Stop a server (h2c or TLS). Idempotent.
 //! (grpc-server-stop sid)
 //!
 //! ; --- inside the handler actor ---
@@ -36,6 +43,8 @@
 //! ; ('*grpc-stream-end* h)       the client half-closed the request stream
 //! (grpc-request-path  h)   => "/etcdserverpb.KV/Range"   ; the :path
 //! (grpc-request-bytes h)   => #u8(...)                    ; FIRST request message
+//! ; The verified mTLS client identity (SAN/CN), or #f over h2c / no cert.
+//! (grpc-request-peer-identity h) => "etcd-client" | #f
 //!
 //! ; UNARY: one response message + grpc-status:0 trailer; consumes h.
 //! (grpc-respond! h response-bytevector)
@@ -60,7 +69,8 @@ use cs_actor::{ActorPid, Payload};
 use cs_core::{SymbolTable, Value};
 
 use cs_web::grpc::{
-    bind_grpc, serve_grpc, ArcGrpcHandler, GrpcHandler, GrpcRequest, GrpcResponseSink,
+    bind_grpc, grpc_server_tls_config, serve_grpc, serve_grpc_tls, ArcGrpcHandler, GrpcHandler,
+    GrpcRequest, GrpcResponseSink,
 };
 use cs_web::Bytes;
 
@@ -78,6 +88,11 @@ struct GrpcBeginMsg {
     call_id: i64,
     path: String,
     message: Bytes,
+    /// The verified mTLS peer identity for this call, or `None` on the
+    /// h2c (cleartext) path / a TLS connection with no client cert.
+    /// Carried from the transport so the bridge can expose it via
+    /// `grpc-request-peer-identity`.
+    peer_identity: Option<Arc<str>>,
     sink: GrpcResponseSink,
 }
 
@@ -98,6 +113,7 @@ struct GrpcStreamEnd {
 struct StreamSlot {
     path: String,
     first_message: Bytes,
+    peer_identity: Option<Arc<str>>,
     sink: GrpcResponseSink,
 }
 
@@ -120,6 +136,7 @@ impl GrpcHandler for ActorGrpcHandler {
             call_id: call_id as i64,
             path: req.path,
             message: req.message,
+            peer_identity: req.peer_identity,
             sink: sink.clone(),
         });
         let payload: Payload = envelope;
@@ -225,6 +242,12 @@ fn value_to_i64(v: &Value, who: &str) -> Result<i64, String> {
     }
 }
 
+/// R7RS truthiness: only `#f` is false; everything else (including the
+/// symbol `#t`) is true. Used for the `require-client-cert?` flag.
+fn value_to_bool(v: &Value) -> bool {
+    !matches!(v, Value::Boolean(false))
+}
+
 fn value_to_bytes(v: &Value, who: &str) -> Result<Bytes, String> {
     match v {
         Value::ByteVector(b) => Ok(Bytes::copy_from_slice(&b.borrow())),
@@ -303,6 +326,61 @@ fn primop_serve(addr: &str, pid: ActorPid) -> Result<(i64, String), String> {
     Ok((id, bound.to_string()))
 }
 
+/// Start a TLS/mTLS gRPC server (cw-u4a.21). Same actor-bridge handler
+/// as [`primop_serve`], but the socket is rustls-terminated and — when
+/// `require_client_cert` — every connection must present a client cert
+/// chaining to `ca_pem` (require-and-verify). The verified peer identity
+/// is exposed per call via `grpc-request-peer-identity`.
+#[allow(clippy::too_many_arguments)]
+fn primop_serve_tls(
+    addr: &str,
+    pid: ActorPid,
+    cert_pem: &str,
+    key_pem: &str,
+    ca_pem: &str,
+    require_client_cert: bool,
+) -> Result<(i64, String), String> {
+    let addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("grpc-serve-tls: invalid addr {:?}: {}", addr, e))?;
+    let actor_ref = crate::builtins::beam::lookup_pid(pid).ok_or_else(|| {
+        format!(
+            "grpc-serve-tls: handler actor {} not found (terminated?)",
+            pid
+        )
+    })?;
+    let handler: ArcGrpcHandler = Arc::new(ActorGrpcHandler { target: actor_ref });
+
+    // Build the rustls server config (load PEMs + build the client-cert
+    // verifier) synchronously, so bad paths / certs / a missing CA fail
+    // the Scheme caller immediately rather than from a detached task.
+    let tls_config = grpc_server_tls_config(cert_pem, key_pem, ca_pem, require_client_cert)
+        .map_err(|e| format!("grpc-serve-tls: {}", e))?;
+
+    let (listener, bound) = rt()
+        .block_on(async { bind_grpc(addr).await })
+        .map_err(|e| format!("grpc-serve-tls: bind: {}", e))?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let join = rt().spawn(async move {
+        let _ = serve_grpc_tls(
+            listener,
+            tls_config,
+            handler,
+            Some(async move {
+                let _ = shutdown_rx.await;
+            }),
+        )
+        .await;
+    });
+
+    let mut reg = lock();
+    let id = reg.next_id;
+    reg.next_id += 1;
+    reg.slots.insert(id, Slot::Running { shutdown_tx, join });
+    Ok((id, bound.to_string()))
+}
+
 fn primop_server_stop(sid: i64) -> Result<(), String> {
     let mut reg = lock();
     let slot = reg
@@ -337,6 +415,7 @@ pub fn try_intern_grpc_request(payload: &Payload) -> Option<SendableValue> {
             StreamSlot {
                 path: begin.path.clone(),
                 first_message: begin.message.clone(),
+                peer_identity: begin.peer_identity.clone(),
                 sink: begin.sink.clone(),
             },
         );
@@ -407,6 +486,15 @@ fn primop_request_bytes(handle: i64) -> Result<Vec<u8>, String> {
     with_slot("grpc-request-bytes", handle, |s| s.first_message.to_vec())
 }
 
+/// The verified mTLS peer identity for this call, or `None` when the
+/// call arrived over cleartext h2c / a TLS connection with no client
+/// cert. The string is the client leaf cert's SAN (DNS/URI/IP) or CN.
+fn primop_request_peer_identity(handle: i64) -> Result<Option<String>, String> {
+    with_slot("grpc-request-peer-identity", handle, |s| {
+        s.peer_identity.as_deref().map(|id| id.to_string())
+    })
+}
+
 fn primop_respond(handle: i64, message: Bytes) -> Result<(), String> {
     let sink = take_slot("grpc-respond!", handle)?;
     sink.send_message(message);
@@ -465,6 +553,46 @@ pub fn b_grpc_serve(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Str
     Ok(Value::Number(cs_core::Number::Fixnum(id)))
 }
 
+/// `(grpc-serve-tls addr handler-pid cert-pem key-pem ca-pem require-client-cert?)`
+/// — start a TLS/mTLS gRPC server (cw-u4a.21) and return an integer
+/// server handle (stop it with `grpc-server-stop`, same as the h2c path).
+///
+/// - `addr` — "host:port" to bind (port 0 lets the OS choose).
+/// - `handler-pid` — the actor that receives `('*grpc-request* h)` etc.,
+///   identical to `grpc-serve`.
+/// - `cert-pem` / `key-pem` — this server's certificate chain + private
+///   key PEM file paths (the leaf SAN should match the dialed endpoint,
+///   e.g. `IP:127.0.0.1` / `DNS:localhost`).
+/// - `ca-pem` — PEM bundle of CA(s) used to verify *client* certs.
+/// - `require-client-cert?` — `#t` ⇒ mutual TLS (require-and-verify: a
+///   connection without a client cert chaining to `ca-pem` is rejected
+///   at the TLS layer); `#f` ⇒ plain server TLS (no client cert
+///   requested, so `grpc-request-peer-identity` is always `#f`).
+pub fn b_grpc_serve_tls(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 6 {
+        return Err(format!(
+            "grpc-serve-tls: expected 6 arguments \
+             (addr handler-pid cert-pem key-pem ca-pem require-client-cert?), got {}",
+            args.len()
+        ));
+    }
+    let addr = value_to_str(&args[0], syms, "grpc-serve-tls")?;
+    let pid = value_to_pid(&args[1], syms, "grpc-serve-tls")?;
+    let cert_pem = value_to_str(&args[2], syms, "grpc-serve-tls")?;
+    let key_pem = value_to_str(&args[3], syms, "grpc-serve-tls")?;
+    let ca_pem = value_to_str(&args[4], syms, "grpc-serve-tls")?;
+    let require_client_cert = value_to_bool(&args[5]);
+    let (id, _bound) = primop_serve_tls(
+        &addr,
+        pid,
+        &cert_pem,
+        &key_pem,
+        &ca_pem,
+        require_client_cert,
+    )?;
+    Ok(Value::Number(cs_core::Number::Fixnum(id)))
+}
+
 pub fn b_grpc_server_stop(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(format!(
@@ -497,6 +625,28 @@ pub fn b_grpc_request_bytes(args: &[Value], _syms: &mut SymbolTable) -> Result<V
     }
     let h = value_to_i64(&args[0], "grpc-request-bytes")?;
     Ok(bytevector_value(primop_request_bytes(h)?))
+}
+
+/// `(grpc-request-peer-identity h)` → the verified mTLS client identity
+/// string for call `h` (the client leaf cert's SAN DNS/URI/IP, else its
+/// Subject CN), or `#f` when the call came over cleartext h2c or a TLS
+/// connection without a client certificate. This is the hook etcd Auth
+/// (cw-u4a.26) maps to a user; `.21` only EXPOSES it.
+pub fn b_grpc_request_peer_identity(
+    args: &[Value],
+    _syms: &mut SymbolTable,
+) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "grpc-request-peer-identity: expected 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let h = value_to_i64(&args[0], "grpc-request-peer-identity")?;
+    Ok(match primop_request_peer_identity(h)? {
+        Some(id) => string_value(id),
+        None => Value::Boolean(false),
+    })
 }
 
 pub fn b_grpc_respond(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
@@ -579,9 +729,11 @@ pub fn grpc_syms_builtins() -> Vec<(
 )> {
     vec![
         ("grpc-serve", b_grpc_serve),
+        ("grpc-serve-tls", b_grpc_serve_tls),
         ("grpc-server-stop", b_grpc_server_stop),
         ("grpc-request-path", b_grpc_request_path),
         ("grpc-request-bytes", b_grpc_request_bytes),
+        ("grpc-request-peer-identity", b_grpc_request_peer_identity),
         ("grpc-respond!", b_grpc_respond),
         ("grpc-respond-error!", b_grpc_respond_error),
         ("grpc-stream-send!", b_grpc_stream_send),
