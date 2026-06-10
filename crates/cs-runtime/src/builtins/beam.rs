@@ -1510,9 +1510,10 @@ fn message_to_sendable(msg: Message) -> SendableValue {
             if let Some(sv) = crate::builtins::web::try_intern_web_request(&payload) {
                 return sv;
             }
-            // cs-grpc sends `Arc<GrpcMessage>` payloads from hyper's
-            // h2c request task to the registered handler actor. Same
-            // bridge shape as the web one: stash + tagged pair.
+            // cs-grpc sends gRPC call-event payloads (begin / stream-msg /
+            // stream-end) from hyper's h2c request task to the registered
+            // handler actor. Same bridge shape as the web one: stash + tagged
+            // pair (`*grpc-request*` / `*grpc-stream-msg*` / `*grpc-stream-end*`).
             #[cfg(feature = "grpc")]
             if let Some(sv) = crate::builtins::grpc::try_intern_grpc_request(&payload) {
                 return sv;
