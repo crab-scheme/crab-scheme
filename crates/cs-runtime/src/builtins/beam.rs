@@ -1510,6 +1510,13 @@ fn message_to_sendable(msg: Message) -> SendableValue {
             if let Some(sv) = crate::builtins::web::try_intern_web_request(&payload) {
                 return sv;
             }
+            // cs-grpc sends `Arc<GrpcMessage>` payloads from hyper's
+            // h2c request task to the registered handler actor. Same
+            // bridge shape as the web one: stash + tagged pair.
+            #[cfg(feature = "grpc")]
+            if let Some(sv) = crate::builtins::grpc::try_intern_grpc_request(&payload) {
+                return sv;
+            }
             // Genuinely-foreign payload (Rust test fixture, third-
             // party plugin, ...). Wrap as a placeholder symbol so
             // Scheme pattern-match still has something to compare.

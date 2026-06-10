@@ -410,6 +410,18 @@ impl Runtime {
                 vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
             }
         }
+        // gRPC (h2c) server primops (the `grpc` feature) — same Syms
+        // shape. MUST be on the VM tier because gRPC handler actors run
+        // their body via `eval_str_via_vm` (the green/spawn-source path):
+        // without this, `grpc-request-path` / `grpc-respond!` are
+        // undefined inside the handler and the actor dies mid-call.
+        #[cfg(feature = "grpc")]
+        {
+            for (name, f) in builtins::grpc::grpc_syms_builtins() {
+                let sym = syms.intern(name);
+                vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
+            }
+        }
         // Mirror the walker tier's record-parent registry so define-record-type
         // works the same on both tiers (predicates look it up at runtime).
         let registry_sym = syms.intern(builtins::RECORD_PARENTS_REGISTRY);

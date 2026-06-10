@@ -15,6 +15,9 @@ pub mod sandbox;
 #[cfg(feature = "web")]
 pub mod web;
 
+#[cfg(feature = "grpc")]
+pub mod grpc;
+
 use cs_core::{
     eq, Hashtable, HtEqKind, Number, Pair, Port, Promise, PromiseState, SymbolTable, Value,
     WriteMode,
@@ -1252,6 +1255,16 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     #[cfg(feature = "web")]
     {
         for (name, f) in web::web_syms_builtins() {
+            let sym = syms.intern(name);
+            env.define(sym, crate::proc::make_builtin_syms(name, f));
+        }
+    }
+    // cs-grpc cleartext-HTTP/2 (h2c) gRPC server transport primops.
+    // Gated on `grpc` (implies `web` + `actor` — reuses cs-web's
+    // hyper-based transport and the cs-actor mailbox bridge).
+    #[cfg(feature = "grpc")]
+    {
+        for (name, f) in grpc::grpc_syms_builtins() {
             let sym = syms.intern(name);
             env.define(sym, crate::proc::make_builtin_syms(name, f));
         }
