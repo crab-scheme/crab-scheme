@@ -35,6 +35,8 @@ rustls-pki-types = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
+# X.509 parser for gRPC mTLS peer-identity extraction (grpc-tls).
+x509-parser = { workspace = true, optional = true }
 
 [features]
 default = ["modules", "actor", "table"]
@@ -53,8 +55,15 @@ http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
 # Needs no extra deps — hyper already ships with `http2` from the
 # workspace feature set. Off by default; the gRPC-native store
 # (crab-watchstore) turns it on. TLS/mTLS for gRPC is the separate
-# `tls` concern; this serves insecure h2c, which etcd permits.
+# `grpc-tls` concern; this serves insecure h2c, which etcd permits.
 grpc = []
+# gRPC over TLS / mutual-TLS (cw-u4a.21): ALPN-`h2` TLS termination
+# in front of the same gRPC handler, a require-and-verify client-cert
+# verifier (mTLS) built from a CA bundle, and extraction of the
+# verified peer (client) identity (SAN/CN) per call. Additive over
+# `grpc` — pulls in the `tls` rustls stack plus an X.509 parser. The
+# plain-h2c `grpc` path is unchanged.
+grpc-tls = ["grpc", "tls", "dep:x509-parser"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

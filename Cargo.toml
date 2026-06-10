@@ -278,6 +278,12 @@ h3-quinn = "0.0.10"
 # Dev-only: generate a self-signed cert in tests so we can
 # verify TLS round trips without provisioning real certs.
 rcgen = "0.13"
+# X.509 parser — extract the verified peer (client) certificate's
+# identity (SAN DNS/URI/IP or Subject CN) after a gRPC mTLS
+# handshake. `default-features = false` keeps it to the DER parser
+# (we don't use its signature-verification path; rustls already
+# verified the chain).
+x509-parser = { version = "0.16", default-features = false }
 
 [profile.release]
 lto = "thin"
