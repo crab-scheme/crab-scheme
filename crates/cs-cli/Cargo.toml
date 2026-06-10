@@ -144,6 +144,10 @@ stdlib-meta = ["cs-runtime/stdlib-meta"]
 # Implies `actor` via the cs-runtime forwarding chain.
 web = ["actor", "cs-runtime/web"]
 web-modules = ["web", "cs-runtime/web-modules"]
+# Cleartext-HTTP/2 (h2c) gRPC server transport (grpc-serve, ...).
+# Implies `web` (reuses the hyper transport) and thus `actor`.
+# Used by the etcd-compatible store (crab-watchstore).
+grpc = ["web", "cs-runtime/grpc"]
 # WASM-safe subset — 21 modules that build clean for
 # `wasm32-wasip1`. Excludes: os/process (no Unix syscalls),
 # net/http/websocket (no real sockets in WASI), signal/tty

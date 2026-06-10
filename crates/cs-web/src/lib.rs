@@ -52,6 +52,9 @@ pub mod tls;
 #[cfg(feature = "http3")]
 pub mod h3;
 
+#[cfg(feature = "grpc")]
+pub mod grpc;
+
 // Re-export `http` so downstream callers can `cs_web::http::Request::builder()`
 // without an explicit dep.
 pub use http;

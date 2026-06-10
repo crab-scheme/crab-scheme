@@ -89,6 +89,14 @@ web = ["actor", "dep:cs-web"]
 # Implies `web`. Native-only — libloading isn't available on
 # WASM.
 web-modules = ["web", "cs-web/modules"]
+# Cleartext-HTTP/2 (h2c) gRPC server transport primops
+# (grpc-serve, grpc-request-path/bytes, grpc-respond!,
+# grpc-respond-error!). Reuses cs-web's hyper transport + the
+# cs-actor mailbox bridge, so it implies `web` (and thus `actor`).
+# Default off — gRPC framing + trailers are only needed by the
+# etcd-compatible store (crab-watchstore). TLS/mTLS for gRPC is a
+# separate concern; this serves insecure h2c (which etcd permits).
+grpc = ["web", "cs-web/grpc"]
 
 # ----- (crab …) stdlib modules — see .spec-workflow/specs/stdlib-modules
 #

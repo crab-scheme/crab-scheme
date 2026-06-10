@@ -48,6 +48,13 @@ tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-t
 # Enables `serve_h3` — HTTP/3 over QUIC. Implies `tls` because
 # QUIC mandates TLS 1.3.
 http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
+# Enables the cleartext HTTP/2 (h2c) gRPC server transport
+# (`serve_grpc`, `GrpcBody` with trailers, length-prefix framing).
+# Needs no extra deps — hyper already ships with `http2` from the
+# workspace feature set. Off by default; the gRPC-native store
+# (crab-watchstore) turns it on. TLS/mTLS for gRPC is the separate
+# `tls` concern; this serves insecure h2c, which etcd permits.
+grpc = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
