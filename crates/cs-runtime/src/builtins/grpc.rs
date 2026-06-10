@@ -93,6 +93,10 @@ struct GrpcBeginMsg {
     /// Carried from the transport so the bridge can expose it via
     /// `grpc-request-peer-identity`.
     peer_identity: Option<Arc<str>>,
+    /// The call's gRPC metadata (HTTP/2 headers), lowercase keys. Carried
+    /// from the transport so the bridge can expose it via
+    /// `grpc-request-metadata` (the etcd-Auth `token` hook, `.26`).
+    metadata: HashMap<String, String>,
     sink: GrpcResponseSink,
 }
 
@@ -114,6 +118,7 @@ struct StreamSlot {
     path: String,
     first_message: Bytes,
     peer_identity: Option<Arc<str>>,
+    metadata: HashMap<String, String>,
     sink: GrpcResponseSink,
 }
 
@@ -137,6 +142,7 @@ impl GrpcHandler for ActorGrpcHandler {
             path: req.path,
             message: req.message,
             peer_identity: req.peer_identity,
+            metadata: req.metadata,
             sink: sink.clone(),
         });
         let payload: Payload = envelope;
@@ -416,6 +422,7 @@ pub fn try_intern_grpc_request(payload: &Payload) -> Option<SendableValue> {
                 path: begin.path.clone(),
                 first_message: begin.message.clone(),
                 peer_identity: begin.peer_identity.clone(),
+                metadata: begin.metadata.clone(),
                 sink: begin.sink.clone(),
             },
         );
@@ -492,6 +499,17 @@ fn primop_request_bytes(handle: i64) -> Result<Vec<u8>, String> {
 fn primop_request_peer_identity(handle: i64) -> Result<Option<String>, String> {
     with_slot("grpc-request-peer-identity", handle, |s| {
         s.peer_identity.as_deref().map(|id| id.to_string())
+    })
+}
+
+/// The value of gRPC metadata header `key` (lowercased) for this call,
+/// or `None` if the request carried no such header. gRPC metadata is
+/// HTTP/2 headers, so this is how the `token` / `authorization` header
+/// an auth client presents is read (etcd-Auth, `.26`).
+fn primop_request_metadata(handle: i64, key: &str) -> Result<Option<String>, String> {
+    let key = key.to_ascii_lowercase();
+    with_slot("grpc-request-metadata", handle, |s| {
+        s.metadata.get(&key).cloned()
     })
 }
 
@@ -649,6 +667,27 @@ pub fn b_grpc_request_peer_identity(
     })
 }
 
+/// `(grpc-request-metadata h key)` → the gRPC metadata header value
+/// string for `key` (case-insensitive; gRPC normalises header names to
+/// lowercase), or `#f` if the call carried no such header. This is the
+/// lone interpreter gap etcd-Auth (cw-u4a.26) needed: the `token`
+/// header is `(grpc-request-metadata h "token")`. Mirrors
+/// `grpc-request-peer-identity` (the cert-CN identity hook).
+pub fn b_grpc_request_metadata(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "grpc-request-metadata: expected 2 arguments (handle key), got {}",
+            args.len()
+        ));
+    }
+    let h = value_to_i64(&args[0], "grpc-request-metadata")?;
+    let key = value_to_str(&args[1], syms, "grpc-request-metadata")?;
+    Ok(match primop_request_metadata(h, &key)? {
+        Some(v) => string_value(v),
+        None => Value::Boolean(false),
+    })
+}
+
 pub fn b_grpc_respond(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!(
@@ -734,6 +773,7 @@ pub fn grpc_syms_builtins() -> Vec<(
         ("grpc-request-path", b_grpc_request_path),
         ("grpc-request-bytes", b_grpc_request_bytes),
         ("grpc-request-peer-identity", b_grpc_request_peer_identity),
+        ("grpc-request-metadata", b_grpc_request_metadata),
         ("grpc-respond!", b_grpc_respond),
         ("grpc-respond-error!", b_grpc_respond_error),
         ("grpc-stream-send!", b_grpc_stream_send),
