@@ -1349,9 +1349,9 @@ pub fn bytecode_to_rir_full(
                                     }
                                     ("arithmetic-shift", 2) | ("bitwise-arithmetic-shift", 2)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
+                                            == Some(Type::Fixnum)
                                             && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
+                                                == Some(Type::Fixnum) =>
                                     {
                                         Some(RirInst::ArithShift(dst, args[0], args[1]))
                                     }
@@ -1459,16 +1459,19 @@ pub fn bytecode_to_rir_full(
                                         Some(RirInst::MinFixnum(dst, args[0], args[1]))
                                     }
                                     // ADR 0012 D-2 (iter FN) — bitwise-bit-count / -length.
-                                    // Both Fixnum -> Fixnum. Gated to non-Flonum.
+                                    // Guard requires proven Fixnum: Cranelift lowering uses
+                                    // unbox_nb_fixnum (no tag check); a bignum would be
+                                    // misinterpreted.  Unknown/bignum operands fall through to
+                                    // the generic builtin, which is now bignum-aware.
                                     ("bitwise-bit-count", 1)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
+                                            == Some(Type::Fixnum) =>
                                     {
                                         Some(RirInst::BitwiseBitCount(dst, args[0]))
                                     }
                                     ("bitwise-length", 1)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum) =>
+                                            == Some(Type::Fixnum) =>
                                     {
                                         Some(RirInst::BitwiseLength(dst, args[0]))
                                     }
@@ -1539,19 +1542,24 @@ pub fn bytecode_to_rir_full(
                                         Some(RirInst::Lt(dst, args[1], args[0]))
                                     }
                                     // ADR 0012 D-2 (iter FO) — bitwise-arithmetic-shift-{left,right}.
+                                    // Guard requires both operands proven Fixnum: the Cranelift
+                                    // lowering uses unbox_nb_fixnum (no tag check), and a bignum
+                                    // operand would be misinterpreted as garbage.  Unknown-type
+                                    // operands fall through to the generic builtin call, which
+                                    // is now bignum-aware.
                                     ("bitwise-arithmetic-shift-left", 2)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
+                                            == Some(Type::Fixnum)
                                             && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
+                                                == Some(Type::Fixnum) =>
                                     {
                                         Some(RirInst::BitwiseArithShiftLeft(dst, args[0], args[1]))
                                     }
                                     ("bitwise-arithmetic-shift-right", 2)
                                         if value_types.get(&args[0]).copied()
-                                            != Some(Type::Flonum)
+                                            == Some(Type::Fixnum)
                                             && value_types.get(&args[1]).copied()
-                                                != Some(Type::Flonum) =>
+                                                == Some(Type::Fixnum) =>
                                     {
                                         Some(RirInst::BitwiseArithShiftRight(dst, args[0], args[1]))
                                     }
@@ -4932,12 +4940,14 @@ pub fn bytecode_to_rir_full(
                                         // so invalid codepoints simply return 0
                                         // (no deopt).
                                         // ADR 0012 D-2 (iter FO) — bitwise-bit-set?.
-                                        // (Fixnum, Fixnum) -> Boolean.
+                                        // Guard requires both operands proven Fixnum: Cranelift
+                                        // lowering uses unbox_nb_fixnum (no tag check); bignum
+                                        // operands must fall through to the generic builtin.
                                         ("bitwise-bit-set?", 2)
                                             if value_types.get(&args[0]).copied()
-                                                != Some(Type::Flonum)
+                                                == Some(Type::Fixnum)
                                                 && value_types.get(&args[1]).copied()
-                                                    != Some(Type::Flonum) =>
+                                                    == Some(Type::Fixnum) =>
                                         {
                                             insts.push(RirInst::BitwiseBitSetP(
                                                 dst, args[0], args[1],

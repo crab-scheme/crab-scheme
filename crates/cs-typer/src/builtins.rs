@@ -253,10 +253,23 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         ("inexact?", pred(fl())),
         ("exact->inexact", p1(num(), fl())),
         ("inexact->exact", p1(num(), fx())),
-        ("bitwise-and", p2(fx(), fx(), fx())),
-        ("bitwise-or", p2(fx(), fx(), fx())),
-        ("bitwise-xor", p2(fx(), fx(), fx())),
-        ("bitwise-not", p1(fx(), fx())),
+        // Widened to any() because these ops are now bignum-aware (bead cw-u4a.41).
+        // Phase 2/3 subsumes BigInt under Fixnum; once the lattice grows an Integer
+        // atom, these should be narrowed to (Integer, Integer) -> Integer.
+        ("bitwise-and", p2(any(), any(), any())),
+        ("bitwise-ior", p2(any(), any(), any())),
+        ("bitwise-or", p2(any(), any(), any())),
+        ("bitwise-xor", p2(any(), any(), any())),
+        ("bitwise-not", p1(any(), any())),
+        ("arithmetic-shift", p2(any(), any(), any())),
+        ("bitwise-arithmetic-shift", p2(any(), any(), any())),
+        ("bitwise-arithmetic-shift-left", p2(any(), any(), any())),
+        ("bitwise-arithmetic-shift-right", p2(any(), any(), any())),
+        // Bignum-aware inspection ops (bead cw-lfx).
+        ("bitwise-bit-count", p1(any(), any())),
+        ("bitwise-length", p1(any(), any())),
+        ("bitwise-bit-set?", p2(any(), any(), bool_())),
+        ("bitwise-if", p3(any(), any(), any(), any())),
         // Character classification (predicates) and case.
         ("char-alphabetic?", pred(ch())),
         ("char-numeric?", pred(ch())),

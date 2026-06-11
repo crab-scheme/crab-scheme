@@ -3445,8 +3445,11 @@ pub unsafe extern "C" fn vm_bitwise_arith_shift_left(n: i64, count: i64) -> i64 
         return 0;
     }
     if count >= 64 {
-        0
+        // count ≥ 64 → result is a bignum; deopt so bytecode can compute it.
+        jit_request_deopt(DEOPT_REASON_FIXNUM_OVERFLOW);
+        0 // placeholder
     } else {
+        // May overflow 47-bit NB range; nb_fx_call_or_deopt handles that.
         n.wrapping_shl(count as u32)
     }
 }
@@ -5716,8 +5719,15 @@ pub unsafe extern "C" fn vm_bytevector_s8_set_gc(bv: i64, k: i64, val: i64) -> i
 }
 
 /// `(arithmetic-shift n count)` — left-shift if count >= 0,
-/// arithmetic right-shift if count < 0. Matches
-/// `b_bitwise_arith_shift`: shifts past 64 saturate to 0 / -1.
+/// arithmetic right-shift if count < 0.
+///
+/// Left shift: for count < 64 the result may overflow the 47-bit NB
+/// Fixnum range; `nb_fx_call_or_deopt` (the JIT wrapper) detects that
+/// and deopts to the bignum-aware bytecode path.  For count ≥ 64 the
+/// i64 result would be 0 (wrapping), which falsely *fits* in 47 bits;
+/// we therefore deopt explicitly so the bytecode can compute the
+/// correct bignum value (e.g. `(arithmetic-shift 1 64)` = 2^64).
+///
 /// Both args are raw Fixnum-shape i64. ADR 0012 D-2 (iter DL).
 ///
 /// # Safety
@@ -5727,8 +5737,11 @@ pub unsafe extern "C" fn vm_bytevector_s8_set_gc(bv: i64, k: i64, val: i64) -> i
 pub unsafe extern "C" fn vm_arith_shift_fx(n: i64, count: i64) -> i64 {
     if count >= 0 {
         if count >= 64 {
-            0
+            // Result would be ≥ 2^64 (bignum) — deopt to bytecode.
+            jit_request_deopt(DEOPT_REASON_FIXNUM_OVERFLOW);
+            0 // placeholder; discarded by the deopt mechanism
         } else {
+            // May overflow 47-bit NB range; nb_fx_call_or_deopt handles that.
             n.wrapping_shl(count as u32)
         }
     } else {

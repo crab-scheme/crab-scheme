@@ -10565,155 +10565,148 @@ fn b_gensym(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     Ok(Value::Symbol(sym))
 }
 
-// ---- bitwise (R6RS arithmetic bitwise) ----
+// ---- bitwise (R6RS arithmetic bitwise — bignum-aware) ----
 
 fn b_bitwise_and(args: &[Value]) -> Result<Value, String> {
-    let mut acc: i64 = -1; // all ones
+    // Identity for zero args: (bitwise-and) = -1 (all ones).
+    let mut acc = Number::Fixnum(-1);
     for a in args {
-        acc &= as_int_i64("bitwise-and", a)?;
+        let n = as_integer_num("bitwise-and", a)?;
+        acc = acc
+            .bit_and(&n)
+            .ok_or_else(|| "bitwise-and: non-integer argument".to_string())?;
     }
-    Ok(Value::fixnum(acc))
+    Ok(Value::Number(acc))
 }
 
 fn b_bitwise_or(args: &[Value]) -> Result<Value, String> {
-    let mut acc: i64 = 0;
+    // Identity for zero args: (bitwise-or) = 0.
+    let mut acc = Number::Fixnum(0);
     for a in args {
-        acc |= as_int_i64("bitwise-or", a)?;
+        let n = as_integer_num("bitwise-or", a)?;
+        acc = acc
+            .bit_or(&n)
+            .ok_or_else(|| "bitwise-or: non-integer argument".to_string())?;
     }
-    Ok(Value::fixnum(acc))
+    Ok(Value::Number(acc))
 }
 
 fn b_bitwise_xor(args: &[Value]) -> Result<Value, String> {
-    let mut acc: i64 = 0;
+    // Identity for zero args: (bitwise-xor) = 0.
+    let mut acc = Number::Fixnum(0);
     for a in args {
-        acc ^= as_int_i64("bitwise-xor", a)?;
+        let n = as_integer_num("bitwise-xor", a)?;
+        acc = acc
+            .bit_xor(&n)
+            .ok_or_else(|| "bitwise-xor: non-integer argument".to_string())?;
     }
-    Ok(Value::fixnum(acc))
+    Ok(Value::Number(acc))
 }
 
 fn b_bitwise_not(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("bitwise-not", "1", args.len()));
     }
-    Ok(Value::fixnum(!as_int_i64("bitwise-not", &args[0])?))
+    let n = as_integer_num("bitwise-not", &args[0])?;
+    n.bit_not()
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-not: non-integer argument".to_string())
 }
 
 fn b_bitwise_arith_shift(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bitwise-arithmetic-shift", "2", args.len()));
     }
-    let n = as_int_i64("bitwise-arithmetic-shift", &args[0])?;
-    let count = as_int_i64("bitwise-arithmetic-shift", &args[1])?;
-    let result = if count >= 0 {
-        if count >= 64 {
-            0
-        } else {
-            n.wrapping_shl(count as u32)
-        }
-    } else {
-        let abs = (-count) as u32;
-        if abs >= 64 {
-            if n < 0 {
-                -1
-            } else {
-                0
-            }
-        } else {
-            n.wrapping_shr(abs)
-        }
-    };
-    Ok(Value::fixnum(result))
+    let n = as_integer_num("bitwise-arithmetic-shift", &args[0])?;
+    let count = as_integer_num("bitwise-arithmetic-shift", &args[1])?;
+    n.arith_shift(&count)
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-arithmetic-shift: non-integer or out-of-range argument".to_string())
 }
 
 fn b_bitwise_arith_shift_left(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bitwise-arithmetic-shift-left", "2", args.len()));
     }
-    let n = as_int_i64("bitwise-arithmetic-shift-left", &args[0])?;
-    let count = as_int_i64("bitwise-arithmetic-shift-left", &args[1])?;
-    if count < 0 {
+    let n = as_integer_num("bitwise-arithmetic-shift-left", &args[0])?;
+    let count = as_integer_num("bitwise-arithmetic-shift-left", &args[1])?;
+    // R6RS requires non-negative count for the -left variant.
+    if count.cmp(&Number::Fixnum(0)) == std::cmp::Ordering::Less {
         return Err("bitwise-arithmetic-shift-left: negative count".into());
     }
-    let result = if count >= 64 {
-        0
-    } else {
-        n.wrapping_shl(count as u32)
-    };
-    Ok(Value::fixnum(result))
+    n.arith_shift(&count)
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-arithmetic-shift-left: out-of-range argument".to_string())
 }
 
 fn b_bitwise_arith_shift_right(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bitwise-arithmetic-shift-right", "2", args.len()));
     }
-    let n = as_int_i64("bitwise-arithmetic-shift-right", &args[0])?;
-    let count = as_int_i64("bitwise-arithmetic-shift-right", &args[1])?;
-    if count < 0 {
+    let n = as_integer_num("bitwise-arithmetic-shift-right", &args[0])?;
+    let count = as_integer_num("bitwise-arithmetic-shift-right", &args[1])?;
+    // R6RS requires non-negative count for the -right variant; negate to right-shift.
+    if count.cmp(&Number::Fixnum(0)) == std::cmp::Ordering::Less {
         return Err("bitwise-arithmetic-shift-right: negative count".into());
     }
-    let result = if count >= 64 {
-        if n < 0 {
-            -1
-        } else {
-            0
-        }
-    } else {
-        n.wrapping_shr(count as u32)
-    };
-    Ok(Value::fixnum(result))
+    let neg_count = count.neg();
+    n.arith_shift(&neg_count)
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-arithmetic-shift-right: out-of-range argument".to_string())
 }
 
 fn b_bitwise_bit_count(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("bitwise-bit-count", "1", args.len()));
     }
-    let n = as_int_i64("bitwise-bit-count", &args[0])?;
-    // R6RS: For non-negative n, returns count of 1 bits.
-    // For negative, returns -1 - (count of 1 bits in (bitwise-not n)).
-    let result = if n >= 0 {
-        n.count_ones() as i64
-    } else {
-        -1 - ((!n).count_ones() as i64)
-    };
-    Ok(Value::fixnum(result))
+    let n = as_integer_num("bitwise-bit-count", &args[0])?;
+    n.bit_count()
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-bit-count: non-integer argument".to_string())
 }
 
 fn b_bitwise_length(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("bitwise-length", "1", args.len()));
     }
-    let n = as_int_i64("bitwise-length", &args[0])?;
-    let abs = if n < 0 { !n } else { n };
-    let bits = if abs == 0 {
-        0
-    } else {
-        64 - abs.leading_zeros() as i64
-    };
-    Ok(Value::fixnum(bits))
+    let n = as_integer_num("bitwise-length", &args[0])?;
+    n.bit_length()
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-length: non-integer argument".to_string())
 }
 
 fn b_bitwise_bit_set_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bitwise-bit-set?", "2", args.len()));
     }
-    let n = as_int_i64("bitwise-bit-set?", &args[0])?;
-    let bit = as_int_i64("bitwise-bit-set?", &args[1])?;
-    if bit < 0 || bit >= 64 {
-        return Ok(Value::Boolean(false));
-    }
-    Ok(Value::Boolean((n >> bit) & 1 == 1))
+    let n = as_integer_num("bitwise-bit-set?", &args[0])?;
+    let bit = as_integer_num("bitwise-bit-set?", &args[1])?;
+    n.bit_set_p(&bit)
+        .map(Value::Boolean)
+        .ok_or_else(|| "bitwise-bit-set?: non-integer or out-of-range argument".to_string())
 }
 
 fn b_bitwise_if(args: &[Value]) -> Result<Value, String> {
-    // R6RS: (bitwise-if ei1 ei2 ei3)
-    // = (bitwise-ior (bitwise-and ei1 ei2) (bitwise-and (bitwise-not ei1) ei3))
+    // R6RS: (bitwise-if mask then else)
+    // = (bitwise-ior (bitwise-and mask then) (bitwise-and (bitwise-not mask) else))
     if args.len() != 3 {
         return Err(arity_err("bitwise-if", "3", args.len()));
     }
-    let mask = as_int_i64("bitwise-if", &args[0])?;
-    let then = as_int_i64("bitwise-if", &args[1])?;
-    let else_ = as_int_i64("bitwise-if", &args[2])?;
-    Ok(Value::fixnum((mask & then) | (!mask & else_)))
+    let mask = as_integer_num("bitwise-if", &args[0])?;
+    let then = as_integer_num("bitwise-if", &args[1])?;
+    let else_ = as_integer_num("bitwise-if", &args[2])?;
+    let not_mask = mask
+        .bit_not()
+        .ok_or_else(|| "bitwise-if: non-integer mask".to_string())?;
+    let a = mask
+        .bit_and(&then)
+        .ok_or_else(|| "bitwise-if: non-integer argument".to_string())?;
+    let b = not_mask
+        .bit_and(&else_)
+        .ok_or_else(|| "bitwise-if: non-integer argument".to_string())?;
+    a.bit_or(&b)
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-if: non-integer argument".to_string())
 }
 
 // ---- exact-integer-sqrt ----
