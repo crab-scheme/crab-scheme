@@ -421,6 +421,10 @@ impl Runtime {
                 let sym = syms.intern(name);
                 vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
             }
+            for (name, f) in builtins::etcdpb::etcdpb_syms_builtins() {
+                let sym = syms.intern(name);
+                vm_env.define(sym, cs_vm::vm::make_vm_builtin_syms(name, f));
+            }
         }
         // Mirror the walker tier's record-parent registry so define-record-type
         // works the same on both tiers (predicates look it up at runtime).
