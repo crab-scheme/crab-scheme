@@ -16,6 +16,7 @@ pub mod sandbox;
 pub mod web;
 
 #[cfg(feature = "grpc")]
+pub mod etcdpb;
 pub mod grpc;
 
 use cs_core::{
@@ -1265,6 +1266,11 @@ pub fn install_into(env: &crate::env::Frame, syms: &mut SymbolTable) {
     #[cfg(feature = "grpc")]
     {
         for (name, f) in grpc::grpc_syms_builtins() {
+            let sym = syms.intern(name);
+            env.define(sym, crate::proc::make_builtin_syms(name, f));
+        }
+        // Native etcdserverpb hot-path codec (cw-b5w.2) rides the same gate.
+        for (name, f) in etcdpb::etcdpb_syms_builtins() {
             let sym = syms.intern(name);
             env.define(sym, crate::proc::make_builtin_syms(name, f));
         }
