@@ -265,6 +265,11 @@ pub fn primop_table() -> Vec<(&'static str, ProcType)> {
         ("bitwise-arithmetic-shift", p2(any(), any(), any())),
         ("bitwise-arithmetic-shift-left", p2(any(), any(), any())),
         ("bitwise-arithmetic-shift-right", p2(any(), any(), any())),
+        // Bignum-aware inspection ops (bead cw-lfx).
+        ("bitwise-bit-count", p1(any(), any())),
+        ("bitwise-length", p1(any(), any())),
+        ("bitwise-bit-set?", p2(any(), any(), bool_())),
+        ("bitwise-if", p3(any(), any(), any(), any())),
         // Character classification (predicates) and case.
         ("char-alphabetic?", pred(ch())),
         ("char-numeric?", pred(ch())),

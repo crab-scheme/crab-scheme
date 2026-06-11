@@ -10659,53 +10659,54 @@ fn b_bitwise_bit_count(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("bitwise-bit-count", "1", args.len()));
     }
-    let n = as_int_i64("bitwise-bit-count", &args[0])?;
-    // R6RS: For non-negative n, returns count of 1 bits.
-    // For negative, returns -1 - (count of 1 bits in (bitwise-not n)).
-    let result = if n >= 0 {
-        n.count_ones() as i64
-    } else {
-        -1 - ((!n).count_ones() as i64)
-    };
-    Ok(Value::fixnum(result))
+    let n = as_integer_num("bitwise-bit-count", &args[0])?;
+    n.bit_count()
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-bit-count: non-integer argument".to_string())
 }
 
 fn b_bitwise_length(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("bitwise-length", "1", args.len()));
     }
-    let n = as_int_i64("bitwise-length", &args[0])?;
-    let abs = if n < 0 { !n } else { n };
-    let bits = if abs == 0 {
-        0
-    } else {
-        64 - abs.leading_zeros() as i64
-    };
-    Ok(Value::fixnum(bits))
+    let n = as_integer_num("bitwise-length", &args[0])?;
+    n.bit_length()
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-length: non-integer argument".to_string())
 }
 
 fn b_bitwise_bit_set_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bitwise-bit-set?", "2", args.len()));
     }
-    let n = as_int_i64("bitwise-bit-set?", &args[0])?;
-    let bit = as_int_i64("bitwise-bit-set?", &args[1])?;
-    if bit < 0 || bit >= 64 {
-        return Ok(Value::Boolean(false));
-    }
-    Ok(Value::Boolean((n >> bit) & 1 == 1))
+    let n = as_integer_num("bitwise-bit-set?", &args[0])?;
+    let bit = as_integer_num("bitwise-bit-set?", &args[1])?;
+    n.bit_set_p(&bit)
+        .map(Value::Boolean)
+        .ok_or_else(|| "bitwise-bit-set?: non-integer or out-of-range argument".to_string())
 }
 
 fn b_bitwise_if(args: &[Value]) -> Result<Value, String> {
-    // R6RS: (bitwise-if ei1 ei2 ei3)
-    // = (bitwise-ior (bitwise-and ei1 ei2) (bitwise-and (bitwise-not ei1) ei3))
+    // R6RS: (bitwise-if mask then else)
+    // = (bitwise-ior (bitwise-and mask then) (bitwise-and (bitwise-not mask) else))
     if args.len() != 3 {
         return Err(arity_err("bitwise-if", "3", args.len()));
     }
-    let mask = as_int_i64("bitwise-if", &args[0])?;
-    let then = as_int_i64("bitwise-if", &args[1])?;
-    let else_ = as_int_i64("bitwise-if", &args[2])?;
-    Ok(Value::fixnum((mask & then) | (!mask & else_)))
+    let mask = as_integer_num("bitwise-if", &args[0])?;
+    let then = as_integer_num("bitwise-if", &args[1])?;
+    let else_ = as_integer_num("bitwise-if", &args[2])?;
+    let not_mask = mask
+        .bit_not()
+        .ok_or_else(|| "bitwise-if: non-integer mask".to_string())?;
+    let a = mask
+        .bit_and(&then)
+        .ok_or_else(|| "bitwise-if: non-integer argument".to_string())?;
+    let b = not_mask
+        .bit_and(&else_)
+        .ok_or_else(|| "bitwise-if: non-integer argument".to_string())?;
+    a.bit_or(&b)
+        .map(Value::Number)
+        .ok_or_else(|| "bitwise-if: non-integer argument".to_string())
 }
 
 // ---- exact-integer-sqrt ----
