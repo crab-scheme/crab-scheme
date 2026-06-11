@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{Num, Signed, ToPrimitive, Zero};
+use num_traits::{Num, One, Signed, ToPrimitive, Zero};
 
 #[derive(Clone)]
 pub enum Number {
@@ -436,6 +436,91 @@ impl Number {
     }
 }
 
+impl Number {
+    /// R6RS `bitwise-and` — two's-complement infinite-precision bitwise AND.
+    /// Returns `None` for non-integer (rational, non-integer flonum) operands.
+    ///
+    /// # Examples
+    /// ```
+    /// use cs_core::number::Number;
+    /// let a = Number::Big(std::rc::Rc::new("18446744073709551615".parse().unwrap()));
+    /// let b = Number::Fixnum(127);
+    /// assert!(matches!(a.bit_and(&b), Some(Number::Fixnum(127))));
+    /// ```
+    pub fn bit_and(&self, other: &Number) -> Option<Number> {
+        let a = self.to_bigint()?;
+        let b = other.to_bigint()?;
+        Some(simplify_bigint(&a & &b))
+    }
+
+    /// R6RS `bitwise-ior` / `bitwise-or` — two's-complement infinite-precision
+    /// bitwise OR. Returns `None` for non-integer operands.
+    pub fn bit_or(&self, other: &Number) -> Option<Number> {
+        let a = self.to_bigint()?;
+        let b = other.to_bigint()?;
+        Some(simplify_bigint(&a | &b))
+    }
+
+    /// R6RS `bitwise-xor` — two's-complement infinite-precision bitwise XOR.
+    /// Returns `None` for non-integer operands.
+    pub fn bit_xor(&self, other: &Number) -> Option<Number> {
+        let a = self.to_bigint()?;
+        let b = other.to_bigint()?;
+        Some(simplify_bigint(&a ^ &b))
+    }
+
+    /// R6RS `bitwise-not` — two's-complement bitwise NOT.
+    /// Identity: `!(n) = -(n + 1)`.
+    /// Returns `None` for non-integer operands.
+    pub fn bit_not(&self) -> Option<Number> {
+        let n = self.to_bigint()?;
+        // Two's complement: !(n) = -(n + 1)
+        Some(simplify_bigint(-n - BigInt::one()))
+    }
+
+    /// R6RS `arithmetic-shift` — infinite-precision two's-complement shift.
+    /// Positive `count` = left shift (result grows); negative = arithmetic
+    /// (floor) right shift.  Returns `None` if either operand is non-integer
+    /// or if `count` is outside `i64` range (absurd in practice).
+    ///
+    /// # Examples
+    /// ```
+    /// use cs_core::number::Number;
+    /// // (arithmetic-shift 1 64) = 2^64
+    /// let result = Number::Fixnum(1).arith_shift(&Number::Fixnum(64)).unwrap();
+    /// assert!(matches!(result, Number::Big(_)));
+    /// // (arithmetic-shift 255 -4) = 15
+    /// assert!(matches!(
+    ///     Number::Fixnum(255).arith_shift(&Number::Fixnum(-4)),
+    ///     Some(Number::Fixnum(15))
+    /// ));
+    /// ```
+    pub fn arith_shift(&self, count: &Number) -> Option<Number> {
+        let n = self.to_bigint()?;
+        let c = count.to_bigint()?;
+        let c_i64 = c.to_i64()?;
+        if c_i64 >= 0 {
+            Some(simplify_bigint(n << (c_i64 as usize)))
+        } else {
+            let abs = (-c_i64) as usize;
+            Some(simplify_bigint(bigint_arith_shr(n, abs)))
+        }
+    }
+}
+
+/// Arithmetic (floor toward −∞) right shift for `BigInt`.
+/// For non-negative `n`: plain `n >> abs`.
+/// For negative `n`: `-((-n - 1) >> abs) - 1`, preserving two's-complement
+/// sign extension.
+fn bigint_arith_shr(n: BigInt, abs: usize) -> BigInt {
+    if n >= BigInt::zero() {
+        n >> abs
+    } else {
+        let pos = -&n - BigInt::one();
+        -(pos >> abs) - BigInt::one()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NumError {
     DivisionByZero,
@@ -593,5 +678,146 @@ mod tests {
         let a = Number::Fixnum(1);
         let b = Number::Fixnum(0);
         assert!(matches!(a.div(&b), Err(NumError::DivisionByZero)));
+    }
+
+    // ---- bignum bitwise tests ----
+
+    fn big_int(s: &str) -> BigInt {
+        s.parse().unwrap()
+    }
+
+    fn unwrap_fixnum(n: Option<Number>) -> i64 {
+        match n {
+            Some(Number::Fixnum(v)) => v,
+            other => panic!("expected Some(Fixnum), got {:?}", other),
+        }
+    }
+
+    fn unwrap_bigint(n: Option<Number>) -> BigInt {
+        match n {
+            Some(Number::Big(b)) => b.as_ref().clone(),
+            other => panic!("expected Some(Big), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bit_and_bignum_u64max_and_127() {
+        // (bitwise-and (2^64 - 1) 127) = 127 — the bead's canonical failing case.
+        let a = Number::Big(Rc::new(big_int("18446744073709551615")));
+        let b = Number::Fixnum(127);
+        assert_eq!(unwrap_fixnum(a.bit_and(&b)), 127);
+    }
+
+    #[test]
+    fn bit_and_fixnum_fast_path() {
+        // Fixnum inputs still normalize back to Fixnum.
+        assert_eq!(
+            unwrap_fixnum(Number::Fixnum(12).bit_and(&Number::Fixnum(10))),
+            8
+        );
+    }
+
+    #[test]
+    fn bit_or_bignum() {
+        // (bitwise-ior 2^100 1) = 2^100 + 1
+        let pow100: BigInt = BigInt::one() << 100_usize;
+        let a = Number::Big(Rc::new(pow100.clone()));
+        let result = unwrap_bigint(a.bit_or(&Number::Fixnum(1)));
+        assert_eq!(result, pow100 + BigInt::one());
+    }
+
+    #[test]
+    fn bit_xor_same_value_is_zero() {
+        let pow70: BigInt = BigInt::one() << 70_usize;
+        let a = Number::Big(Rc::new(pow70.clone()));
+        let b = Number::Big(Rc::new(pow70));
+        assert_eq!(unwrap_fixnum(a.bit_xor(&b)), 0);
+    }
+
+    #[test]
+    fn bit_not_bignum() {
+        // (bitwise-not 2^64) = -(2^64 + 1)
+        let pow64: BigInt = BigInt::one() << 64_usize;
+        let n = Number::Big(Rc::new(pow64.clone()));
+        let result = unwrap_bigint(n.bit_not());
+        let expected: BigInt = -(pow64 + BigInt::one());
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn bit_not_negative_roundtrip() {
+        // !(!(n)) = n for any integer n.
+        for v in [-100i64, -1, 0, 1, 127, i64::MAX] {
+            let result = unwrap_fixnum(Number::Fixnum(v).bit_not().unwrap().bit_not());
+            assert_eq!(result, v, "bit_not roundtrip failed for {}", v);
+        }
+    }
+
+    #[test]
+    fn arith_shift_left_big() {
+        // (arithmetic-shift 1 64) = 2^64
+        let result = unwrap_bigint(Number::Fixnum(1).arith_shift(&Number::Fixnum(64)));
+        let expected: BigInt = BigInt::one() << 64_usize;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn arith_shift_left_small() {
+        // (arithmetic-shift 1 3) = 8 — stays Fixnum.
+        assert_eq!(
+            unwrap_fixnum(Number::Fixnum(1).arith_shift(&Number::Fixnum(3))),
+            8
+        );
+    }
+
+    #[test]
+    fn arith_shift_right_fixnum() {
+        // (arithmetic-shift 255 -4) = 15
+        assert_eq!(
+            unwrap_fixnum(Number::Fixnum(255).arith_shift(&Number::Fixnum(-4))),
+            15
+        );
+    }
+
+    #[test]
+    fn arith_shift_right_negative_one() {
+        // (arithmetic-shift -1 -80) = -1  (sign extension: all ones >> anything = -1)
+        assert_eq!(
+            unwrap_fixnum(Number::Fixnum(-1).arith_shift(&Number::Fixnum(-80))),
+            -1
+        );
+    }
+
+    #[test]
+    fn arith_shift_left_negative_n() {
+        // (arithmetic-shift -1 80) = -(2^80)
+        let result = unwrap_bigint(Number::Fixnum(-1).arith_shift(&Number::Fixnum(80)));
+        let expected: BigInt = -(BigInt::one() << 80_usize);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn arith_shift_right_bignum() {
+        // (arithmetic-shift 2^80 -40) = 2^40 = 1099511627776 (fits in Fixnum).
+        let pow80 = Number::Big(Rc::new(BigInt::one() << 80_usize));
+        // 2^40 fits in i64, so simplify_bigint returns Fixnum.
+        assert_eq!(
+            unwrap_fixnum(pow80.arith_shift(&Number::Fixnum(-40))),
+            1_i64 << 40
+        );
+    }
+
+    #[test]
+    fn bit_and_negative_two_complement() {
+        // (-1) & 127 = 127
+        assert_eq!(
+            unwrap_fixnum(Number::Fixnum(-1).bit_and(&Number::Fixnum(127))),
+            127
+        );
+        // (-2) & (-1) = -2
+        assert_eq!(
+            unwrap_fixnum(Number::Fixnum(-2).bit_and(&Number::Fixnum(-1))),
+            -2
+        );
     }
 }
