@@ -61,6 +61,7 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("store-iter", store_iter),
         UntypedProc::new("store-iter-next", store_iter_next),
         UntypedProc::new("store-iter-close", store_iter_close),
+        UntypedProc::new("store-seek", store_seek),
         UntypedProc::new("store-checkpoint", store_checkpoint),
         UntypedProc::new("store-flush", store_flush),
         UntypedProc::new("store-flush-wal", store_flush_wal),
@@ -603,6 +604,52 @@ fn store_iter_close(args: &[Value]) -> Result<Value, FfiError> {
             iter_id
         )))
     }
+}
+
+/// `(store-seek handle cf seekkey prefix)` -> `(key . value)` | `#f`
+///
+/// One-shot O(log n) RocksDB Seek: position the iterator at the first key
+/// `>= seekkey` and return that single `(key . value)` IFF the key still starts
+/// with `prefix` (the bounding group), else `#f`. Unlike `store-iter` this does
+/// NOT materialise the whole prefix range — it returns at most one row, which is
+/// exactly what a "latest version <= readRev" MVCC point read needs (cw-u4a.38):
+/// seek to `K || INV(rev16(readRev, MAX))` and take the first record still under
+/// the `K` prefix.
+fn store_seek(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 4 {
+        return Err(arity_err("store-seek", "4", args.len()));
+    }
+    let id = expect_fixnum("store-seek", args, 0)?;
+    let cf_name = expect_string("store-seek", args, 1)?;
+    let seekkey = expect_bv("store-seek", args, 2)?;
+    let prefix = expect_bv("store-seek", args, 3)?;
+
+    let r = db_lock()?;
+    let db = r
+        .slots
+        .get(&id)
+        .ok_or_else(|| FfiError::HostFailure(format!("store-seek: bad handle {}", id)))?;
+    let mut raw = if cf_name == "default" {
+        db.raw_iterator()
+    } else {
+        let cf = db.cf_handle(&cf_name).ok_or_else(|| {
+            FfiError::HostFailure(format!("store-seek: unknown CF {:?}", cf_name))
+        })?;
+        db.raw_iterator_cf(cf)
+    };
+    raw.seek(&seekkey);
+    if !raw.valid() {
+        return Ok(Value::Boolean(false));
+    }
+    let k = match raw.key() {
+        Some(k) => k.to_vec(),
+        None => return Ok(Value::Boolean(false)),
+    };
+    if !prefix.is_empty() && !k.starts_with(&prefix) {
+        return Ok(Value::Boolean(false));
+    }
+    let v = raw.value().unwrap_or(&[]).to_vec();
+    Ok(cons_value(bv_value(k), bv_value(v)))
 }
 
 fn store_checkpoint(args: &[Value]) -> Result<Value, FfiError> {
