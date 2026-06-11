@@ -506,6 +506,97 @@ impl Number {
             Some(simplify_bigint(bigint_arith_shr(n, abs)))
         }
     }
+
+    /// R6RS `bitwise-bit-count` — population count (number of set bits) in
+    /// infinite-precision two's-complement representation.
+    /// For `n >= 0`: number of 1 bits in the magnitude.
+    /// For `n < 0`: `-1 - bit_count(bitwise-not n)` = `-1 - bit_count(-n - 1)`.
+    /// Result is always a `Fixnum` (count ≤ bit-width of a finite number).
+    /// Returns `None` for non-integer operands.
+    pub fn bit_count(&self) -> Option<Number> {
+        match self {
+            Number::Fixnum(n) => {
+                let v = if *n >= 0 {
+                    n.count_ones() as i64
+                } else {
+                    -1 - ((!n).count_ones() as i64)
+                };
+                Some(Number::Fixnum(v))
+            }
+            Number::Big(b) => {
+                if b.sign() != num_bigint::Sign::Minus {
+                    // Non-negative: sum popcount over all bytes of the magnitude.
+                    let count: u64 = b
+                        .magnitude()
+                        .to_bytes_le()
+                        .iter()
+                        .map(|&byte| u64::from(byte.count_ones()))
+                        .sum();
+                    Some(Number::Fixnum(count as i64))
+                } else {
+                    // Negative n: bit_count(n) = -1 - bit_count(-n - 1)
+                    let pos = -b.as_ref() - BigInt::one();
+                    let count: u64 = pos
+                        .magnitude()
+                        .to_bytes_le()
+                        .iter()
+                        .map(|&byte| u64::from(byte.count_ones()))
+                        .sum();
+                    Some(Number::Fixnum(-1 - count as i64))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// R6RS `bitwise-length` — number of bits needed to represent `n`
+    /// (excluding the sign bit), i.e. `floor(log2(|n|)) + 1` for `|n| > 0`,
+    /// or 0 for `n = 0` and `n = -1`.
+    /// For `n >= 0`: `BigInt::bits()` of the magnitude.
+    /// For `n < 0`: `bit_length(-n - 1)` (two's-complement sign extension).
+    /// Result is always a `Fixnum`. Returns `None` for non-integers.
+    pub fn bit_length(&self) -> Option<Number> {
+        match self {
+            Number::Fixnum(n) => {
+                let abs = if *n < 0 { !n } else { *n };
+                let bits = if abs == 0 {
+                    0
+                } else {
+                    64 - abs.leading_zeros() as i64
+                };
+                Some(Number::Fixnum(bits))
+            }
+            Number::Big(b) => {
+                if b.sign() != num_bigint::Sign::Minus {
+                    // Non-negative: number of significant bits.
+                    Some(Number::Fixnum(b.bits() as i64))
+                } else {
+                    // Negative: bit_length(-n - 1), which is >= 0.
+                    let pos = -b.as_ref() - BigInt::one();
+                    Some(Number::Fixnum(pos.bits() as i64))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// R6RS `bitwise-bit-set?` — test whether bit `bit` is set in
+    /// two's-complement infinite-precision representation.
+    /// Negative `bit` index returns `false` (lenient).
+    /// Returns `None` if `self` or `bit` is non-integer, or if `bit`
+    /// is non-negative but out of `i64` range (absurd in practice).
+    pub fn bit_set_p(&self, bit: &Number) -> Option<bool> {
+        let b = bit.to_bigint()?;
+        // Negative bit index → false (lenient, matches R6RS spec extension).
+        if b.sign() == num_bigint::Sign::Minus {
+            return Some(false);
+        }
+        // Right-shift self by `bit` and test the LSB.
+        let neg_bit = bit.neg();
+        let shifted = self.arith_shift(&neg_bit)?;
+        let lsb = shifted.bit_and(&Number::Fixnum(1))?;
+        Some(!lsb.is_zero())
+    }
 }
 
 /// Arithmetic (floor toward −∞) right shift for `BigInt`.
@@ -818,6 +909,113 @@ mod tests {
         assert_eq!(
             unwrap_fixnum(Number::Fixnum(-2).bit_and(&Number::Fixnum(-1))),
             -2
+        );
+    }
+
+    // ---- bit_count tests ----
+
+    #[test]
+    fn bit_count_fixnum_positive() {
+        assert_eq!(unwrap_fixnum(Number::Fixnum(0).bit_count()), 0);
+        assert_eq!(unwrap_fixnum(Number::Fixnum(1).bit_count()), 1);
+        assert_eq!(unwrap_fixnum(Number::Fixnum(0b1010_1010).bit_count()), 4);
+    }
+
+    #[test]
+    fn bit_count_fixnum_negative() {
+        // R6RS: bit_count(-1) = -1  (bitwise-not(-1)=0, popcount(0)=0, -1-0=-1)
+        assert_eq!(unwrap_fixnum(Number::Fixnum(-1).bit_count()), -1);
+        // bit_count(-2) = -2  (bitwise-not(-2)=1, popcount(1)=1, -1-1=-2)
+        assert_eq!(unwrap_fixnum(Number::Fixnum(-2).bit_count()), -2);
+    }
+
+    #[test]
+    fn bit_count_bignum_pow100() {
+        // 2^100 has exactly 1 set bit.
+        let n = Number::Big(Rc::new(BigInt::one() << 100_usize));
+        assert_eq!(unwrap_fixnum(n.bit_count()), 1);
+    }
+
+    #[test]
+    fn bit_count_bignum_all_ones() {
+        // 2^100 - 1 has 100 set bits.
+        let n = Number::Big(Rc::new((BigInt::one() << 100_usize) - BigInt::one()));
+        assert_eq!(unwrap_fixnum(n.bit_count()), 100);
+    }
+
+    #[test]
+    fn bit_count_bignum_negative() {
+        // bit_count(-(2^64)) = -1 - bit_count(2^64 - 1)
+        // 2^64 - 1 has 64 set bits, so result = -1 - 64 = -65.
+        let n = Number::Big(Rc::new(-(BigInt::one() << 64_usize)));
+        assert_eq!(unwrap_fixnum(n.bit_count()), -65);
+    }
+
+    // ---- bit_length tests ----
+
+    #[test]
+    fn bit_length_fixnum() {
+        assert_eq!(unwrap_fixnum(Number::Fixnum(0).bit_length()), 0);
+        assert_eq!(unwrap_fixnum(Number::Fixnum(1).bit_length()), 1);
+        assert_eq!(unwrap_fixnum(Number::Fixnum(4).bit_length()), 3);
+        // R6RS: bitwise-length(-1) = 0  (bitwise-not(-1) = 0, length(0) = 0)
+        assert_eq!(unwrap_fixnum(Number::Fixnum(-1).bit_length()), 0);
+        // bitwise-length(-2) = 1  (-(-2)-1 = 1, length(1) = 1)
+        assert_eq!(unwrap_fixnum(Number::Fixnum(-2).bit_length()), 1);
+    }
+
+    #[test]
+    fn bit_length_bignum_pow100() {
+        // bitwise-length(2^100) = 101
+        let n = Number::Big(Rc::new(BigInt::one() << 100_usize));
+        assert_eq!(unwrap_fixnum(n.bit_length()), 101);
+    }
+
+    #[test]
+    fn bit_length_bignum_negative() {
+        // bitwise-length(-(2^100)) = bit_length(2^100 - 1) = 100
+        let n = Number::Big(Rc::new(-(BigInt::one() << 100_usize)));
+        assert_eq!(unwrap_fixnum(n.bit_length()), 100);
+    }
+
+    // ---- bit_set_p tests ----
+
+    #[test]
+    fn bit_set_p_bignum_exact_bit() {
+        // bit 100 of 2^100 is set; bit 99 is not.
+        let n = Number::Big(Rc::new(BigInt::one() << 100_usize));
+        assert_eq!(n.bit_set_p(&Number::Fixnum(100)), Some(true));
+        assert_eq!(n.bit_set_p(&Number::Fixnum(99)), Some(false));
+        assert_eq!(n.bit_set_p(&Number::Fixnum(0)), Some(false));
+    }
+
+    #[test]
+    fn bit_set_p_negative_n_high_bit() {
+        // All bits of -1 are set (two's complement).
+        assert_eq!(
+            Number::Fixnum(-1).bit_set_p(&Number::Fixnum(200)),
+            Some(true)
+        );
+        assert_eq!(Number::Fixnum(-1).bit_set_p(&Number::Fixnum(0)), Some(true));
+    }
+
+    #[test]
+    fn bit_set_p_negative_bit_index_returns_false() {
+        assert_eq!(
+            Number::Fixnum(42).bit_set_p(&Number::Fixnum(-1)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn bit_set_p_fixnum_regressions() {
+        assert_eq!(
+            Number::Fixnum(0b1010).bit_set_p(&Number::Fixnum(1)),
+            Some(true)
+        );
+        assert_eq!(
+            Number::Fixnum(0b1010).bit_set_p(&Number::Fixnum(0)),
+            Some(false)
         );
     }
 }
