@@ -134,6 +134,16 @@ pub struct CompiledLambda {
     /// is still populated (kept for the no-fast-path fallback in apply,
     /// arity errors, error spans, and future tooling).
     pub fast: Option<FastPrimopBody>,
+    /// Set for the single-binding `letrec` lambda (the named-`let`
+    /// shape). The closure is built BEFORE the letrec scope layer, so
+    /// it does NOT capture the env layer holding its own binding —
+    /// that self-capture is a closure↔env Rc cycle the Rc heap can
+    /// never reclaim, leaked once per *execution* of the form (the
+    /// crab-watchstore ~150KB/request server leak). Self-references
+    /// in the body instead resolve through this name, which every
+    /// bytecode call path binds to the closure itself in the callee
+    /// frame env (the JIT resolves them earlier, via `SelfRef`).
+    pub self_bind: Option<Symbol>,
     /// Shared per-lambda JIT profile: tier-up counter, compiled
     /// native pointer, type signature, stack maps. Exactly one
     /// `LambdaProfile` per `CompiledLambda`, shared (via `Rc`) by

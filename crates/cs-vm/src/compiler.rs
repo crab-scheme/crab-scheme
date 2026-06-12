@@ -147,6 +147,88 @@ fn collect_assigned_names(expr: &CoreExpr, out: &mut HashSet<Symbol>) {
     }
 }
 
+/// Walk `expr` and add every `Ref { name, .. }` to `out`. Conservative:
+/// shadowed names are included too — for the letrec dependency analysis
+/// below a false edge only affects ordering or forces the (safe)
+/// original compile path, never correctness.
+fn collect_ref_names(expr: &CoreExpr, out: &mut HashSet<Symbol>) {
+    match expr {
+        CoreExpr::Const { .. } => {}
+        CoreExpr::Ref { name, .. } => {
+            out.insert(*name);
+        }
+        CoreExpr::Set { name, value, .. } => {
+            out.insert(*name);
+            collect_ref_names(value, out);
+        }
+        CoreExpr::Lambda { body, .. } => collect_ref_names(body, out),
+        CoreExpr::App { func, args, .. } => {
+            collect_ref_names(func, out);
+            for a in args {
+                collect_ref_names(a, out);
+            }
+        }
+        CoreExpr::If {
+            cond, then, alt, ..
+        } => {
+            collect_ref_names(cond, out);
+            collect_ref_names(then, out);
+            collect_ref_names(alt, out);
+        }
+        CoreExpr::Begin { exprs, .. } => {
+            for e in exprs {
+                collect_ref_names(e, out);
+            }
+        }
+        CoreExpr::Letrec { bindings, body, .. } => {
+            for (_, v) in bindings {
+                collect_ref_names(v, out);
+            }
+            collect_ref_names(body, out);
+        }
+        CoreExpr::WithContinuationMark { key, val, body, .. } => {
+            collect_ref_names(key, out);
+            collect_ref_names(val, out);
+            collect_ref_names(body, out);
+        }
+    }
+}
+
+/// Topologically order letrec bindings by their sibling references
+/// (self-edges ignored — self-recursion resolves via `self_bind`).
+/// Returns `None` when the sibling graph has a cycle (true mutual
+/// recursion), in which case the caller keeps the classic compile.
+fn letrec_topo_order(bindings: &[(Symbol, CoreExpr)], names: &[Symbol]) -> Option<Vec<usize>> {
+    let index_of: HashMap<Symbol, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    // deps[i] = set of sibling indices binding i references (minus self)
+    let deps: Vec<HashSet<usize>> = bindings
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| {
+            let mut refs = HashSet::new();
+            collect_ref_names(v, &mut refs);
+            refs.iter()
+                .filter_map(|r| index_of.get(r).copied())
+                .filter(|&j| j != i)
+                .collect()
+        })
+        .collect();
+    // Kahn's algorithm.
+    let n = bindings.len();
+    let mut remaining: Vec<HashSet<usize>> = deps;
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    while order.len() < n {
+        let next = (0..n).find(|&i| !placed[i] && remaining[i].is_empty())?;
+        placed[next] = true;
+        order.push(next);
+        for r in remaining.iter_mut() {
+            r.remove(&next);
+        }
+    }
+    Some(order)
+}
+
 /// Buffered output of compile: parallel insts + spans Vecs that grow
 /// together, ensuring spans[i] is the source span of insts[i].
 struct InstBuf {
@@ -539,6 +621,7 @@ fn compile_expr(
                 body: Rc::new(body_insts),
                 spans: Rc::new(body_spans),
                 fast,
+                self_bind: None,
                 profile: Default::default(),
             });
             out.push(Inst::MakeClosure(lambda_idx), *s);
@@ -571,6 +654,62 @@ fn compile_expr(
             // For non-tail context, the body leaves a value on the
             // stack and control flows to `LeaveScope`, which pops the
             // env layer while the value-stack top passes through.
+            // Letrec-of-lambdas cycle avoidance (cw-6m8). The classic
+            // compile order — push the scope layer, then build closures
+            // that capture it — makes every closure capture the env layer
+            // holding its OWN binding: a closure↔layer Rc cycle that no
+            // refcount can reclaim, leaked once per *execution* of the
+            // form (~1KB). Named lets and internal defines are letrecs,
+            // so long-lived server actors ground through GiBs of these
+            // (the crab-watchstore ~150KB/request leak).
+            //
+            // When every binding is a lambda, no bound name is `set!`,
+            // and the sibling-reference graph is ACYCLIC (self-recursion
+            // allowed — it resolves via `self_bind` at call time), the
+            // closures can be built in dependency order, each BEFORE the
+            // scope layer that holds its own binding: references to
+            // earlier siblings resolve through captured earlier layers,
+            // self-references through `self_bind`, and no closure ever
+            // captures its own layer — no cycle. All-lambda initializers
+            // make the reorder unobservable (R6RS letrec restriction).
+            // True mutual recursion (a cyclic SCC) keeps the original
+            // path — that cycle is semantically real.
+            {
+                let names: Vec<Symbol> = bindings.iter().map(|(n, _)| *n).collect();
+                let all_lambdas = bindings
+                    .iter()
+                    .all(|(_, v)| matches!(v, CoreExpr::Lambda { .. }));
+                let mut assigned = HashSet::new();
+                for (_, v) in bindings {
+                    collect_assigned_names(v, &mut assigned);
+                }
+                collect_assigned_names(body, &mut assigned);
+                let no_sets = names.iter().all(|n| !assigned.contains(n));
+                if all_lambdas && no_sets {
+                    if let Some(order) = letrec_topo_order(bindings, &names) {
+                        let frame: HashSet<Symbol> = names.iter().copied().collect();
+                        scope.push(frame);
+                        for &i in &order {
+                            let (name, lam_expr) = (&bindings[i].0, &bindings[i].1);
+                            compile_expr(lam_expr, out, lambdas, false, globals, primops, scope)?;
+                            // compile_expr(Lambda) pushes its CompiledLambda
+                            // LAST (inner lambdas are pushed during the body
+                            // compile), so the MakeClosure just emitted refers
+                            // to lambdas.last().
+                            lambdas.last_mut().expect("lambda just compiled").self_bind =
+                                Some(*name);
+                            out.push(Inst::EnterScope, *s);
+                            out.push(Inst::DefineLocal(*name), lam_expr.span());
+                        }
+                        compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+                        for _ in &order {
+                            out.push(Inst::LeaveScope, body.span());
+                        }
+                        scope.pop();
+                        return Ok(());
+                    }
+                }
+            }
             let frame: HashSet<Symbol> = bindings.iter().map(|(s, _)| *s).collect();
             scope.push(frame);
             out.push(Inst::EnterScope, *s);

@@ -311,6 +311,16 @@ pub fn eval(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value,
 fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let mut cur_expr = expr.clone();
     let mut cur_env = env;
+    // Backtrace-span high-water for THIS eval_inner activation. The App
+    // arm pushes a call-site span per application, but a TAIL call
+    // `continue`s this loop without returning through `eval`'s
+    // truncate — so before the fix a walker-tier tail loop leaked one
+    // Span per iteration, forever (a long-lived server's idle
+    // `(let park () (yield) (park))` ground RSS up at ~16MB/s; the
+    // crab-watchstore WAN melt). Truncating at the back-edge keeps the
+    // CURRENT iteration's chain for error backtraces — prior
+    // iterations' spans are the same call sites repeated.
+    let tail_snapshot = ctx.call_stack.len();
 
     loop {
         // No depth check here: `depth` is bumped + checked in
@@ -469,6 +479,9 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                             }
                             cur_env = new_env;
                             cur_expr = (*c.body).clone();
+                            // Tail-call back-edge: drop this iteration's
+                            // call-site spans (see tail_snapshot above).
+                            ctx.call_stack.truncate(tail_snapshot);
                             continue;
                         }
                         if let Some(param) = any.downcast_ref::<Parameter>() {

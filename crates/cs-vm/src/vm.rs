@@ -538,7 +538,23 @@ pub unsafe extern "C" fn vm_env_lookup_any(sym: i64) -> i64 {
     let sym = Symbol(sym as u32);
     match env.get(sym) {
         Some(v) => value_to_gc_i64(v),
-        None => panic!("vm_env_lookup_any: unbound symbol {:?}", sym),
+        None => {
+            // Resolve the symbol's name for the diagnostic when the
+            // dispatch site installed the active symbol table.
+            let name = {
+                let syms = jit_active_syms();
+                if syms.is_null() {
+                    None
+                } else {
+                    Some(unsafe { &*syms }.name(sym).to_string())
+                }
+            };
+            panic!(
+                "vm_env_lookup_any: unbound symbol {:?} ({})",
+                sym,
+                name.as_deref().unwrap_or("?")
+            )
+        }
     }
 }
 
@@ -9471,7 +9487,12 @@ pub unsafe extern "C" fn vm_ic_dispatch(
     // `[Flonum]` hint emit `FlonumMul` etc. which silently miscompiles
     // when called with a Fixnum (NaN * NaN preserves operand bits).
     let body_is_uniform_nb = closure.jit_return_type() == JIT_RT_NB;
-    let needs_frame_env = closure.jit_needs_frame_env();
+    // self_bind lambdas (named-let shape, cw-6m8) no longer capture the
+    // env layer holding their own binding; the SelfRef-at-branch
+    // materialization looks the name up in the frame env, so one must
+    // exist and carry the binding (installed by the frame-env builders).
+    let needs_frame_env =
+        closure.jit_needs_frame_env() || closure.bc.lambdas[closure.lambda_idx].self_bind.is_some();
     let mut jit_args: [i64; 6] = [0; 6];
     if n_args > jit_args.len() {
         // Beyond the fast-path arity window — decode args and route
@@ -9625,6 +9646,13 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         let lam = &closure.bc.lambdas[closure.lambda_idx];
         for (name, v) in lam.params.iter().zip(value_args.iter()) {
             env.define(*name, v.clone());
+        }
+        // Named-let cycle break (CompiledLambda::self_bind): inner
+        // closures built by this JIT body may look the name up here.
+        if let Some(sb) = lam.self_bind {
+            if let Some(v) = closure.self_value() {
+                env.define(sb, v);
+            }
         }
         Some(env)
     } else {
@@ -9864,15 +9892,15 @@ pub unsafe extern "C" fn vm_make_closure(lambda_idx: i64) -> i64 {
     // instance of this lambda — cloning is a cheap `Rc` refcount
     // bump. (Post-M8 JIT plan, Stage 0.)
     let profile = bc_rc.lambdas[lambda_idx].profile.clone();
-    let cl = VmClosure {
+    let p: Rc<dyn Procedure> = Rc::new_cyclic(|w| VmClosure {
         lambda_idx,
         env: env_rc,
         bc: bc_rc,
         profile,
         self_name: Cell::new(None),
+        self_weak: w.clone(),
         closure_id: alloc_closure_id(),
-    };
-    let p: Rc<dyn Procedure> = Rc::new(cl);
+    });
     value_to_gc_i64(Value::Procedure(p))
 }
 
@@ -10087,12 +10115,21 @@ fn run_jit_body_once(
     // `MakeClosure` that captures invocation params. Bind params as
     // NanboxValue directly via `define_nb`, mirroring the `LoadVar`
     // fast path that lives in K2.
-    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env() {
+    let frame_env_holder: Option<Rc<Env>> = if closure.jit_needs_frame_env()
+        || closure.bc.lambdas[closure.lambda_idx].self_bind.is_some()
+    {
         let env = Env::child(closure.env.clone());
         let lam = &closure.bc.lambdas[closure.lambda_idx];
         for (name, nb) in lam.params.iter().zip(args.iter()) {
             let cloned = unsafe { vm_value_clone_gc(nb.into_raw()) };
             env.define_nb(*name, NanboxValue(cloned));
+        }
+        // Named-let cycle break (CompiledLambda::self_bind): inner
+        // closures built by this JIT body may look the name up here.
+        if let Some(sb) = lam.self_bind {
+            if let Some(v) = closure.self_value() {
+                env.define(sb, v);
+            }
         }
         Some(env)
     } else {
@@ -10793,6 +10830,13 @@ pub struct VmClosure {
     /// Stays per-instance: it's a property of the binding, and the
     /// tier-up hook reads it from whichever instance triggered it.
     self_name: Cell<Option<Symbol>>,
+    /// Weak handle to this closure's own `Rc` (set via `Rc::new_cyclic`
+    /// at both construction sites). Lets contexts that only hold a
+    /// `&VmClosure` (the JIT frame-env builders) rebuild the
+    /// `Value::Procedure` for the `self_bind` binding without threading
+    /// the strong `Rc` through every signature. Weak, so it does not
+    /// keep the closure alive (no cycle).
+    self_weak: std::rc::Weak<VmClosure>,
     /// Stable, process-wide unique identity. Stamped once at
     /// construction (the `Inst::MakeClosure` site in `run_dispatch`)
     /// from [`NEXT_CLOSURE_ID`] and never mutated thereafter — the
@@ -10908,6 +10952,16 @@ fn alloc_closure_id() -> u32 {
 }
 
 impl VmClosure {
+    /// Rebuild the `Value::Procedure` for this closure from its weak
+    /// self-handle (set at construction). Used by the JIT frame-env
+    /// builders to install the `self_bind` binding when only a
+    /// `&VmClosure` is in scope. `None` only if the closure is mid-drop.
+    fn self_value(&self) -> Option<Value> {
+        self.self_weak
+            .upgrade()
+            .map(|rc| Value::Procedure(rc as Rc<dyn cs_core::Procedure>))
+    }
+
     // The JIT accessors below all forward to the shared
     // [`LambdaProfile`] (`self.profile`). Keeping them on `VmClosure`
     // means every existing call site — the dispatch path, the
@@ -11860,6 +11914,12 @@ fn run_dispatch(
                             let rest =
                                 stack.slice_as_values(args_start + lam.params.len()..stack_len);
                             new_env.define(rest_name, Value::list(rest.into_iter()));
+                        }
+                        // Named-let cycle break (see CompiledLambda::self_bind):
+                        // the closure no longer captures the layer holding its
+                        // own binding, so bind the name → itself per call.
+                        if let Some(sb) = lam.self_bind {
+                            new_env.define(sb, Value::Procedure(func_proc.clone()));
                         }
                         stack.truncate(func_idx);
                         if is_tail {
@@ -13296,6 +13356,10 @@ fn run_dispatch(
                                 let rest = &args[lam.params.len()..];
                                 new_env.define(rest_name, Value::list(rest.iter().cloned()));
                             }
+                            // Named-let cycle break (CompiledLambda::self_bind).
+                            if let Some(sb) = lam.self_bind {
+                                new_env.define(sb, Value::Procedure(p.clone()));
+                            }
                             if is_tail {
                                 // Replace current frame instead of pushing.
                                 let last = frames.last_mut().unwrap();
@@ -13378,7 +13442,7 @@ fn run_dispatch(
                 // The IC uses this as its cache key; assigning at
                 // the (single) construction site keeps the id
                 // immutable for the closure's lifetime.
-                let cl = VmClosure {
+                let p: Rc<dyn Procedure> = Rc::new_cyclic(|w| VmClosure {
                     lambda_idx: *idx,
                     env: frame.env.clone(),
                     bc: frame.bc.clone(),
@@ -13386,9 +13450,9 @@ fn run_dispatch(
                     // instance of this lambda. (Post-M8 plan, Stage 0.)
                     profile: frame.bc.lambdas[*idx].profile.clone(),
                     self_name: Cell::new(None),
+                    self_weak: w.clone(),
                     closure_id: alloc_closure_id(),
-                };
-                let p: Rc<dyn Procedure> = Rc::new(cl);
+                });
                 stack.push(Value::Procedure(p));
             }
             Inst::Return => {
@@ -14612,6 +14676,10 @@ pub fn vm_call_sync(
                 if let Some(rest_name) = lam.rest {
                     let rest_args = &args[lam.params.len()..];
                     new_env.define(rest_name, Value::list(rest_args.iter().cloned()));
+                }
+                // Named-let cycle break (CompiledLambda::self_bind).
+                if let Some(sb) = lam.self_bind {
+                    new_env.define(sb, Value::Procedure(p.clone()));
                 }
                 // Reuse the closure's existing Rc<Bytecode> with an entry-
                 // insts override; avoids allocating a sub-Bytecode per HO
