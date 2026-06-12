@@ -115,6 +115,18 @@ impl Router {
         self.peers.lock().expect("peers poisoned").len()
     }
 
+    /// Labels of all currently-registered peers (cw-lkq.6: lets the etcd
+    /// MemberAdd handler resolve a joiner's node name from the mesh — the
+    /// joiner dialed in under its real name).
+    pub fn peer_labels(&self) -> Vec<String> {
+        self.peers
+            .lock()
+            .expect("peers poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Register (or replace) the transport to `peer`.
     pub fn add_peer(&self, peer: NodeId, transport: Box<dyn Transport>) {
         self.peers.lock().expect("peers poisoned").insert(
