@@ -141,6 +141,16 @@ pub fn primop_node_peer_count(node: &str) -> Result<usize, String> {
     Ok(lookup_router(node, "node-peer-count")?.peer_count())
 }
 
+/// `(node-peers NODE)` -> list of connected peer-name strings.
+pub fn b_node_peers(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("node-peers: expected (node-peers NODE)".into());
+    }
+    let node = name_of(&args[0], syms, "node-peers")?;
+    let labels = lookup_router(&node, "node-peers")?.peer_labels();
+    Ok(Value::list(labels.into_iter().map(Value::string)))
+}
+
 /// Prune peers whose transport has closed (a crashed or departed node) and
 /// return how many were dropped (also fires any pending DOWN monitors). Call
 /// periodically so `node-peer-count` reflects reality — `node-poll` does not
@@ -560,6 +570,7 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-listen-quic", b_node_listen_quic),
         ("node-connect-quic", b_node_connect_quic),
         ("node-peer-count", b_node_peer_count),
+        ("node-peers", b_node_peers),
         ("node-detect-disconnects", b_node_detect_disconnects),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
