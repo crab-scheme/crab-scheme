@@ -43,7 +43,9 @@ use cs_core::{Gc, Number, Value};
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
 
-use rocksdb::{checkpoint::Checkpoint, DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
+use rocksdb::{
+    checkpoint::Checkpoint, DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions,
+};
 
 // MultiThreaded mode (cw-b5w.6): RocksDB is internally thread-safe, so the
 // registry hands out Arc<RocksDb> clones and every operation runs WITHOUT the
