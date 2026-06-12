@@ -43,11 +43,14 @@ use cs_core::{Gc, Number, Value};
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
 
-use rocksdb::{checkpoint::Checkpoint, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{checkpoint::Checkpoint, DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
 
-// DB = DBWithThreadMode<SingleThreaded>. The DB is always accessed through the
-// Mutex in DbRegistry, which provides external synchronization.
-type RocksDb = DB;
+// MultiThreaded mode (cw-b5w.6): RocksDB is internally thread-safe, so the
+// registry hands out Arc<RocksDb> clones and every operation runs WITHOUT the
+// registry Mutex held — concurrent apply workers' reads/writes proceed in
+// parallel (the old SingleThreaded-behind-a-Mutex setup re-serialized them,
+// which is what made --shards>1 a net loss).
+type RocksDb = DBWithThreadMode<MultiThreaded>;
 
 pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
     vec![
@@ -72,7 +75,7 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
 
 struct DbRegistry {
     next_id: i64,
-    slots: HashMap<i64, RocksDb>,
+    slots: HashMap<i64, Arc<RocksDb>>,
 }
 
 fn db_registry() -> &'static Mutex<DbRegistry> {
@@ -95,8 +98,18 @@ fn db_insert(db: RocksDb) -> Result<i64, FfiError> {
     let mut r = db_lock()?;
     let id = r.next_id;
     r.next_id += 1;
-    r.slots.insert(id, db);
+    r.slots.insert(id, Arc::new(db));
     Ok(id)
+}
+
+/// Clone the Arc handle out under a BRIEF registry lock; the DB operation
+/// itself then runs unlocked (MultiThreaded RocksDB is internally safe).
+fn db_get(id: i64, who: &str) -> Result<Arc<RocksDb>, FfiError> {
+    let r = db_lock()?;
+    r.slots
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| FfiError::HostFailure(format!("{}: bad handle {}", who, id)))
 }
 
 // ---- Iterator registry -------------------------------------------------
@@ -208,7 +221,7 @@ fn open_db(path: &str, create_if_missing: bool) -> Result<RocksDb, FfiError> {
     // rocksdb_close(). The "default" CF is always implicitly available via the
     // non-CF put/get/delete/iterator methods. Non-default CFs created via
     // store-cf-create are tracked by create_cf() which adds them to the Rust map.
-    DB::open(&opts, path).map_err(|e| FfiError::HostFailure(format!("store-open: {}", e)))
+    RocksDb::open(&opts, path).map_err(|e| FfiError::HostFailure(format!("store-open: {}", e)))
 }
 
 // ---- Procedures --------------------------------------------------------
@@ -250,11 +263,7 @@ fn store_cf_create(args: &[Value]) -> Result<Value, FfiError> {
     }
     let id = expect_fixnum("store-cf-create", args, 0)?;
     let cf_name = expect_string("store-cf-create", args, 1)?;
-    let mut r = db_lock()?;
-    let db = r
-        .slots
-        .get_mut(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-cf-create: bad handle {}", id)))?;
+    let db = db_get(id, "store-cf-create")?;
     db.create_cf(&cf_name, &Options::default())
         .map_err(|e| FfiError::HostFailure(format!("store-cf-create: {}", e)))?;
     Ok(Value::Unspecified)
@@ -267,11 +276,7 @@ fn store_get(args: &[Value]) -> Result<Value, FfiError> {
     let id = expect_fixnum("store-get", args, 0)?;
     let cf_name = expect_string("store-get", args, 1)?;
     let key = expect_bv("store-get", args, 2)?;
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-get: bad handle {}", id)))?;
+    let db = db_get(id, "store-get")?;
     // For "default" use the non-CF method (DB was opened with DB::open which
     // does not register CFs in Rust's tracking map).
     let result = if cf_name == "default" {
@@ -280,7 +285,7 @@ fn store_get(args: &[Value]) -> Result<Value, FfiError> {
         let cf = db
             .cf_handle(&cf_name)
             .ok_or_else(|| FfiError::HostFailure(format!("store-get: unknown CF {:?}", cf_name)))?;
-        db.get_cf(cf, &key)
+        db.get_cf(&cf, &key)
     };
     match result.map_err(|e| FfiError::HostFailure(format!("store-get: {}", e)))? {
         Some(bytes) => Ok(bv_value(bytes)),
@@ -297,18 +302,14 @@ fn store_put(args: &[Value]) -> Result<Value, FfiError> {
     let key = expect_bv("store-put", args, 2)?;
     let val = expect_bv("store-put", args, 3)?;
     let sync = opt_bool(args, 4);
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-put: bad handle {}", id)))?;
+    let db = db_get(id, "store-put")?;
     if cf_name == "default" {
         db.put_opt(&key, &val, &write_opts(sync))
     } else {
         let cf = db
             .cf_handle(&cf_name)
             .ok_or_else(|| FfiError::HostFailure(format!("store-put: unknown CF {:?}", cf_name)))?;
-        db.put_cf_opt(cf, &key, &val, &write_opts(sync))
+        db.put_cf_opt(&cf, &key, &val, &write_opts(sync))
     }
     .map_err(|e| FfiError::HostFailure(format!("store-put: {}", e)))?;
     Ok(Value::Unspecified)
@@ -322,18 +323,14 @@ fn store_delete(args: &[Value]) -> Result<Value, FfiError> {
     let cf_name = expect_string("store-delete", args, 1)?;
     let key = expect_bv("store-delete", args, 2)?;
     let sync = opt_bool(args, 3);
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-delete: bad handle {}", id)))?;
+    let db = db_get(id, "store-delete")?;
     if cf_name == "default" {
         db.delete_opt(&key, &write_opts(sync))
     } else {
         let cf = db.cf_handle(&cf_name).ok_or_else(|| {
             FfiError::HostFailure(format!("store-delete: unknown CF {:?}", cf_name))
         })?;
-        db.delete_cf_opt(cf, &key, &write_opts(sync))
+        db.delete_cf_opt(&cf, &key, &write_opts(sync))
     }
     .map_err(|e| FfiError::HostFailure(format!("store-delete: {}", e)))?;
     Ok(Value::Unspecified)
@@ -477,11 +474,7 @@ fn store_write_batch(args: &[Value]) -> Result<Value, FfiError> {
         ops.push(parse_batch_op(elem)?);
     }
 
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-write-batch: bad handle {}", id)))?;
+    let db = db_get(id, "store-write-batch")?;
 
     let mut batch = WriteBatch::default();
     for op in ops {
@@ -493,7 +486,7 @@ fn store_write_batch(args: &[Value]) -> Result<Value, FfiError> {
                     let cfh = db.cf_handle(&cf).ok_or_else(|| {
                         FfiError::HostFailure(format!("store-write-batch: unknown CF {:?}", cf))
                     })?;
-                    batch.put_cf(cfh, &key, &val);
+                    batch.put_cf(&cfh, &key, &val);
                 }
             }
             BatchOp::Delete { cf, key } => {
@@ -503,7 +496,7 @@ fn store_write_batch(args: &[Value]) -> Result<Value, FfiError> {
                     let cfh = db.cf_handle(&cf).ok_or_else(|| {
                         FfiError::HostFailure(format!("store-write-batch: unknown CF {:?}", cf))
                     })?;
-                    batch.delete_cf(cfh, &key);
+                    batch.delete_cf(&cfh, &key);
                 }
             }
         }
@@ -526,11 +519,7 @@ fn store_iter(args: &[Value]) -> Result<Value, FfiError> {
     // This avoids any lifetime coupling between the scan and the DB handle —
     // the DB can be closed independently of the iterator handle.
     let entries = {
-        let r = db_lock()?;
-        let db = r
-            .slots
-            .get(&id)
-            .ok_or_else(|| FfiError::HostFailure(format!("store-iter: bad handle {}", id)))?;
+        let db = db_get(id, "store-iter")?;
         let mut collected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut raw = if cf_name == "default" {
             db.raw_iterator()
@@ -538,7 +527,7 @@ fn store_iter(args: &[Value]) -> Result<Value, FfiError> {
             let cf = db.cf_handle(&cf_name).ok_or_else(|| {
                 FfiError::HostFailure(format!("store-iter: unknown CF {:?}", cf_name))
             })?;
-            db.raw_iterator_cf(cf)
+            db.raw_iterator_cf(&cf)
         };
         if prefix.is_empty() {
             raw.seek_to_first();
@@ -624,18 +613,14 @@ fn store_seek(args: &[Value]) -> Result<Value, FfiError> {
     let seekkey = expect_bv("store-seek", args, 2)?;
     let prefix = expect_bv("store-seek", args, 3)?;
 
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-seek: bad handle {}", id)))?;
+    let db = db_get(id, "store-seek")?;
     let mut raw = if cf_name == "default" {
         db.raw_iterator()
     } else {
         let cf = db.cf_handle(&cf_name).ok_or_else(|| {
             FfiError::HostFailure(format!("store-seek: unknown CF {:?}", cf_name))
         })?;
-        db.raw_iterator_cf(cf)
+        db.raw_iterator_cf(&cf)
     };
     raw.seek(&seekkey);
     if !raw.valid() {
@@ -658,12 +643,8 @@ fn store_checkpoint(args: &[Value]) -> Result<Value, FfiError> {
     }
     let id = expect_fixnum("store-checkpoint", args, 0)?;
     let dir = expect_string("store-checkpoint", args, 1)?;
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-checkpoint: bad handle {}", id)))?;
-    let checkpoint = Checkpoint::new(db)
+    let db = db_get(id, "store-checkpoint")?;
+    let checkpoint = Checkpoint::new(&db)
         .map_err(|e| FfiError::HostFailure(format!("store-checkpoint: create: {}", e)))?;
     checkpoint
         .create_checkpoint(&dir)
@@ -676,11 +657,7 @@ fn store_flush(args: &[Value]) -> Result<Value, FfiError> {
         return Err(arity_err("store-flush", "1", args.len()));
     }
     let id = expect_fixnum("store-flush", args, 0)?;
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-flush: bad handle {}", id)))?;
+    let db = db_get(id, "store-flush")?;
     // DB was opened with DB::open so "default" CF is not in Rust's tracking
     // map — use the plain flush() which operates on the default CF internally.
     db.flush()
@@ -710,11 +687,7 @@ fn store_flush_wal(args: &[Value]) -> Result<Value, FfiError> {
     } else {
         true
     };
-    let r = db_lock()?;
-    let db = r
-        .slots
-        .get(&id)
-        .ok_or_else(|| FfiError::HostFailure(format!("store-flush-wal: bad handle {}", id)))?;
+    let db = db_get(id, "store-flush-wal")?;
     db.flush_wal(sync)
         .map_err(|e| FfiError::HostFailure(format!("store-flush-wal: {}", e)))?;
     Ok(Value::Unspecified)
