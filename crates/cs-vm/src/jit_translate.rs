@@ -8575,6 +8575,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None as Option<FastPrimopBody>,
+            self_bind: None,
             profile: Default::default(),
         };
         (l, fib)
@@ -8622,6 +8623,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            self_bind: None,
             profile: Default::default(),
         };
         let f = bytecode_to_rir(&lam, "addone", None).unwrap();
@@ -8652,6 +8654,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            self_bind: None,
             profile: Default::default(),
         };
         let f = bytecode_to_rir(&lam, "f", None).expect("free-var LoadVar should translate");
@@ -8687,6 +8690,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            self_bind: None,
             profile: Default::default(),
         };
         let f = bytecode_to_rir(&lam, "f", None).expect("translate succeeded");
@@ -8724,6 +8728,7 @@ mod tests {
             body: Rc::new(body),
             spans: Rc::new(vec![cs_diag::Span::DUMMY; len]),
             fast: None,
+            self_bind: None,
             profile: Default::default(),
         };
         match bytecode_to_rir(&lam, "f", None) {
