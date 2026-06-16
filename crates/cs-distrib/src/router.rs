@@ -84,12 +84,27 @@ pub struct Router {
     /// Peers keyed by `name@host` (epoch-independent) so a restarted peer
     /// replaces its predecessor and stale-epoch sends are caught.
     peers: Mutex<HashMap<String, Peer>>,
-    /// Inbound messages destined for local actors on this node.
+    /// Inbound messages destined for local actors on this node (the default
+    /// `Messages` channel — back-compat for the single-poller path).
     inbox: Mutex<VecDeque<(DistPid, Vec<u8>)>>,
+    /// cw-gx4: per-cs-net-channel inboxes, so independent consumers (e.g. one
+    /// peer-poller PER Raft group) can drain in parallel instead of serializing
+    /// on one channel. Indexed by `Channel as usize` (0..6); only the
+    /// shard channels {1,3,4,5} (Consensus/Workflow/Bulk/Observability) are used
+    /// — Control=0 is reserved for handshake/gossip, Messages=2 stays on `inbox`.
+    chan_inboxes: [Mutex<VecDeque<(DistPid, Vec<u8>)>>; 6],
     /// Active monitors of remote Pids (fire DOWN on disconnect).
     monitors: Mutex<Vec<Monitor>>,
     /// DOWN notices ready for local delivery.
     down_inbox: Mutex<VecDeque<DownNotice>>,
+}
+
+/// cw-gx4: the cs-net channels usable for per-group Raft traffic (NOT Control=0,
+/// NOT Messages=2 which is the back-compat default). 4-way parallelism.
+pub const SHARD_CHANNELS: [u8; 4] = [1, 3, 4, 5];
+
+fn channel_of(ch: u8) -> Channel {
+    Channel::ALL[(ch as usize) % Channel::ALL.len()]
 }
 
 impl Router {
@@ -98,6 +113,7 @@ impl Router {
             node,
             peers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(VecDeque::new()),
+            chan_inboxes: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
             monitors: Mutex::new(Vec::new()),
             down_inbox: Mutex::new(VecDeque::new()),
         }
@@ -162,6 +178,31 @@ impl Router {
         Ok(())
     }
 
+    /// cw-gx4: send on an explicit cs-net channel (one Raft group → one
+    /// channel) so independent groups don't serialize on `Messages`. `ch` is a
+    /// `Channel as u8` (use the {1,3,4,5} shard channels). Local targets are
+    /// delivered to the matching per-channel inbox.
+    pub fn send_ch(&self, target: &DistPid, payload: &[u8], ch: u8) -> Result<(), DistribError> {
+        if target.node == self.node {
+            self.deliver_local_ch(ch, target.clone(), payload.to_vec());
+            return Ok(());
+        }
+        let peers = self.peers.lock().expect("peers poisoned");
+        let peer = peers
+            .get(&target.node.label())
+            .ok_or_else(|| DistribError::NoTransport(target.node.label()))?;
+        if peer.node.epoch != target.node.epoch {
+            return Err(DistribError::EpochMismatch {
+                expected: peer.node.epoch,
+                got: target.node.epoch,
+            });
+        }
+        let mut frame = target.encode_vec();
+        frame.extend_from_slice(payload);
+        peer.transport.send(channel_of(ch), &frame)?;
+        Ok(())
+    }
+
     /// Drain every peer's `Messages` channel into the local inbox. Returns
     /// the number of messages delivered. A closed peer is skipped (the
     /// failure detector / DOWN path handles disconnects).
@@ -182,9 +223,30 @@ impl Router {
                 }
             }
         }
+        // cw-gx4: also drain the per-group shard channels into their own
+        // inboxes, so a per-group poller can read just its channel.
+        let mut chan_inbound: Vec<(u8, DistPid, Vec<u8>)> = Vec::new();
+        for &ch in SHARD_CHANNELS.iter() {
+            for peer in peers.values() {
+                loop {
+                    match peer.transport.try_recv(channel_of(ch)) {
+                        Ok(Some(frame)) => {
+                            let (pid, consumed) = DistPid::decode(&frame)?;
+                            chan_inbound.push((ch, pid, frame[consumed..].to_vec()));
+                            delivered += 1;
+                        }
+                        Ok(None) | Err(TransportError::PeerClosed) => break,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
         drop(peers);
         for msg in inbound {
             self.deliver_local(msg.0, msg.1);
+        }
+        for (ch, pid, payload) in chan_inbound {
+            self.deliver_local_ch(ch, pid, payload);
         }
         Ok(delivered)
     }
@@ -196,10 +258,25 @@ impl Router {
             .push_back((pid, payload));
     }
 
+    fn deliver_local_ch(&self, ch: u8, pid: DistPid, payload: Vec<u8>) {
+        self.chan_inboxes[(ch as usize) % self.chan_inboxes.len()]
+            .lock()
+            .expect("chan inbox poisoned")
+            .push_back((pid, payload));
+    }
+
     /// Pop the next inbound message for a local actor, if any. (Stands in
     /// for cs-actor mailbox delivery until that integration lands.)
     pub fn recv_local(&self) -> Option<(DistPid, Vec<u8>)> {
         self.inbox.lock().expect("inbox poisoned").pop_front()
+    }
+
+    /// cw-gx4: pop the next inbound message on a specific shard channel.
+    pub fn recv_local_channel(&self, ch: u8) -> Option<(DistPid, Vec<u8>)> {
+        self.chan_inboxes[(ch as usize) % self.chan_inboxes.len()]
+            .lock()
+            .expect("chan inbox poisoned")
+            .pop_front()
     }
 
     /// Register that local `watcher` monitors remote `target`. If the

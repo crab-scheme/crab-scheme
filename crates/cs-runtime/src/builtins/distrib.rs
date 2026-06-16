@@ -135,6 +135,37 @@ pub fn primop_node_poll(node: &str) -> Result<Vec<SendableValue>, String> {
     Ok(out)
 }
 
+/// cw-gx4: like `primop_node_send` but routes over an explicit cs-net channel
+/// `ch` (one Raft group → one channel), so groups don't serialize on Messages.
+pub fn primop_node_send_ch(
+    from: &str,
+    to: &str,
+    ch: u8,
+    msg: &SendableValue,
+) -> Result<(), String> {
+    let router = lookup_router(from, "node-send-ch")?;
+    let target = DistPid::new(node_id(to), REPLICA_LOCAL_ID);
+    let mut bytes = Vec::new();
+    encode_sendable(msg, &mut bytes)?;
+    router
+        .send_ch(&target, &bytes, ch)
+        .map_err(|e| format!("node-send-ch: {from} -> {to} ch{ch}: {e}"))
+}
+
+/// cw-gx4: pump `node`'s transports and return only the messages delivered on
+/// shard channel `ch`. A per-group poller calls this with its own channel so
+/// independent groups drain in parallel.
+pub fn primop_node_poll_ch(node: &str, ch: u8) -> Result<Vec<SendableValue>, String> {
+    let router = lookup_router(node, "node-poll-ch")?;
+    router.poll().map_err(|e| format!("node-poll-ch: {e}"))?;
+    let mut out = Vec::new();
+    while let Some((_target, payload)) = router.recv_local_channel(ch) {
+        let (sv, _consumed) = decode_sendable(&payload)?;
+        out.push(sv);
+    }
+    Ok(out)
+}
+
 /// Number of peers currently registered on `node`. A cluster bootstrap waits
 /// on this because TCP peers are added asynchronously on the accepting side.
 pub fn primop_node_peer_count(node: &str) -> Result<usize, String> {
@@ -442,6 +473,41 @@ pub fn b_node_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     Ok(Value::Unspecified)
 }
 
+fn chan_of(v: &Value, who: &str) -> Result<u8, String> {
+    match v {
+        Value::Number(cs_core::Number::Fixnum(n)) if (0..=5).contains(n) => Ok(*n as u8),
+        _ => Err(format!("{who}: channel must be an integer 0..5")),
+    }
+}
+
+/// `(node-send-ch FROM TO CH MSG)` — cw-gx4: send over cs-net channel CH.
+pub fn b_node_send_ch(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 4 {
+        return Err("node-send-ch: expected (node-send-ch FROM TO CH MSG)".into());
+    }
+    let from = name_of(&args[0], syms, "node-send-ch")?;
+    let to = name_of(&args[1], syms, "node-send-ch")?;
+    let ch = chan_of(&args[2], "node-send-ch")?;
+    let msg = to_sendable_in(&args[3], syms)?;
+    primop_node_send_ch(&from, &to, ch, &msg)?;
+    Ok(Value::Unspecified)
+}
+
+/// `(node-poll-ch NODE CH)` — cw-gx4: drain only channel CH's inbox.
+pub fn b_node_poll_ch(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("node-poll-ch: expected (node-poll-ch NODE CH)".into());
+    }
+    let node = name_of(&args[0], syms, "node-poll-ch")?;
+    let ch = chan_of(&args[1], "node-poll-ch")?;
+    let msgs = primop_node_poll_ch(&node, ch)?;
+    let mut list = Value::Null;
+    for sv in msgs.iter().rev() {
+        list = Value::Pair(Pair::new(from_sendable(sv, syms), list));
+    }
+    Ok(list)
+}
+
 /// `(node-poll NODE)` — returns a list of the messages delivered to NODE.
 pub fn b_node_poll(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
@@ -574,6 +640,8 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-detect-disconnects", b_node_detect_disconnects),
         ("node-send", b_node_send),
         ("node-poll", b_node_poll),
+        ("node-send-ch", b_node_send_ch),
+        ("node-poll-ch", b_node_poll_ch),
     ]
 }
 
