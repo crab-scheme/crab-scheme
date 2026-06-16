@@ -157,7 +157,9 @@ pub fn primop_node_send_ch(
 /// independent groups drain in parallel.
 pub fn primop_node_poll_ch(node: &str, ch: u8) -> Result<Vec<SendableValue>, String> {
     let router = lookup_router(node, "node-poll-ch")?;
-    router.poll().map_err(|e| format!("node-poll-ch: {e}"))?;
+    router
+        .poll_channel(ch)
+        .map_err(|e| format!("node-poll-ch: {e}"))?;
     let mut out = Vec::new();
     while let Some((_target, payload)) = router.recv_local_channel(ch) {
         let (sv, _consumed) = decode_sendable(&payload)?;

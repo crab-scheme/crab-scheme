@@ -251,6 +251,34 @@ impl Router {
         Ok(delivered)
     }
 
+    /// cw-gx4: drain ONLY shard channel `ch` from every peer into its inbox.
+    /// A per-group poller calls this with its own channel so it does 1/N of the
+    /// drain work and avoids the redundant all-channel sweep `poll()` does —
+    /// less per-poller CPU and less contention on the `peers` lock.
+    pub fn poll_channel(&self, ch: u8) -> Result<usize, DistribError> {
+        let peers = self.peers.lock().expect("peers poisoned");
+        let mut delivered = 0;
+        let mut inbound: Vec<(DistPid, Vec<u8>)> = Vec::new();
+        for peer in peers.values() {
+            loop {
+                match peer.transport.try_recv(channel_of(ch)) {
+                    Ok(Some(frame)) => {
+                        let (pid, consumed) = DistPid::decode(&frame)?;
+                        inbound.push((pid, frame[consumed..].to_vec()));
+                        delivered += 1;
+                    }
+                    Ok(None) | Err(TransportError::PeerClosed) => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        drop(peers);
+        for (pid, payload) in inbound {
+            self.deliver_local_ch(ch, pid, payload);
+        }
+        Ok(delivered)
+    }
+
     fn deliver_local(&self, pid: DistPid, payload: Vec<u8>) {
         self.inbox
             .lock()
