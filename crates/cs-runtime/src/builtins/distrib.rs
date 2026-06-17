@@ -45,7 +45,7 @@ use cs_net::tcp::TcpTransport;
 use cs_net::{Channel, Transport, TransportConfig};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::beam::{beam_state, from_sendable, to_sendable_in, SendableValue};
+use super::beam::{beam_state, from_sendable, SendableValue};
 
 // All single-process nodes share one host/epoch; a node is identified by name.
 const NODE_HOST: &str = "local";
@@ -150,6 +150,40 @@ pub fn primop_node_send_ch(
     router
         .send_ch(&target, &bytes, ch)
         .map_err(|e| format!("node-send-ch: {from} -> {to} ch{ch}: {e}"))
+}
+
+/// cw-sei: send a `Value` directly (no intermediate `SendableValue` tree) over
+/// channel `ch`. Fuses projection + byte-encode into one read-only walk.
+pub fn primop_node_send_ch_value(
+    from: &str,
+    to: &str,
+    ch: u8,
+    v: &Value,
+    syms: &SymbolTable,
+) -> Result<(), String> {
+    let router = lookup_router(from, "node-send-ch")?;
+    let target = DistPid::new(node_id(to), REPLICA_LOCAL_ID);
+    let mut bytes = Vec::new();
+    encode_value_in(v, syms, &mut bytes)?;
+    router
+        .send_ch(&target, &bytes, ch)
+        .map_err(|e| format!("node-send-ch: {from} -> {to} ch{ch}: {e}"))
+}
+
+/// cw-sei: `primop_node_send` direct-from-`Value` variant.
+pub fn primop_node_send_value(
+    from: &str,
+    to: &str,
+    v: &Value,
+    syms: &SymbolTable,
+) -> Result<(), String> {
+    let router = lookup_router(from, "node-send")?;
+    let target = DistPid::new(node_id(to), REPLICA_LOCAL_ID);
+    let mut bytes = Vec::new();
+    encode_value_in(v, syms, &mut bytes)?;
+    router
+        .send(&target, &bytes)
+        .map_err(|e| format!("node-send: {from} -> {to}: {e}"))
 }
 
 /// cw-gx4: pump `node`'s transports and return only the messages delivered on
@@ -470,8 +504,8 @@ pub fn b_node_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     }
     let from = name_of(&args[0], syms, "node-send")?;
     let to = name_of(&args[1], syms, "node-send")?;
-    let msg = to_sendable_in(&args[2], syms)?;
-    primop_node_send(&from, &to, &msg)?;
+    // cw-sei: encode straight from the Value, skipping the SendableValue tree.
+    primop_node_send_value(&from, &to, &args[2], syms)?;
     Ok(Value::Unspecified)
 }
 
@@ -490,8 +524,8 @@ pub fn b_node_send_ch(args: &[Value], syms: &mut SymbolTable) -> Result<Value, S
     let from = name_of(&args[0], syms, "node-send-ch")?;
     let to = name_of(&args[1], syms, "node-send-ch")?;
     let ch = chan_of(&args[2], "node-send-ch")?;
-    let msg = to_sendable_in(&args[3], syms)?;
-    primop_node_send_ch(&from, &to, ch, &msg)?;
+    // cw-sei: encode straight from the Value, skipping the SendableValue tree.
+    primop_node_send_ch_value(&from, &to, ch, &args[3], syms)?;
     Ok(Value::Unspecified)
 }
 
@@ -715,6 +749,85 @@ pub fn encode_sendable(v: &SendableValue, out: &mut Vec<u8>) -> Result<(), Strin
                 "node-send: a PID cannot cross nodes; address the peer by node name".into(),
             );
         }
+    }
+    Ok(())
+}
+
+/// cw-sei: encode a `Value` DIRECTLY to the same wire bytes as
+/// `encode_sendable(&to_sendable_in(v))`, WITHOUT allocating the intermediate
+/// `SendableValue` tree. The send path (node-send/-ch) is a hot Raft path; the
+/// profile showed `to_sendable_in` (18k samples) + its `drop_in_place` churn is
+/// pure overhead — this fuses the projection and the byte-encode into one
+/// read-only walk of the `Value`. Tag bytes MUST match `encode_sendable`.
+pub fn encode_value_in(v: &Value, syms: &SymbolTable, out: &mut Vec<u8>) -> Result<(), String> {
+    match v {
+        Value::Null => out.push(0),
+        Value::Unspecified => out.push(1),
+        Value::Eof => out.push(2),
+        Value::Boolean(b) => {
+            out.push(3);
+            out.push(u8::from(*b));
+        }
+        Value::Character(c) => {
+            out.push(4);
+            out.extend_from_slice(&(*c as u32).to_be_bytes());
+        }
+        Value::Number(n) => match n {
+            cs_core::Number::Fixnum(i) => {
+                out.push(5);
+                out.extend_from_slice(&i.to_be_bytes());
+            }
+            cs_core::Number::Flonum(f) => {
+                out.push(6);
+                out.extend_from_slice(&f.to_bits().to_be_bytes());
+            }
+            cs_core::Number::Big(b) => {
+                out.push(7);
+                put_bytes(out, b.to_str_radix(10).as_bytes());
+            }
+            cs_core::Number::Rat(_) => {
+                return Err("node-send: rationals not yet supported across actors".into());
+            }
+        },
+        Value::String(s) => {
+            out.push(8);
+            put_bytes(out, s.borrow().as_bytes());
+        }
+        Value::Symbol(s) => {
+            out.push(9);
+            put_bytes(out, syms.name(*s).as_bytes());
+        }
+        Value::Identifier { name, .. } => {
+            out.push(9);
+            put_bytes(out, syms.name(*name).as_bytes());
+        }
+        Value::Pair(p) => {
+            out.push(10);
+            encode_value_in(&p.car.borrow(), syms, out)?;
+            encode_value_in(&p.cdr.borrow(), syms, out)?;
+        }
+        Value::Vector(items) => {
+            out.push(11);
+            let items = items.borrow();
+            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for it in items.iter() {
+                encode_value_in(it, syms, out)?;
+            }
+        }
+        Value::ByteVector(bytes) => {
+            out.push(12);
+            put_bytes(out, &bytes.borrow());
+        }
+        Value::Procedure(_) => {
+            return Err("node-send: procedures cannot cross actor boundaries".into());
+        }
+        Value::Hashtable(_) => {
+            return Err(
+                "node-send: hashtables are per-actor; use cs-table for shared state".into(),
+            );
+        }
+        Value::Port(_) => return Err("node-send: ports cannot cross actor boundaries".into()),
+        Value::Promise(_) => return Err("node-send: promises cannot cross actor boundaries".into()),
     }
     Ok(())
 }
