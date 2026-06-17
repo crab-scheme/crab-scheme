@@ -45,7 +45,7 @@ use cs_net::tcp::TcpTransport;
 use cs_net::{Channel, Transport, TransportConfig};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::beam::{beam_state, from_sendable, SendableValue};
+use super::beam::{beam_state, SendableValue};
 
 // All single-process nodes share one host/epoch; a node is identified by name.
 const NODE_HOST: &str = "local";
@@ -536,10 +536,11 @@ pub fn b_node_poll_ch(args: &[Value], syms: &mut SymbolTable) -> Result<Value, S
     }
     let node = name_of(&args[0], syms, "node-poll-ch")?;
     let ch = chan_of(&args[1], "node-poll-ch")?;
-    let msgs = primop_node_poll_ch(&node, ch)?;
+    // cw-sei: decode straight into Values, skipping the SendableValue tree.
+    let msgs = primop_node_poll_ch_value(&node, ch, syms)?;
     let mut list = Value::Null;
-    for sv in msgs.iter().rev() {
-        list = Value::Pair(Pair::new(from_sendable(sv, syms), list));
+    for v in msgs.into_iter().rev() {
+        list = Value::Pair(Pair::new(v, list));
     }
     Ok(list)
 }
@@ -550,10 +551,11 @@ pub fn b_node_poll(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
         return Err("node-poll: expected (node-poll NODE)".into());
     }
     let node = name_of(&args[0], syms, "node-poll")?;
-    let msgs = primop_node_poll(&node)?;
+    // cw-sei: decode straight into Values, skipping the SendableValue tree.
+    let msgs = primop_node_poll_value(&node, syms)?;
     let mut list = Value::Null;
-    for sv in msgs.iter().rev() {
-        list = Value::Pair(Pair::new(from_sendable(sv, syms), list));
+    for v in msgs.into_iter().rev() {
+        list = Value::Pair(Pair::new(v, list));
     }
     Ok(list)
 }
@@ -915,6 +917,94 @@ fn dec(c: &mut Dec) -> Result<SendableValue, String> {
         12 => Ok(SendableValue::ByteVector(c.len_bytes()?)),
         other => Err(format!("decode: unknown tag {other}")),
     }
+}
+
+/// cw-sei: decode one wire value DIRECTLY into a `Value`, skipping the
+/// intermediate `SendableValue` tree (the receive-side counterpart of
+/// [`encode_value_in`]). Mirrors `dec` + `from_sendable` fused: the profile's
+/// 52k `from_sendable` samples + tree-drop churn collapse into one walk that
+/// builds the destination `Value` as it reads bytes. Tags MUST match `dec`.
+fn decode_value(c: &mut Dec, syms: &mut SymbolTable) -> Result<Value, String> {
+    use std::cell::RefCell;
+    match c.u8()? {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Unspecified),
+        2 => Ok(Value::Eof),
+        3 => Ok(Value::Boolean(c.u8()? != 0)),
+        4 => {
+            let n = c.u32()?;
+            Ok(Value::Character(
+                char::from_u32(n).ok_or_else(|| format!("decode: bad char {n}"))?,
+            ))
+        }
+        5 => Ok(Value::Number(cs_core::Number::Fixnum(c.i64()?))),
+        6 => Ok(Value::Number(cs_core::Number::from_f64(f64::from_bits(
+            c.u64()?,
+        )))),
+        7 => {
+            let s = c.string()?;
+            Ok(Value::Number(
+                cs_core::Number::parse_decimal_integer(&s).expect("bigint round-trip"),
+            ))
+        }
+        8 => Ok(Value::String(cs_core::Gc::new(RefCell::new(c.string()?)))),
+        9 => Ok(Value::Symbol(syms.intern(&c.string()?))),
+        10 => {
+            let a = decode_value(c, syms)?;
+            let b = decode_value(c, syms)?;
+            Ok(Value::Pair(Pair::new(a, b)))
+        }
+        11 => {
+            let n = c.u32()? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(decode_value(c, syms)?);
+            }
+            Ok(Value::Vector(cs_core::Gc::new(RefCell::new(v))))
+        }
+        12 => Ok(Value::ByteVector(cs_core::Gc::new(RefCell::new(
+            c.len_bytes()?,
+        )))),
+        other => Err(format!("decode: unknown tag {other}")),
+    }
+}
+
+/// cw-sei: `primop_node_poll` returning `Value`s built directly from the wire
+/// (no `SendableValue` round-trip).
+pub fn primop_node_poll_value(node: &str, syms: &mut SymbolTable) -> Result<Vec<Value>, String> {
+    let router = lookup_router(node, "node-poll")?;
+    router.poll().map_err(|e| format!("node-poll: {e}"))?;
+    let mut out = Vec::new();
+    while let Some((_target, payload)) = router.recv_local() {
+        let mut c = Dec {
+            b: &payload,
+            pos: 0,
+        };
+        out.push(decode_value(&mut c, syms)?);
+    }
+    Ok(out)
+}
+
+/// cw-sei: per-channel direct-to-`Value` poll (receive-side counterpart of
+/// `primop_node_send_ch_value`).
+pub fn primop_node_poll_ch_value(
+    node: &str,
+    ch: u8,
+    syms: &mut SymbolTable,
+) -> Result<Vec<Value>, String> {
+    let router = lookup_router(node, "node-poll-ch")?;
+    router
+        .poll_channel(ch)
+        .map_err(|e| format!("node-poll-ch: {e}"))?;
+    let mut out = Vec::new();
+    while let Some((_target, payload)) = router.recv_local_channel(ch) {
+        let mut c = Dec {
+            b: &payload,
+            pos: 0,
+        };
+        out.push(decode_value(&mut c, syms)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
