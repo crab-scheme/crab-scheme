@@ -83,6 +83,7 @@ fn fact_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
         spans: Rc::new(vec![Span::DUMMY; len]),
         fast: None,
         profile: Default::default(),
+        self_bind: None,
     };
     (lam, fact)
 }
@@ -135,6 +136,7 @@ fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
         spans: Rc::new(vec![Span::DUMMY; len]),
         fast: None,
         profile: Default::default(),
+        self_bind: None,
     };
     (lam, fib)
 }
