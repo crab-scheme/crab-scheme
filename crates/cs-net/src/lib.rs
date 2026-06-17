@@ -484,10 +484,42 @@ pub mod tcp {
                 }
             });
 
+            // WAN-RTT simulation (cw-c1l/cw-wan): CW_NET_DELAY_MS holds each
+            // INBOUND frame for that many ms before it becomes visible to
+            // `try_recv`, modelling one-way link propagation (both peers delay
+            // their receive side, so a request/reply round-trip pays ~2×). The
+            // delay is added via `sleep_until(ready_at)` computed at enqueue, so
+            // it shifts delivery in time WITHOUT throttling bandwidth and keeps
+            // per-channel order (single FIFO drain, monotonic deadlines). 0 (the
+            // default) takes the original zero-overhead direct-push path.
+            let delay_ms: u64 = std::env::var("CW_NET_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let delay_tx = if delay_ms > 0 {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(usize, Vec<u8>, tokio::time::Instant)>(
+                    );
+                let inbound_d = inbound.clone();
+                tokio::spawn(async move {
+                    while let Some((chi, payload, ready)) = rx.recv().await {
+                        tokio::time::sleep_until(ready).await;
+                        inbound_d[chi]
+                            .lock()
+                            .expect("tcp inbound poisoned")
+                            .push_back(payload);
+                    }
+                });
+                Some(tx)
+            } else {
+                None
+            };
+
             // Reader: read, reassemble frames, fan out per channel.
             let inbound_r = inbound.clone();
             let closed_r = closed.clone();
             let max_frame = cfg.max_frame_bytes;
+            let delay = std::time::Duration::from_millis(delay_ms);
             let reader = tokio::spawn(async move {
                 let mut decoder = FrameDecoder::new(max_frame);
                 let mut buf = vec![0u8; 64 * 1024];
@@ -498,10 +530,19 @@ pub mod tcp {
                             decoder.push(&buf[..n]);
                             loop {
                                 match decoder.next_frame() {
-                                    Ok(Some((ch, payload))) => inbound_r[ch as usize]
-                                        .lock()
-                                        .expect("tcp inbound poisoned")
-                                        .push_back(payload),
+                                    Ok(Some((ch, payload))) => match &delay_tx {
+                                        Some(tx) => {
+                                            let ready = tokio::time::Instant::now() + delay;
+                                            // drain task gone => peer torn down; stop.
+                                            if tx.send((ch as usize, payload, ready)).is_err() {
+                                                break 'read;
+                                            }
+                                        }
+                                        None => inbound_r[ch as usize]
+                                            .lock()
+                                            .expect("tcp inbound poisoned")
+                                            .push_back(payload),
+                                    },
                                     Ok(None) => break,
                                     Err(_) => break 'read, // malformed framing → drop
                                 }
