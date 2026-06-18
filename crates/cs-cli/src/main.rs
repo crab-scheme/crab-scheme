@@ -1813,10 +1813,20 @@ fn run_aot_multi(
         // create a fresh sym that doesn't match the lambda's body's
         // EnvLookup(loop_sym) → the CallSelf detection misses and
         // `loop` becomes a capture.
-        let (name, self_sym) = match name_by_idx.get(&idx) {
+        let (name, mut self_sym) = match name_by_idx.get(&idx) {
             Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
+        // cw-6m8: the closure-cycle leak fix moved named-let/letrec
+        // self-recursion off the captured-self shape onto the lambda's
+        // own `self_bind` field, so the MakeClosure+DefineLocal scan
+        // above no longer finds it and `self_sym` comes out None — the
+        // self-call then lowers to an unbound (null) load and aborts at
+        // runtime. `self_bind` is authoritative when present, so prefer
+        // it so CallSelf detection still fires.
+        if let Some(sb) = lam.self_bind {
+            self_sym = Some(sb);
+        }
         // Phase 5.3: consume typer-derived hints when the user
         // annotated the function. Lookup by the lambda's bound
         // symbol (which the MakeClosure+SetVar scan above
@@ -1865,7 +1875,10 @@ fn run_aot_multi(
                 // MakeClosure for an inner lambda whose captures
                 // include THIS fn's own binding sym, the capture-
                 // gather emits `__self_handle` (forward self-ref).
-                rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
+                rir.self_binding_sym = lam
+                    .self_bind
+                    .map(|s| s.0)
+                    .or_else(|| sym_by_idx.get(&idx).map(|s| s.0));
                 compatible_funcs.push(rir);
             }
             Err(e) => skipped.push((name, format!("{e:?}"))),
