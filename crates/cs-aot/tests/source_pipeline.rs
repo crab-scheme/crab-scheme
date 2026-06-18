@@ -435,13 +435,20 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
     }
     let mut compatible: Vec<cs_rir::Function> = Vec::new();
     for (idx, lam) in bc.lambdas.iter().enumerate() {
-        let (name, self_sym) = match name_by_idx.get(&idx) {
+        let (name, mut self_sym) = match name_by_idx.get(&idx) {
             // RC3 iter 2.15 — pass ORIGINAL sym for self_sym (not
             // syms.intern(name)), since disambiguation may have
             // suffixed the name.
             Some(n) => (n.clone(), sym_by_idx.get(&idx).copied()),
             None => (format!("__aot_lambda_{idx}"), None),
         };
+        // cw-6m8 — the closure-cycle leak fix carries named-let/letrec
+        // self-recursion on the lambda's own `self_bind` field, which the
+        // MakeClosure+DefineLocal scan no longer surfaces; prefer it so
+        // CallSelf detection fires (mirrors the cs-cli AOT driver).
+        if let Some(sb) = lam.self_bind {
+            self_sym = Some(sb);
+        }
         // RC3 iter 2.15 — inner lambdas default params to Type::Any.
         let is_top_level = sym_by_idx
             .get(&idx)
@@ -466,7 +473,10 @@ fn aot_compile_multi_and_run(src: &str, entry_name: &str, pkg_suffix: &str) -> P
         } else {
             None
         };
-        rir.self_binding_sym = sym_by_idx.get(&idx).map(|s| s.0);
+        rir.self_binding_sym = lam
+            .self_bind
+            .map(|s| s.0)
+            .or_else(|| sym_by_idx.get(&idx).map(|s| s.0));
         compatible.push(rir);
     }
     assert!(
