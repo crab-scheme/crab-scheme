@@ -321,6 +321,8 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
     // CURRENT iteration's chain for error backtraces — prior
     // iterations' spans are the same call sites repeated.
     let tail_snapshot = ctx.call_stack.len();
+    // ponytail: per-activation tail-chain span cap (see back-edge below).
+    const TAIL_SPAN_CAP: usize = 256;
 
     loop {
         // No depth check here: `depth` is bumped + checked in
@@ -479,9 +481,17 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                             }
                             cur_env = new_env;
                             cur_expr = (*c.body).clone();
-                            // Tail-call back-edge: drop this iteration's
-                            // call-site spans (see tail_snapshot above).
-                            ctx.call_stack.truncate(tail_snapshot);
+                            // Tail-call back-edge: a hot tail loop pushes the same
+                            // call-site span every iteration and would leak forever
+                            // (cw-6m8). But resetting unconditionally also wipes a
+                            // genuine tail-call chain (outer->middle->...) the error
+                            // backtrace needs. ponytail: only reset once the chain
+                            // exceeds the cap — bounds the leak, keeps short chains
+                            // intact for backtraces. Ceiling: a legit tail chain
+                            // deeper than the cap loses its oldest frames on reset.
+                            if ctx.call_stack.len() - tail_snapshot > TAIL_SPAN_CAP {
+                                ctx.call_stack.truncate(tail_snapshot);
+                            }
                             continue;
                         }
                         if let Some(param) = any.downcast_ref::<Parameter>() {
