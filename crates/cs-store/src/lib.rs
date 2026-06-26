@@ -64,6 +64,7 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("store-delete", store_delete),
         UntypedProc::new("store-write-batch", store_write_batch),
         UntypedProc::new("store-iter", store_iter),
+        UntypedProc::new("store-iter-range", store_iter_range),
         UntypedProc::new("store-iter-next", store_iter_next),
         UntypedProc::new("store-iter-close", store_iter_close),
         UntypedProc::new("store-seek", store_seek),
@@ -559,6 +560,54 @@ fn store_iter(args: &[Value]) -> Result<Value, FfiError> {
     ir.next_id += 1;
     ir.slots.insert(iter_id, IterState { entries, pos: 0 });
 
+    Ok(Value::fixnum(iter_id))
+}
+
+// store-iter-range: seek to START key and iterate (ascending) while key < END key.
+// Unlike store-iter (prefix-bounded), this is a half-open RANGE [start, end) — the
+// caller bounds the scan to exactly the rows it needs (e.g. a watch's (rev_lo, rev_hi]
+// revision window), avoiding a full-namespace scan. (id cf start-bv end-bv) -> iter-id.
+fn store_iter_range(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 4 {
+        return Err(arity_err("store-iter-range", "4", args.len()));
+    }
+    let id = expect_fixnum("store-iter-range", args, 0)?;
+    let cf_name = expect_string("store-iter-range", args, 1)?;
+    let start = expect_bv("store-iter-range", args, 2)?;
+    let end = expect_bv("store-iter-range", args, 3)?;
+    let entries = {
+        let db = db_get(id, "store-iter-range")?;
+        let mut collected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut raw = if cf_name == "default" {
+            db.raw_iterator()
+        } else {
+            let cf = db.cf_handle(&cf_name).ok_or_else(|| {
+                FfiError::HostFailure(format!("store-iter-range: unknown CF {:?}", cf_name))
+            })?;
+            db.raw_iterator_cf(&cf)
+        };
+        raw.seek(&start);
+        loop {
+            if !raw.valid() {
+                break;
+            }
+            let k = match raw.key() {
+                Some(k) => k.to_vec(),
+                None => break,
+            };
+            if k.as_slice() >= end.as_slice() {
+                break;
+            }
+            let v = raw.value().unwrap_or(&[]).to_vec();
+            collected.push((k, v));
+            raw.next();
+        }
+        collected
+    };
+    let mut ir = iter_lock()?;
+    let iter_id = ir.next_id;
+    ir.next_id += 1;
+    ir.slots.insert(iter_id, IterState { entries, pos: 0 });
     Ok(Value::fixnum(iter_id))
 }
 
