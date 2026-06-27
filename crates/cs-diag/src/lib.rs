@@ -108,7 +108,7 @@ impl SourceMap {
     }
 
     pub fn contents(&self, file: FileId) -> &str {
-        if file == FileId::DUMMY {
+        if file == FileId::DUMMY || (file.0 as usize) >= self.files.len() {
             return "";
         }
         &self.files[file.0 as usize].contents
@@ -116,7 +116,12 @@ impl SourceMap {
 
     /// Returns 1-based (line, column).
     pub fn line_col(&self, span: Span) -> (u32, u32) {
-        if span.is_dummy() {
+        // cw-l5h: a Diagnostic can cross an actor boundary carrying a Span whose FileId isn't
+        // in THIS actor's SourceMap (e.g. an error raised against the main source but rendered
+        // in a per-actor map holding only its own file). Bounds-check instead of panicking — a
+        // foreign span renders without precise line/col rather than KILLING the actor, which
+        // tore down shard/watch workers under k8s load and destabilized the whole node.
+        if span.is_dummy() || (span.file.0 as usize) >= self.files.len() {
             return (0, 0);
         }
         let f = &self.files[span.file.0 as usize];
@@ -130,10 +135,18 @@ impl SourceMap {
     }
 
     pub fn snippet(&self, span: Span) -> &str {
-        if span.is_dummy() {
+        if span.is_dummy() || (span.file.0 as usize) >= self.files.len() {
             return "";
         }
         let f = &self.files[span.file.0 as usize];
+        // cw-l5h: a foreign span's offsets may exceed THIS file — clamp instead of panicking.
+        if span.start > span.end
+            || (span.end as usize) > f.contents.len()
+            || !f.contents.is_char_boundary(span.start as usize)
+            || !f.contents.is_char_boundary(span.end as usize)
+        {
+            return "";
+        }
         &f.contents[span.start as usize..span.end as usize]
     }
 }
