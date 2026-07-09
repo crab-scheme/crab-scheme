@@ -1638,6 +1638,28 @@ pub struct ValueStack {
     raw: Vec<NanboxValue>,
 }
 
+/// Capacity of the inline arg buffer used by `slice_as_values_small`.
+const SMALL_ARGS_CAP: usize = 8;
+
+/// Decoded call args, backed by a stack array for the common `<= 8`
+/// arg case (no heap alloc) or a `Vec` above that. Derefs to `&[Value]`
+/// so call sites are a drop-in swap for `slice_as_values`.
+pub enum SmallArgs {
+    Inline([Value; SMALL_ARGS_CAP], usize),
+    Heap(Vec<Value>),
+}
+
+impl std::ops::Deref for SmallArgs {
+    type Target = [Value];
+    #[inline]
+    fn deref(&self) -> &[Value] {
+        match self {
+            SmallArgs::Inline(buf, n) => &buf[..*n],
+            SmallArgs::Heap(v) => v,
+        }
+    }
+}
+
 impl ValueStack {
     #[inline]
     pub fn new() -> Self {
@@ -1714,6 +1736,34 @@ impl ValueStack {
             out.push(self.at_as_value(i));
         }
         out
+    }
+
+    /// Like `slice_as_values`, but avoids the heap `Vec` for the common
+    /// case of `<= 8` args: decodes into a stack-local array instead.
+    /// Falls back to `slice_as_values` (heap) above that. Builtin call
+    /// dispatch is the hot consumer — every arg here still gets the
+    /// same clone-decode (`at_as_value`) as the `Vec` path, only the
+    /// backing storage changes.
+    pub fn slice_as_values_small(&self, range: std::ops::Range<usize>) -> SmallArgs {
+        let n = range.len();
+        if n <= SMALL_ARGS_CAP {
+            let mut buf = [
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+            ];
+            for (slot, idx) in buf.iter_mut().zip(range) {
+                *slot = self.at_as_value(idx);
+            }
+            SmallArgs::Inline(buf, n)
+        } else {
+            SmallArgs::Heap(self.slice_as_values(range))
+        }
     }
 
     /// Drain slots from `start` to the end, transferring slot ownership
@@ -11908,7 +11958,25 @@ fn run_dispatch(
                             .with_span(call_span));
                         }
                         if let Some(fp) = &lam.fast {
-                            let args = stack.slice_as_values(args_start..stack_len);
+                            // NB-native path: both operands are Fixnum
+                            // immediates, read via `at_nb` (Copy, no
+                            // refcount traffic) and computed in place.
+                            // Falls back below on any non-fixnum operand,
+                            // overflow, or uncovered op.
+                            if let Some(nb) = try_fast_primop_nb(stack, args_start, fp) {
+                                stack.truncate(func_idx);
+                                stack.push_nb(nb);
+                                if is_tail {
+                                    frames.pop();
+                                    if frames.is_empty() {
+                                        return stack
+                                            .pop()
+                                            .ok_or_else(|| VmError::new("empty stack at exit"));
+                                    }
+                                }
+                                continue;
+                            }
+                            let args = stack.slice_as_values_small(args_start..stack_len);
                             let result = apply_fast_primop(fp, &args, syms)
                                 .map_err(|e| e.with_span(call_span))?;
                             stack.truncate(func_idx);
@@ -11967,7 +12035,7 @@ fn run_dispatch(
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
                         let name = b.name;
-                        let args = stack.slice_as_values(args_start..stack_len);
+                        let args = stack.slice_as_values_small(args_start..stack_len);
                         let raw = (b.f)(&args);
                         let r = match raw {
                             Ok(v) => v,
@@ -11989,7 +12057,7 @@ fn run_dispatch(
                     }
                     if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
                         let name = h.name;
-                        let args = stack.slice_as_values(args_start..stack_len);
+                        let args = stack.slice_as_values_small(args_start..stack_len);
                         let raw = (h.f)(&args);
                         let r = match raw {
                             Ok(v) => v,
@@ -12011,7 +12079,7 @@ fn run_dispatch(
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
                         let name = b.name;
-                        let args = stack.slice_as_values(args_start..stack_len);
+                        let args = stack.slice_as_values_small(args_start..stack_len);
                         let raw = (b.f)(&args, syms);
                         let r = match raw {
                             Ok(v) => v,
@@ -13707,6 +13775,57 @@ fn fallback_branch_nb(
         *ip = target;
     }
     Ok(())
+}
+
+/// NB-native variant of `apply_fast_primop`'s fixnum fast path: reads
+/// both operands directly off the stack via `at_nb` (`Copy`, no
+/// refcount traffic — fixnums are immediates, so there is no owned ref
+/// to touch either way) instead of clone-decoding through
+/// `at_as_value`/`Value`. `FastArg::Param(i)` resolves against
+/// `args_start`; `FastArg::Const` resolves only if the constant is
+/// itself a Fixnum (the only shape the fixnum ops care about).
+/// Returns `None` — meaning "fall back to `apply_fast_primop`" — on
+/// any non-fixnum operand, checked-arith overflow, or an op outside
+/// the fixnum set; the caller must then re-decode via the slow path.
+fn try_fast_primop_nb(
+    stack: &ValueStack,
+    args_start: usize,
+    fp: &crate::opcode::FastPrimopBody,
+) -> Option<NanboxValue> {
+    use crate::opcode::FastArg;
+    let resolve = |fa: &FastArg| -> Option<NanboxValue> {
+        match fa {
+            FastArg::Param(i) => Some(stack.at_nb(args_start + *i as usize)),
+            FastArg::Const(Value::Number(cs_core::Number::Fixnum(v))) => {
+                Some(NanboxValue::fixnum(*v))
+            }
+            FastArg::Const(_) => None,
+        }
+    };
+    let an = resolve(&fp.args[0])?;
+    let bn = resolve(&fp.args[1])?;
+    let ab = an.into_raw() as u64;
+    let bb = bn.into_raw() as u64;
+    if !(nb_is_tagged(ab)
+        && nb_is_tagged(bb)
+        && nb_tag_of(ab) == NB_TAG_FIXNUM
+        && nb_tag_of(bb) == NB_TAG_FIXNUM)
+    {
+        return None;
+    }
+    let av = nb_sign_extend_47(nb_payload_of(ab));
+    let bv = nb_sign_extend_47(nb_payload_of(bb));
+    match &fp.op {
+        Inst::AddFx2 => av.checked_add(bv).map(NanboxValue::fixnum),
+        Inst::SubFx2 => av.checked_sub(bv).map(NanboxValue::fixnum),
+        Inst::MulFx2 => av.checked_mul(bv).map(NanboxValue::fixnum),
+        Inst::LtFx2 => Some(NanboxValue::boolean(av < bv)),
+        Inst::LeFx2 => Some(NanboxValue::boolean(av <= bv)),
+        Inst::GtFx2 => Some(NanboxValue::boolean(av > bv)),
+        Inst::GeFx2 => Some(NanboxValue::boolean(av >= bv)),
+        Inst::EqFx2 => Some(NanboxValue::boolean(av == bv)),
+        _ => None,
+    }
 }
 
 /// Fast-path arithmetic on two fixnums. On (Fixnum, Fixnum) where the op
