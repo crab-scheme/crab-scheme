@@ -810,8 +810,11 @@ impl Lowerer<JITModule> {
     /// Build a fresh lowerer, using the host ISA.
     pub fn new() -> Result<Self, JitError> {
         let mut flag_builder = settings::builder();
-        // Use the default optimization level. Iter 2 doesn't need
-        // tuning; iter 6+ (the perf iter) revisits.
+        // cs-7wy: opt_level was never set, so codegen ran at the
+        // cranelift default ("none") — no GVN/LICM/alias/egraph opts.
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| JitError::Codegen(format!("flag opt_level: {e}")))?;
         flag_builder
             .set("use_colocated_libcalls", "false")
             .map_err(|e| JitError::Codegen(format!("flag use_colocated_libcalls: {e}")))?;
@@ -1833,6 +1836,11 @@ impl Lowerer<ObjectModule> {
     /// diagnostics). PIC is on so the `.o` links cleanly into a PIE.
     pub fn new_object(name: &str) -> Result<Self, JitError> {
         let mut flag_builder = settings::builder();
+        // cs-7wy: opt_level was never set, so codegen ran at the
+        // cranelift default ("none") — no GVN/LICM/alias/egraph opts.
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| JitError::Codegen(format!("flag opt_level: {e}")))?;
         flag_builder
             .set("use_colocated_libcalls", "false")
             .map_err(|e| JitError::Codegen(format!("flag use_colocated_libcalls: {e}")))?;
