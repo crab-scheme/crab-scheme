@@ -33,8 +33,9 @@
 //! chains terminate without overflowing the host stack at the
 //! default limit of 10_000.
 
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+
+use rustc_hash::FxHashSet;
 
 use crate::Gc;
 
@@ -121,7 +122,7 @@ pub struct CyclePath {
 /// descending into a child) and [`CycleVisitor::done`] (consulted
 /// before processing further siblings).
 pub struct CycleVisitor {
-    visited: HashSet<usize>,
+    visited: FxHashSet<usize>,
     found: bool,
     over_limit: bool,
     root_addr: usize,
@@ -259,6 +260,35 @@ pub fn get_limit() -> usize {
     LIMIT.with(|c| c.get())
 }
 
+thread_local! {
+    /// Single reused `visited` set per thread, so back-to-back
+    /// mutation-triggered checks (e.g. tail-building a list via
+    /// repeated `set-cdr!`) don't allocate a fresh hash table on
+    /// every call — the old cost that made list construction via
+    /// `set-cdr!` O(n) per mutation. Cleared (not dropped) between
+    /// uses via [`take_visited_set`] / [`return_visited_set`].
+    static VISITED_POOL: RefCell<Option<FxHashSet<usize>>> =
+        RefCell::new(Some(FxHashSet::default()));
+}
+
+/// Borrow the thread's reused visited-set, or allocate a fresh one
+/// if it's already checked out (a nested `cycle_check` call from
+/// inside a `visit_children`/`break_at` callback). The nested case
+/// just forfeits reuse for that inner call — it never double-
+/// borrows the `RefCell`.
+fn take_visited_set() -> FxHashSet<usize> {
+    VISITED_POOL
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Return a visited-set to the pool for the next call, clearing it
+/// in place rather than dropping the backing allocation.
+fn return_visited_set(mut set: FxHashSet<usize>) {
+    set.clear();
+    VISITED_POOL.with(|p| *p.borrow_mut() = Some(set));
+}
+
 /// Check whether the heap subgraph reachable from `root` contains
 /// a cycle returning to `root` itself.
 ///
@@ -272,7 +302,7 @@ where
     T: CycleVisit + 'static,
 {
     let mut ctx = CycleVisitor {
-        visited: HashSet::new(),
+        visited: take_visited_set(),
         found: false,
         over_limit: false,
         root_addr: Gc::as_addr(root),
@@ -282,13 +312,15 @@ where
     // Root's own slot is implicitly visited — encountering it
     // again during descent is the cycle signal.
     root.visit_children(&mut ctx);
-    if ctx.found {
+    let result = if ctx.found {
         Some(CyclePath {
             root: ctx.root_addr,
         })
     } else {
         None
-    }
+    };
+    return_visited_set(ctx.visited);
+    result
 }
 
 /// Convenience: run [`cycle_check`] on `root`; if a cycle is
@@ -322,7 +354,7 @@ where
     T: CycleVisit + 'static,
 {
     let mut ctx = CycleVisitor {
-        visited: HashSet::new(),
+        visited: take_visited_set(),
         found: false,
         over_limit: false,
         root_addr: Gc::as_addr(root),
@@ -330,8 +362,10 @@ where
         broken: false,
     };
     root.visit_children(&mut ctx);
-    if ctx.found {
-        break_at(root, ctx.broken);
+    let (found, broken) = (ctx.found, ctx.broken);
+    return_visited_set(ctx.visited);
+    if found {
+        break_at(root, broken);
     }
 }
 

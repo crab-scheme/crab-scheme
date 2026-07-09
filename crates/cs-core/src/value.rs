@@ -910,6 +910,39 @@ impl cs_gc::cycle::CycleVisit for Value {
     }
 }
 
+/// `true` if `v` provably cannot hold an outgoing reference to
+/// another `Value` — i.e. its `CycleVisit::visit_children` is a
+/// no-op no matter what it contains.
+///
+/// A mutation (`set-car!`, `vector-set!`, ...) can only *close* a
+/// cycle through the edge it just wrote: the new target must have
+/// some outgoing path back to the mutated root. If the newly
+/// stored value has no outgoing `Value` edges at all, no such path
+/// exists, so callers can skip `cs_gc::cycle::check_and_break`
+/// entirely for that store.
+///
+/// `String` and `ByteVector` are `Gc`-backed but hold only raw
+/// bytes/chars, not further `Value`s, so they qualify. `Pair` /
+/// `Vector` / `Hashtable` / `Promise` / `Procedure` can all hold
+/// arbitrary `Value` children (directly or via a captured
+/// environment) and must still go through the full check.
+pub fn value_is_acyclic_leaf(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Null
+            | Value::Unspecified
+            | Value::Eof
+            | Value::Boolean(_)
+            | Value::Character(_)
+            | Value::Number(_)
+            | Value::Symbol(_)
+            | Value::Identifier { .. }
+            | Value::String(_)
+            | Value::ByteVector(_)
+            | Value::Port(_)
+    )
+}
+
 impl Value {
     pub fn fixnum(v: i64) -> Self {
         Value::Number(Number::Fixnum(v))

@@ -1186,6 +1186,7 @@ name = "cs-gc"
 version = "1.0.0-rc7"
 dependencies = [
  "bumpalo",
+ "rustc-hash 2.1.2",
 ]
 
 [[package]]

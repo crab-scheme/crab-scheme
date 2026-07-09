@@ -24,3 +24,4 @@ tracing-cycle-collector = []
 
 [dependencies]
 bumpalo = { workspace = true, optional = true }
+rustc-hash = { workspace = true }

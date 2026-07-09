@@ -3166,18 +3166,23 @@ fn b_set_car(args: &[Value]) -> Result<Value, String> {
             if cs_gc::Gc::is_region(p) {
                 return Ok(Value::Unspecified);
             }
-            cs_gc::cycle::check_and_break(p, |p| {
-                crate::countable_memory_cycle::record_cycle_with_candidate(p);
-                // Iter 7.1.x.y: caller-supplied baseline=3
-                // (slot + args[0] + args[1] + VM transient).
-                // The in-walk back-edge demote that iter
-                // 7.1.x.z attempted is reverted pending a
-                // full Bacon-Rajan implementation; see ADR
-                // 0014 §"iter 7.1.x.z note".
-                if p.break_car_cycle(3) {
-                    crate::countable_memory_cycle::record_cycle_broken();
-                }
-            });
+            // cs-fsq: a leaf value written into car has no
+            // outgoing edges, so it can't close a cycle back to
+            // the mutated pair — skip the DFS entirely.
+            if !cs_core::value::value_is_acyclic_leaf(&args[1]) {
+                cs_gc::cycle::check_and_break(p, |p| {
+                    crate::countable_memory_cycle::record_cycle_with_candidate(p);
+                    // Iter 7.1.x.y: caller-supplied baseline=3
+                    // (slot + args[0] + args[1] + VM transient).
+                    // The in-walk back-edge demote that iter
+                    // 7.1.x.z attempted is reverted pending a
+                    // full Bacon-Rajan implementation; see ADR
+                    // 0014 §"iter 7.1.x.z note".
+                    if p.break_car_cycle(3) {
+                        crate::countable_memory_cycle::record_cycle_broken();
+                    }
+                });
+            }
             Ok(Value::Unspecified)
         }
         v => Err(type_err("set-car!", "pair", v)),
@@ -3196,12 +3201,16 @@ fn b_set_cdr(args: &[Value]) -> Result<Value, String> {
             if cs_gc::Gc::is_region(p) {
                 return Ok(Value::Unspecified);
             }
-            cs_gc::cycle::check_and_break(p, |p| {
-                crate::countable_memory_cycle::record_cycle_with_candidate(p);
-                if p.break_cdr_cycle(3) {
-                    crate::countable_memory_cycle::record_cycle_broken();
-                }
-            });
+            // cs-fsq: see b_set_car — leaf cdr writes can't
+            // close a cycle, skip the DFS.
+            if !cs_core::value::value_is_acyclic_leaf(&args[1]) {
+                cs_gc::cycle::check_and_break(p, |p| {
+                    crate::countable_memory_cycle::record_cycle_with_candidate(p);
+                    if p.break_cdr_cycle(3) {
+                        crate::countable_memory_cycle::record_cycle_broken();
+                    }
+                });
+            }
             Ok(Value::Unspecified)
         }
         v => Err(type_err("set-cdr!", "pair", v)),
@@ -4524,9 +4533,13 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
             if cs_gc::Gc::is_region(v) {
                 return Ok(Value::Unspecified);
             }
-            cs_gc::cycle::check_and_break(v, |v| {
-                crate::countable_memory_cycle::record_cycle_with_candidate(v);
-            });
+            // cs-fsq: see b_set_car — leaf writes can't close a
+            // cycle, skip the DFS.
+            if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
+                cs_gc::cycle::check_and_break(v, |v| {
+                    crate::countable_memory_cycle::record_cycle_with_candidate(v);
+                });
+            }
             Ok(Value::Unspecified)
         }
         v => Err(type_err("vector-set!", "vector", v)),
@@ -6851,9 +6864,13 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                 if cs_gc::Gc::is_region(&h) {
                     return Ok(Value::Unspecified);
                 }
-                cs_gc::cycle::check_and_break(&h, |h| {
-                    crate::countable_memory_cycle::record_cycle_with_candidate(h);
-                });
+                // cs-fsq: see b_set_car — leaf writes can't
+                // close a cycle, skip the DFS.
+                if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
+                    cs_gc::cycle::check_and_break(&h, |h| {
+                        crate::countable_memory_cycle::record_cycle_with_candidate(h);
+                    });
+                }
                 return Ok(Value::Unspecified);
             }
         }
@@ -6864,9 +6881,11 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         if cs_gc::Gc::is_region(&h) {
             return Ok(Value::Unspecified);
         }
-        cs_gc::cycle::check_and_break(&h, |h| {
-            crate::countable_memory_cycle::record_cycle_with_candidate(h);
-        });
+        if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
+            cs_gc::cycle::check_and_break(&h, |h| {
+                crate::countable_memory_cycle::record_cycle_with_candidate(h);
+            });
+        }
         return Ok(Value::Unspecified);
     }
     let kind = h.eq_kind;
@@ -6883,9 +6902,13 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if cs_gc::Gc::is_region(&h) {
         return Ok(Value::Unspecified);
     }
-    cs_gc::cycle::check_and_break(&h, |h| {
-        crate::countable_memory_cycle::record_cycle_with_candidate(h);
-    });
+    // cs-fsq: see b_set_car — leaf writes can't close a cycle,
+    // skip the DFS.
+    if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
+        cs_gc::cycle::check_and_break(&h, |h| {
+            crate::countable_memory_cycle::record_cycle_with_candidate(h);
+        });
+    }
     Ok(Value::Unspecified)
 }
 
