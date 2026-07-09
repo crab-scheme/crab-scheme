@@ -1181,14 +1181,26 @@ mod proc_table {
         }
 
         /// Decrement refcount; free slot if it hits 0.
-        pub(super) fn decref(&mut self, idx: u32) {
+        ///
+        /// Returns the freed `Rc` (if any) instead of dropping it here:
+        /// dropping it inline would run its destructor while `self` is
+        /// still under the caller's `RefCell` borrow, and a closure's
+        /// destructor can recursively reach `proc_table::decref` (e.g.
+        /// via a captured `Bindings` holding another procedure slot),
+        /// which would re-borrow the same thread-local and panic. The
+        /// caller must drop the returned value only after releasing the
+        /// borrow.
+        #[must_use]
+        pub(super) fn decref(&mut self, idx: u32) -> Option<Rc<dyn cs_core::Procedure>> {
             let slot = &mut self.slots[idx as usize];
             debug_assert!(slot.proc.is_some(), "decref on freed slot");
             slot.refcount -= 1;
             if slot.refcount == 0 {
-                slot.proc = None;
                 slot.next_free = self.free_head;
                 self.free_head = idx;
+                slot.proc.take()
+            } else {
+                None
             }
         }
 
@@ -1224,7 +1236,15 @@ mod proc_table {
     }
 
     pub(super) fn decref(idx: u32) {
-        let _ = PROC_TABLE.try_with(|t| t.borrow_mut().decref(idx));
+        // Deferred drop (see `ProcTable::decref`): the freed `Rc`, if
+        // any, comes out of `try_with` and is dropped here — after the
+        // `RefCell` borrow has been released — so a reentrant decref
+        // triggered by its destructor doesn't double-borrow.
+        let freed = PROC_TABLE
+            .try_with(|t| t.borrow_mut().decref(idx))
+            .ok()
+            .flatten();
+        drop(freed);
     }
 
     pub(super) fn peek(idx: u32) -> Rc<dyn cs_core::Procedure> {
@@ -1234,12 +1254,16 @@ mod proc_table {
     /// Consume the NB encoding: clone the Rc out + decrement refcount
     /// (freeing the slot when it was the last NB owner).
     pub(super) fn take(idx: u32) -> Rc<dyn cs_core::Procedure> {
-        PROC_TABLE.with(|t| {
+        // Deferred drop (see `ProcTable::decref`): `freed` must be
+        // dropped only after the borrow below is released.
+        let (p, freed) = PROC_TABLE.with(|t| {
             let mut t = t.borrow_mut();
             let p = t.peek(idx);
-            t.decref(idx);
-            p
-        })
+            let freed = t.decref(idx);
+            (p, freed)
+        });
+        drop(freed);
+        p
     }
 }
 
@@ -17026,5 +17050,57 @@ mod yield_hook_tests {
         assert_eq!(yield_count(), 0, "no hook → no fires recorded");
 
         set_reduction_budget(2000);
+    }
+
+    // Regression for cs-6p8: a procedure whose destructor itself drops
+    // another live procedure-table slot (the shape a `VmClosure` produces
+    // when its captured `Bindings` holds another closure — e.g. nqueens'
+    // nested closures) used to panic with "RefCell already borrowed".
+    // `proc_table::decref` dropped the freed `Rc<dyn Procedure>` while
+    // still holding the table's `RefCell` borrow, so the nested
+    // `proc_table::decref` call made from within that drop re-entered the
+    // same borrow. Fixed by deferring the drop until after the borrow is
+    // released.
+    #[derive(Debug)]
+    struct ReentrantDropProc {
+        inner_idx: std::cell::Cell<Option<u32>>,
+    }
+
+    impl Procedure for ReentrantDropProc {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for ReentrantDropProc {
+        fn drop(&mut self) {
+            // Simulates a closure's `Bindings` drop reaching back into
+            // the proc table for a captured procedure value while the
+            // outer slot's drop (and its `RefCell` borrow) is still on
+            // the stack.
+            if let Some(idx) = self.inner_idx.take() {
+                proc_table::decref(idx);
+            }
+        }
+    }
+
+    #[test]
+    fn proc_table_decref_reentrant_drop_does_not_panic() {
+        let inner: Rc<dyn cs_core::Procedure> = Rc::new(ReentrantDropProc {
+            inner_idx: std::cell::Cell::new(None),
+        });
+        let inner_idx = proc_table::alloc(inner);
+
+        let outer: Rc<dyn cs_core::Procedure> = Rc::new(ReentrantDropProc {
+            inner_idx: std::cell::Cell::new(Some(inner_idx)),
+        });
+        let outer_idx = proc_table::alloc(outer);
+
+        // Dropping the outer slot's last reference runs `ReentrantDropProc`'s
+        // destructor, which reenters `proc_table::decref` for the inner
+        // slot from inside the outer call's drop. Before the fix, this
+        // panicked ("RefCell already borrowed") instead of freeing both
+        // slots cleanly.
+        proc_table::decref(outer_idx);
     }
 }
