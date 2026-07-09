@@ -341,3 +341,75 @@ fn perf_fib_25_compared() {
         walker_ms / vm_ms
     );
 }
+
+/// Runs `src` on both tiers, expects BOTH to raise, and asserts the
+/// error messages match exactly. Used by the cs-h5v data-primitive
+/// opcode tests to prove the specialized-opcode fallback path (car of
+/// non-pair, eq? on numbers falling to the generic decode, vector-ref
+/// out of range, ...) raises byte-for-byte the same error text the
+/// generic builtin `Call` path does on the walker tier.
+fn diff_err(src: &str) {
+    let mut rt_walker = Runtime::new();
+    let mut rt_vm = Runtime::new();
+    let e_walker = rt_walker
+        .eval_str("<diff-err-walker>", src)
+        .expect_err(&format!("walker unexpectedly succeeded on {:?}", src));
+    let e_vm = rt_vm
+        .eval_str_via_vm("<diff-err-vm>", src)
+        .expect_err(&format!("vm unexpectedly succeeded on {:?}", src));
+    assert_eq!(
+        e_walker.message, e_vm.message,
+        "error-message mismatch on {:?}: walker={} vm={}",
+        src, e_walker.message, e_vm.message
+    );
+}
+
+// ---- cs-h5v: data-primitive specialized opcodes ----
+
+#[test]
+fn diff_data_primitives_success() {
+    diff("(car (cons 1 2))");
+    diff("(cdr (cons 1 2))");
+    diff("(cons 'a 'b)");
+    diff("(null? '())");
+    diff("(null? (cons 1 2))");
+    diff("(pair? (cons 1 2))");
+    diff("(pair? '())");
+    diff("(not #f)");
+    diff("(not #t)");
+    diff("(not 0)"); // 0 is truthy in Scheme — (not 0) => #f
+    diff("(eq? 'a 'a)");
+    diff("(eq? 'a 'b)");
+    diff("(eq? 1 1)");
+    diff("(eq? 1 2)");
+    diff("(eq? #t #t)");
+    diff("(eq? '() '())");
+    diff("(let ((v (vector 1 2 3))) (eq? v v))");
+    diff("(eq? (cons 1 2) (cons 1 2))"); // distinct allocations, not eq?
+    diff("(eq? 1.5 1.5)"); // non-Fixnum Number kinds: eq? is false
+    diff("(let ((v (vector 1 2 3))) (vector-ref v 0))");
+    diff("(let ((v (vector 1 2 3))) (vector-ref v 2))");
+    diff("(let ((v (vector 1 2 3))) (vector-set! v 1 99) (vector-ref v 1))");
+    // vector-set! creating a self-referential cycle: must not hang/crash.
+    diff("(let ((v (vector 1 2 3))) (vector-set! v 0 v) (vector? (vector-ref v 0)))");
+    // arity-mismatched calls to primop names must still hit the
+    // ordinary generic-Call arity check, not a mis-decoded fast opcode.
+    diff_err("(car)");
+    diff_err("(car 1 2)");
+    diff_err("(cons 1)");
+    diff_err("(vector-set! (vector 1 2 3) 0)");
+}
+
+#[test]
+fn diff_data_primitives_type_errors() {
+    diff_err("(car 5)");
+    diff_err("(car '())");
+    diff_err("(cdr 5)");
+    diff_err("(vector-ref 5 0)");
+    diff_err("(vector-ref (vector 1 2 3) \"x\")");
+    diff_err("(let ((v (vector 1 2 3))) (vector-ref v -1))");
+    diff_err("(let ((v (vector 1 2 3))) (vector-ref v 10))");
+    diff_err("(vector-set! 5 0 1)");
+    diff_err("(let ((v (vector 1 2 3))) (vector-set! v -1 9))");
+    diff_err("(let ((v (vector 1 2 3))) (vector-set! v 10 9))");
+}

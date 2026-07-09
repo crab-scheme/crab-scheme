@@ -365,7 +365,19 @@ impl Runtime {
         let vm_env = cs_vm::vm::Env::root();
         for (name, f) in builtins::pure_builtins() {
             let sym = syms.intern(name);
-            vm_env.define(sym, cs_vm::vm::make_vm_builtin(name, f));
+            // cs-h5v: tag the small set of data-primitive builtins so
+            // the VM's Call/TailCall dispatch loop can take an inline
+            // fast path (skips arg-Vec materialization + the indirect
+            // `f` call) instead of the generic builtin-call path. See
+            // `cs_vm::vm::DataPrimOp` for why this is a VmBuiltin-level
+            // tag rather than a bytecode-level opcode (the latter hid
+            // these calls from an existing JIT peephole and regressed
+            // tier-up).
+            let value = match data_primop_for(name) {
+                Some(op) => cs_vm::vm::make_vm_builtin_fast(name, f, op),
+                None => cs_vm::vm::make_vm_builtin(name, f),
+            };
+            vm_env.define(sym, value);
         }
         for (name, f) in builtins::syms_builtins() {
             let sym = syms.intern(name);
@@ -3341,6 +3353,26 @@ fn primop_table(
     m.insert(syms.intern(">="), PrimOp::Ge);
     m.insert(syms.intern("="), PrimOp::Eq);
     m
+}
+
+/// Maps a `pure_builtins()` name to its [`cs_vm::vm::DataPrimOp`]
+/// identity, for the VM builtin-registration loop (cs-h5v). Only the
+/// exact names below get tagged; every other builtin registers as a
+/// plain (untagged) `VmBuiltin`.
+fn data_primop_for(name: &str) -> Option<cs_vm::vm::DataPrimOp> {
+    use cs_vm::vm::DataPrimOp;
+    match name {
+        "car" => Some(DataPrimOp::Car),
+        "cdr" => Some(DataPrimOp::Cdr),
+        "cons" => Some(DataPrimOp::Cons),
+        "null?" => Some(DataPrimOp::NullP),
+        "pair?" => Some(DataPrimOp::PairP),
+        "not" => Some(DataPrimOp::Not),
+        "eq?" => Some(DataPrimOp::EqP),
+        "vector-ref" => Some(DataPrimOp::VectorRef),
+        "vector-set!" => Some(DataPrimOp::VectorSet),
+        _ => None,
+    }
 }
 
 // Helper so cs-runtime can look up symbols by name without intern.

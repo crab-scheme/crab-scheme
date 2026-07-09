@@ -12034,6 +12034,29 @@ fn run_dispatch(
                         continue;
                     }
                     if let Some(b) = any.downcast_ref::<VmBuiltin>() {
+                        // cs-h5v: for the tagged data-primitive builtins,
+                        // try the inline fast path first — skips the
+                        // arg-Vec materialization and indirect `(b.f)`
+                        // call. Declines (leaving the stack exactly as
+                        // it was) on any arity mismatch or type miss,
+                        // falling through to the identical generic call
+                        // below so error text always matches the real
+                        // builtin.
+                        if let Some(op) = b.fast {
+                            if let Some(r) = try_fast_data_primop(op, n, stack) {
+                                stack.truncate(func_idx);
+                                stack.push(r);
+                                if is_tail {
+                                    frames.pop();
+                                    if frames.is_empty() {
+                                        return stack.pop().ok_or_else(|| {
+                                            VmError::new("empty stack at tail-builtin")
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         let name = b.name;
                         let args = stack.slice_as_values_small(args_start..stack_len);
                         let raw = (b.f)(&args);
@@ -14106,10 +14129,44 @@ pub type VmBuiltinFn = fn(&[Value]) -> Result<Value, String>;
 /// display/write that resolve symbol names).
 pub type VmBuiltinSymsFn = fn(&[Value], &mut SymbolTable) -> Result<Value, String>;
 
+/// Identity tag for the small set of "data primitive" builtins
+/// (cs-h5v) whose `Call` dispatch is worth skipping the generic
+/// downcast + arg-`Vec` materialization + indirect-call path for.
+///
+/// This started as a bytecode-level `Inst` specialization (mirroring
+/// the existing `AddFx2`-style fixnum-arith opcodes), but that
+/// approach collided with a pre-existing JIT optimization: the JIT
+/// translator already recognizes `Const(builtin procedure) + Call(N)`
+/// for exactly these names and lowers them to efficient RIR ops
+/// (jit_translate.rs, the `("car", 1)` / `("cons", 2)` / ... arms).
+/// Emitting a dedicated `Inst` instead of that `Const`+`Call` shape
+/// hid the pattern from the JIT peephole and silently disabled
+/// tier-up for any function using these ops. Tagging the `VmBuiltin`
+/// itself keeps the bytecode shape — and therefore the JIT path —
+/// completely unchanged, while still letting the bytecode-VM
+/// dispatch loop recognize the identity with one enum-field read
+/// (no string compare, no fn-pointer compare) instead of a string
+/// compare against `name`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataPrimOp {
+    Car,
+    Cdr,
+    Cons,
+    NullP,
+    PairP,
+    Not,
+    EqP,
+    VectorRef,
+    VectorSet,
+}
+
 #[derive(Debug)]
 pub struct VmBuiltin {
     pub name: &'static str,
     pub f: VmBuiltinFn,
+    /// Set only for the cs-h5v data-primitive builtins; `None` for
+    /// every other registered builtin. See [`DataPrimOp`].
+    pub fast: Option<DataPrimOp>,
 }
 
 impl Procedure for VmBuiltin {
@@ -14118,6 +14175,138 @@ impl Procedure for VmBuiltin {
     }
     fn name(&self) -> Option<&str> {
         Some(self.name)
+    }
+}
+
+/// Expected argument count for a [`DataPrimOp`]. The `Call` dispatch
+/// site checks this before touching the stack, so an arity-mismatched
+/// call (e.g. `(car 1 2)`) declines the fast path immediately and
+/// falls through to the real builtin, which raises the ordinary
+/// arity error.
+fn fast_data_primop_arity(op: DataPrimOp) -> usize {
+    match op {
+        DataPrimOp::Car
+        | DataPrimOp::Cdr
+        | DataPrimOp::NullP
+        | DataPrimOp::PairP
+        | DataPrimOp::Not => 1,
+        DataPrimOp::Cons | DataPrimOp::EqP | DataPrimOp::VectorRef => 2,
+        DataPrimOp::VectorSet => 3,
+    }
+}
+
+/// Inline fast path for the cs-h5v data-primitive builtins, called
+/// from the `Call`/`TailCall` dispatch loop in place of the generic
+/// downcast + arg-`Vec` + indirect-call path.
+///
+/// Returns `Some(result)` on success. Returns `None` — leaving the
+/// stack in EXACTLY the state it was in on entry (the `n` call args
+/// still sitting at their original slots) — on any arity mismatch or
+/// type/bounds miss, so the caller can fall through to the unchanged
+/// generic path and get identical error text from the real builtin
+/// (no error-message duplication to keep in sync here).
+///
+/// `Cons`/`NullP`/`PairP`/`Not`/`EqP` never fail once the arity check
+/// passes (they're total over all `Value`s), so those arms always
+/// return `Some`. `Car`/`Cdr`/`VectorRef`/`VectorSet` decline on a
+/// type miss, an out-of-range/negative index, or a non-Fixnum index
+/// (leaving Bignum indices, which are rare, to the real builtin).
+fn try_fast_data_primop(op: DataPrimOp, n: usize, stack: &mut ValueStack) -> Option<Value> {
+    if n != fast_data_primop_arity(op) {
+        return None;
+    }
+    match op {
+        DataPrimOp::Car => {
+            let v = stack.pop().expect("arity-checked pop");
+            match v {
+                Value::Pair(p) => Some(p.car()),
+                other => {
+                    stack.push(other);
+                    None
+                }
+            }
+        }
+        DataPrimOp::Cdr => {
+            let v = stack.pop().expect("arity-checked pop");
+            match v {
+                Value::Pair(p) => Some(p.cdr()),
+                other => {
+                    stack.push(other);
+                    None
+                }
+            }
+        }
+        DataPrimOp::Cons => {
+            let b = stack.pop().expect("arity-checked pop");
+            let a = stack.pop().expect("arity-checked pop");
+            Some(Value::Pair(cs_core::Pair::new(a, b)))
+        }
+        DataPrimOp::NullP => {
+            let v = stack.pop().expect("arity-checked pop");
+            Some(Value::Boolean(matches!(v, Value::Null)))
+        }
+        DataPrimOp::PairP => {
+            let v = stack.pop().expect("arity-checked pop");
+            Some(Value::Boolean(matches!(v, Value::Pair(_))))
+        }
+        DataPrimOp::Not => {
+            let v = stack.pop().expect("arity-checked pop");
+            Some(Value::Boolean(!v.is_truthy()))
+        }
+        DataPrimOp::EqP => {
+            let b = stack.pop().expect("arity-checked pop");
+            let a = stack.pop().expect("arity-checked pop");
+            Some(Value::Boolean(cs_core::eq::eq(&a, &b)))
+        }
+        DataPrimOp::VectorRef => {
+            let i_v = stack.pop().expect("arity-checked pop");
+            let vec_v = stack.pop().expect("arity-checked pop");
+            let result = match (&vec_v, &i_v) {
+                (Value::Vector(v), Value::Number(cs_core::Number::Fixnum(i))) if *i >= 0 => {
+                    v.borrow().get(*i as usize).cloned()
+                }
+                _ => None,
+            };
+            match result {
+                Some(x) => Some(x),
+                None => {
+                    stack.push(vec_v);
+                    stack.push(i_v);
+                    None
+                }
+            }
+        }
+        DataPrimOp::VectorSet => {
+            let x = stack.pop().expect("arity-checked pop");
+            let i_v = stack.pop().expect("arity-checked pop");
+            let vec_v = stack.pop().expect("arity-checked pop");
+            let in_bounds = match (&vec_v, &i_v) {
+                (Value::Vector(v), Value::Number(cs_core::Number::Fixnum(i))) if *i >= 0 => {
+                    (*i as usize) < v.borrow().len()
+                }
+                _ => false,
+            };
+            if !in_bounds {
+                stack.push(vec_v);
+                stack.push(i_v);
+                stack.push(x);
+                return None;
+            }
+            let (Value::Vector(v), Value::Number(cs_core::Number::Fixnum(i))) = (&vec_v, &i_v)
+            else {
+                unreachable!("in_bounds only true for (Vector, Fixnum)");
+            };
+            // Mirrors b_vector_set exactly: region-allocated vectors
+            // skip the synchronous cycle detector (bulk region free
+            // reclaims regardless), and a leaf write can't close a
+            // cycle so the DFS is skipped.
+            let is_leaf = cs_core::value::value_is_acyclic_leaf(&x);
+            v.borrow_mut()[*i as usize] = x;
+            if !cs_gc::Gc::is_region(v) && !is_leaf {
+                cs_gc::cycle::check_and_break(v, |_r| {});
+            }
+            Some(Value::Unspecified)
+        }
     }
 }
 
@@ -14137,7 +14326,27 @@ impl Procedure for VmBuiltinSyms {
 }
 
 pub fn make_vm_builtin(name: &'static str, f: VmBuiltinFn) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(VmBuiltin { name, f });
+    let p: Rc<dyn Procedure> = Rc::new(VmBuiltin {
+        name,
+        f,
+        fast: None,
+    });
+    Value::Procedure(p)
+}
+
+/// Like [`make_vm_builtin`], but tags the builtin with a [`DataPrimOp`]
+/// identity so the `Call`/`TailCall` dispatch loop can take the
+/// specialized inline fast path instead of the generic downcast +
+/// arg-`Vec` + indirect-call path. `f` remains the real builtin
+/// (cs-runtime's `b_car`, `b_cons`, ...) — the fast path falls back to
+/// calling it directly on any arity mismatch or type miss, so error
+/// text is always byte-for-byte what the generic path would produce.
+pub fn make_vm_builtin_fast(name: &'static str, f: VmBuiltinFn, fast: DataPrimOp) -> Value {
+    let p: Rc<dyn Procedure> = Rc::new(VmBuiltin {
+        name,
+        f,
+        fast: Some(fast),
+    });
     Value::Procedure(p)
 }
 
@@ -17106,6 +17315,224 @@ mod nb_arith_tests {
         let r = unsafe { vm_value_lt_nb(nb_bool(true), nb_fixnum(1)) };
         assert_eq!(jit_take_deopt(), DEOPT_REASON_ARITH_MISS);
         assert_bool(r, false);
+    }
+}
+
+// cs-h5v: the inline VmBuiltin-tagged fast path for car/cdr/cons/
+// null?/pair?/not/eq?/vector-ref/vector-set!. Exercises
+// `try_fast_data_primop` directly against a `ValueStack`, including
+// the arity-mismatch / type-miss decline cases where the stack must
+// come back exactly as it went in. `Value` has no `PartialEq`, so
+// assertions unwrap to the concrete Rust type they expect instead of
+// comparing `Value`s directly.
+#[cfg(test)]
+mod data_primop_tests {
+    use super::*;
+
+    fn push_all(stack: &mut ValueStack, vs: Vec<Value>) {
+        for v in vs {
+            stack.push(v);
+        }
+    }
+
+    fn pair(a: i64, b: i64) -> Value {
+        Value::Pair(cs_core::Pair::new(Value::fixnum(a), Value::fixnum(b)))
+    }
+
+    fn assert_fixnum(v: &Value, expected: i64) {
+        match v {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, expected),
+            other => panic!("expected Fixnum({}), got {:?}", expected, other),
+        }
+    }
+
+    fn assert_bool(v: &Value, expected: bool) {
+        match v {
+            Value::Boolean(b) => assert_eq!(*b, expected),
+            other => panic!("expected Boolean({}), got {:?}", expected, other),
+        }
+    }
+
+    #[test]
+    fn car_cdr_success() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![pair(1, 2)]);
+        let r = try_fast_data_primop(DataPrimOp::Car, 1, &mut stack).unwrap();
+        assert_fixnum(&r, 1);
+        assert!(stack.is_empty());
+
+        push_all(&mut stack, vec![pair(1, 2)]);
+        let r = try_fast_data_primop(DataPrimOp::Cdr, 1, &mut stack).unwrap();
+        assert_fixnum(&r, 2);
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn car_on_non_pair_declines_and_restores_stack() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![Value::fixnum(5)]);
+        let r = try_fast_data_primop(DataPrimOp::Car, 1, &mut stack);
+        assert!(r.is_none());
+        // Stack must be untouched so the generic path's
+        // `slice_as_values_small(args_start..stack_len)` sees the
+        // original arg.
+        assert_eq!(stack.len(), 1);
+        assert_fixnum(&stack.pop().unwrap(), 5);
+    }
+
+    #[test]
+    fn arity_mismatch_declines_without_touching_stack() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![Value::fixnum(1), Value::fixnum(2)]);
+        // Car expects 1 arg; called here as if 2 were passed.
+        let r = try_fast_data_primop(DataPrimOp::Car, 2, &mut stack);
+        assert!(r.is_none());
+        assert_eq!(stack.len(), 2);
+    }
+
+    #[test]
+    fn cons_allocates_fresh_pair() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![Value::fixnum(1), Value::fixnum(2)]);
+        let r = try_fast_data_primop(DataPrimOp::Cons, 2, &mut stack).unwrap();
+        match r {
+            Value::Pair(p) => {
+                assert_fixnum(&p.car(), 1);
+                assert_fixnum(&p.cdr(), 2);
+            }
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn null_p_and_pair_p() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![Value::Null]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::NullP, 1, &mut stack).unwrap(),
+            true,
+        );
+        push_all(&mut stack, vec![pair(1, 2)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::NullP, 1, &mut stack).unwrap(),
+            false,
+        );
+        push_all(&mut stack, vec![pair(1, 2)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::PairP, 1, &mut stack).unwrap(),
+            true,
+        );
+    }
+
+    #[test]
+    fn not_truthiness() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![Value::Boolean(false)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::Not, 1, &mut stack).unwrap(),
+            true,
+        );
+        // 0 is truthy in Scheme.
+        push_all(&mut stack, vec![Value::fixnum(0)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::Not, 1, &mut stack).unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    fn eq_p_immediate_and_pointer_identity() {
+        let mut stack = ValueStack::new();
+        push_all(&mut stack, vec![Value::fixnum(7), Value::fixnum(7)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::EqP, 2, &mut stack).unwrap(),
+            true,
+        );
+        push_all(&mut stack, vec![Value::fixnum(7), Value::fixnum(8)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::EqP, 2, &mut stack).unwrap(),
+            false,
+        );
+        // Two distinct allocations are never eq?.
+        push_all(&mut stack, vec![pair(1, 2), pair(1, 2)]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::EqP, 2, &mut stack).unwrap(),
+            false,
+        );
+        // Same allocation IS eq? to itself.
+        let p = pair(1, 2);
+        push_all(&mut stack, vec![p.clone(), p]);
+        assert_bool(
+            &try_fast_data_primop(DataPrimOp::EqP, 2, &mut stack).unwrap(),
+            true,
+        );
+    }
+
+    #[test]
+    fn vector_ref_success_and_out_of_range_declines() {
+        let mut stack = ValueStack::new();
+        let v = Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(vec![
+            Value::fixnum(10),
+            Value::fixnum(20),
+        ])));
+        push_all(&mut stack, vec![v.clone(), Value::fixnum(1)]);
+        assert_fixnum(
+            &try_fast_data_primop(DataPrimOp::VectorRef, 2, &mut stack).unwrap(),
+            20,
+        );
+        assert!(stack.is_empty());
+
+        push_all(&mut stack, vec![v.clone(), Value::fixnum(5)]);
+        let r = try_fast_data_primop(DataPrimOp::VectorRef, 2, &mut stack);
+        assert!(r.is_none(), "out-of-range index must decline, not panic");
+        assert_eq!(stack.len(), 2);
+        // Stack restored in original order: vec below, index on top.
+        assert_fixnum(&stack.pop().unwrap(), 5);
+        match stack.pop().unwrap() {
+            Value::Vector(popped) => assert!(cs_gc::Gc::ptr_eq(
+                &popped,
+                match &v {
+                    Value::Vector(g) => g,
+                    _ => unreachable!(),
+                }
+            )),
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vector_set_success_mutates_in_place() {
+        let mut stack = ValueStack::new();
+        let v = Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(vec![
+            Value::fixnum(10),
+            Value::fixnum(20),
+        ])));
+        push_all(
+            &mut stack,
+            vec![v.clone(), Value::fixnum(0), Value::fixnum(99)],
+        );
+        let r = try_fast_data_primop(DataPrimOp::VectorSet, 3, &mut stack).unwrap();
+        assert!(matches!(r, Value::Unspecified));
+        match &v {
+            Value::Vector(vec) => assert_fixnum(&vec.borrow()[0], 99),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn vector_set_self_cycle_does_not_hang() {
+        // (vector-set! v 0 v) — must not deadlock/panic; the cycle
+        // detector runs (or is at least invoked) exactly as
+        // b_vector_set does.
+        let mut stack = ValueStack::new();
+        let v = Value::Vector(cs_gc::Gc::new(std::cell::RefCell::new(vec![Value::Null])));
+        push_all(&mut stack, vec![v.clone(), Value::fixnum(0), v.clone()]);
+        let r = try_fast_data_primop(DataPrimOp::VectorSet, 3, &mut stack).unwrap();
+        assert!(matches!(r, Value::Unspecified));
+        match &v {
+            Value::Vector(vec) => assert!(matches!(vec.borrow()[0], Value::Vector(_))),
+            _ => unreachable!(),
+        }
     }
 }
 
