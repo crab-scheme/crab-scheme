@@ -7,6 +7,7 @@
 #   bench/baseline.sh                    # record a new baseline JSON
 #   bench/baseline.sh --diff <file.json> # rerun and diff vs a saved baseline
 set -euo pipefail
+CALLER_PWD="$PWD"
 cd "$(dirname "$0")"
 ROOT=$(cd .. && pwd)
 SCM_DIR="$ROOT/bench/microbench/scheme"
@@ -19,6 +20,10 @@ TIERS=(walker vm vm-jit)
 DIFF_AGAINST=""
 if [ "${1:-}" = "--diff" ]; then
   DIFF_AGAINST="${2:?--diff requires a baseline JSON path}"
+  case "$DIFF_AGAINST" in
+    /*) ;;
+    *) DIFF_AGAINST="$CALLER_PWD/$DIFF_AGAINST" ;;
+  esac
 fi
 
 HAVE_HYPERFINE=1
