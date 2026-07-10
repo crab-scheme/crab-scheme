@@ -165,10 +165,17 @@ thread_local! {
     /// makes the budget check a no-op — non-actor contexts pay only
     /// the per-N-op counter decrement.
     static VM_YIELD_HOOK: Cell<Option<VmYieldHook>> = const { Cell::new(None) };
-    /// Counter of bytecode ops since the last yield (per-thread).
-    /// Counts UP toward `REDUCTION_BUDGET` then triggers the hook
-    /// and resets to 0. Tests can read this via `reductions_used`.
-    static VM_REDUCTIONS_USED: Cell<u32> = const { Cell::new(0) };
+    /// Countdown of dispatch ticks remaining before the next budget
+    /// check (cs-gyb: replaces a two-cell "used vs budget" compare
+    /// with a single decrement on the hot path). Reaching 0 means a
+    /// check is due *now*; [`vm_tick_reductions`] takes the cold
+    /// `vm_tick_reductions_slow` path in that case, which fires the
+    /// yield hook (if installed) and reloads this countdown from
+    /// [`VM_REDUCTION_BUDGET`]. Kept in lockstep with the budget by
+    /// [`set_reduction_budget`], which reloads it too so a shrunk
+    /// budget takes effect on the very next tick (tests rely on
+    /// this for fast preemption).
+    static VM_TICKS_REMAINING: Cell<u32> = const { Cell::new(1999) };
     /// Per-thread reduction budget. Default 2000 (matches BEAM's
     /// reduction unit). Adjustable via [`set_reduction_budget`] for
     /// tests that want to force preemption sooner.
@@ -10483,6 +10490,9 @@ pub fn install_yield_hook(hook: Option<VmYieldHook>) -> Option<VmYieldHook> {
 /// instructions.
 pub fn set_reduction_budget(n: u32) {
     VM_REDUCTION_BUDGET.with(|c| c.set(n));
+    // Resync the countdown so the new budget governs the very next
+    // tick rather than whenever the old countdown happens to hit 0.
+    VM_TICKS_REMAINING.with(|c| c.set(n.saturating_sub(1)));
 }
 
 /// Read the current thread's reduction-budget setting.
@@ -10504,24 +10514,39 @@ pub fn reset_yield_count() {
 
 /// Bump the reduction counter and fire the yield hook if the
 /// budget is exhausted. Called from the dispatch loop on every
-/// instruction; also `pub` for integration tests that simulate
-/// bytecode interpretation without spinning up a full VM frame
-/// (parallel-runtime spec C2.3). Hot path — keep small.
+/// instruction, and (cs-gyb) from the JIT's tail-self back-edge
+/// helper `vm_jit_tick_reductions` — also `pub` for integration
+/// tests that simulate bytecode interpretation without spinning up
+/// a full VM frame (parallel-runtime spec C2.3). Hot path: the
+/// common case is one TLS access and a decrement; the budget
+/// check/yield-hook logic only runs once every `REDUCTION_BUDGET`
+/// ticks via the cold `vm_tick_reductions_slow` path.
 #[inline]
 pub fn vm_tick_reductions() {
-    VM_REDUCTIONS_USED.with(|used| {
-        let new = used.get().saturating_add(1);
-        let budget = VM_REDUCTION_BUDGET.with(|b| b.get());
-        if new >= budget {
-            used.set(0);
-            if let Some(hook) = VM_YIELD_HOOK.with(|h| h.get()) {
-                VM_YIELD_COUNT.with(|c| c.set(c.get() + 1));
-                hook();
-            }
+    VM_TICKS_REMAINING.with(|remaining| {
+        let n = remaining.get();
+        if n == 0 {
+            vm_tick_reductions_slow();
         } else {
-            used.set(new);
+            remaining.set(n - 1);
         }
     });
+}
+
+/// Cold path for [`vm_tick_reductions`]: fires the yield hook (if
+/// installed) and reloads the countdown from the current budget.
+/// Split out so the hot inline path stays a single load/branch and
+/// this larger, rarely-taken body doesn't get inlined into every
+/// call site.
+#[cold]
+#[inline(never)]
+fn vm_tick_reductions_slow() {
+    if let Some(hook) = VM_YIELD_HOOK.with(|h| h.get()) {
+        VM_YIELD_COUNT.with(|c| c.set(c.get() + 1));
+        hook();
+    }
+    let budget = VM_REDUCTION_BUDGET.with(|b| b.get());
+    VM_TICKS_REMAINING.with(|c| c.set(budget.saturating_sub(1)));
 }
 
 /// C-ABI entry point so JIT-compiled code can tick a reduction at loop
