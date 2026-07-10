@@ -33,23 +33,28 @@
 //! on region-allocated handles. The count does NOT drive
 //! reclamation — the region's bulk free runs regardless.
 //!
-//! # Validity check (iter 3 + Gap E-6)
+//! # Validity check (iter 3 + Gap E-6 + cs-6hb epoch slab)
 //!
-//! A thread-local `LIVE_REGION_IDS` set: every Region-arm
-//! `Gc<T>` operation (`Clone`, `Deref`, `strong_count`)
-//! checks that the region the value was allocated from is
-//! still alive. Use-after-region-drop panics with a clear
-//! diagnostic.
+//! Every Region-arm `Gc<T>` operation (`Clone`, `Deref`,
+//! `strong_count`) checks that the region the value was
+//! allocated from is still alive. Use-after-region-drop panics
+//! with a clear diagnostic.
 //!
 //! Iter 3 originally gated this check on
 //! `#[cfg(debug_assertions)]` and accepted release-mode UB.
 //! Gap E-6 closed that window: the check runs unconditionally
-//! in every build. Cost is one HashSet lookup per Region-arm
-//! Deref (~5ns on a warm cache). The trade-off is favourable —
-//! protecting against UB in production is worth ~5ns/deref,
-//! and layer-5 escape analysis (when fully wired) eliminates
-//! the path entirely for compiled programs (all Region
-//! allocations become statically safe).
+//! in every build.
+//!
+//! cs-6hb replaced the original `RefCell<HashSet<RegionId>>`
+//! (SipHash lookup per deref) with a thread-local **epoch
+//! slab**: `RegionId`'s u32 payload is repacked as `(generation
+//! << 16) | slot`, and liveness is a TLS access + `Vec` index +
+//! integer compare — see [`RegionSlab`] for the encoding and
+//! wraparound argument. Cost dropped from a hashed set lookup
+//! to a couple of array reads; protecting against UB in
+//! production remains effectively free. Layer-5 escape analysis
+//! (when fully wired) eliminates the path entirely for compiled
+//! programs (all Region allocations become statically safe).
 //!
 //! # Status
 //!
@@ -67,39 +72,64 @@
 #![cfg(feature = "regions")]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use bumpalo::Bump;
 
-/// Per-region identity used to validate region membership in
-/// debug builds and to disambiguate handles from sibling
-/// regions.
+/// Number of low bits of the packed u32 given to the slot
+/// index; the remaining high bits hold the generation. See
+/// [`RegionSlab`] for the full encoding rationale.
+const SLOT_BITS: u32 = 16;
+const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
+/// Slot indices this thread can have concurrently live at
+/// once (not the total number of regions ever created — slots
+/// recycle on drop). 65,536 concurrently-live regions on one
+/// thread is far beyond any realistic call-depth/region-nesting
+/// pattern in this codebase.
+const MAX_SLOTS: usize = 1 << SLOT_BITS;
+/// Largest generation value a single slot index is allowed to
+/// reach before [`RegionSlab`] retires it instead of recycling
+/// it. See the module doc + [`RegionSlab::drop_region`] for why
+/// this fully eliminates ABA/wraparound rather than merely
+/// making it unlikely.
+const MAX_GENERATION: u32 = u32::MAX >> SLOT_BITS;
+
+/// Per-region identity used to validate region membership and
+/// to disambiguate handles from sibling regions.
 ///
-/// The id is a 32-bit non-zero counter minted from a global
-/// atomic. Sized to u32 so it fits the `region_id` field of
-/// [`RegionSlot`] — that field stores the owning region's id
-/// inline so `from_raw_jit_region` can reconstruct
+/// The id packs a thread-local slab slot index (low
+/// [`SLOT_BITS`] bits) and a generation counter (high bits)
+/// into a single non-zero u32 — see [`RegionSlab`]. It's still
+/// sized to u32 so it fits the `region_id` field of
+/// [`RegionSlot`] unchanged: that field stores the owning
+/// region's id inline so `from_raw_jit_region` can reconstruct
 /// `GcRepr::Region` from a raw slot pointer alone (no
-/// thread-local lookup required). Roll-over after 2³² regions
-/// per process is a theoretical concern only — realistically
-/// the counter never approaches u32::MAX in any program.
+/// thread-local lookup required) — the packed encoding
+/// round-trips through that field exactly like the old flat
+/// counter did.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct RegionId(NonZeroU32);
 
-static REGION_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
-
 impl RegionId {
-    /// Mint a fresh `RegionId` distinct from every other id
-    /// produced this process.
-    fn fresh() -> Self {
-        let raw = REGION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Counter starts at 1 and only ever increments; the
-        // NonZero invariant holds.
-        RegionId(NonZeroU32::new(raw).expect("RegionId counter overflowed to 0"))
+    /// Pack a (slot, generation) pair minted by [`RegionSlab`]
+    /// into a `RegionId`. `generation` must be in `1..=MAX_GENERATION`
+    /// (the slab never mints 0 or values above the cap).
+    fn pack(slot: u32, generation: u32) -> Self {
+        debug_assert!(slot <= SLOT_MASK, "region slot index overflowed SLOT_BITS");
+        debug_assert!(
+            (1..=MAX_GENERATION).contains(&generation),
+            "region generation out of range"
+        );
+        let raw = (generation << SLOT_BITS) | slot;
+        RegionId(NonZeroU32::new(raw).expect("RegionId packed to 0 (slot=0, generation=0)"))
+    }
+
+    /// Unpack into `(slot_index, generation)`.
+    fn unpack(self) -> (u32, u32) {
+        let raw = self.0.get();
+        (raw & SLOT_MASK, raw >> SLOT_BITS)
     }
 
     /// Raw u32 form for diagnostic printing and `RegionSlot`
@@ -114,6 +144,119 @@ impl RegionId {
     /// region" / corrupted slot).
     pub fn from_raw_u32(raw: u32) -> Option<Self> {
         NonZeroU32::new(raw).map(RegionId)
+    }
+}
+
+/// Thread-local epoch slab backing region-liveness checks.
+///
+/// Replaces the original `HashSet<RegionId>` (cs-6hb): instead
+/// of hashing a region id and probing a set on every
+/// Region-arm `Gc<T>` operation, liveness is a slot index into
+/// two parallel `Vec`s plus an integer compare.
+///
+/// # Encoding
+///
+/// A `RegionId`'s u32 payload is `(generation << SLOT_BITS) |
+/// slot`. `slot` indexes `generation`/`live`; `generation` is
+/// the value that was current for that slot when this
+/// particular `RegionId` was minted.
+///
+/// - `Region::new()` calls [`alloc`](Self::alloc): pop a free
+///   slot (bumping its generation) or grow the slab.
+/// - `Region::drop` calls [`drop_region`](Self::drop_region):
+///   marks the slot dead and — usually — returns it to the
+///   free list for the next `Region::new()` to reuse.
+/// - The liveness check is `live[slot] && generation[slot] ==
+///   embedded_generation`: a stale id from a since-recycled
+///   slot fails the generation compare even though the slot
+///   itself is live again for a *different* region.
+///
+/// # Wraparound is guarded, not just "unlikely"
+///
+/// A slot's generation is a `u32 >> SLOT_BITS` = 16-bit
+/// counter here (`MAX_GENERATION`). Rather than letting it
+/// wrap (which would let a stale `RegionId` from generation N
+/// alias a live region at generation N + 2¹⁶ — an ABA false
+/// "live" positive on exactly the case this check exists to
+/// catch), [`drop_region`](Self::drop_region) simply stops
+/// recycling a slot once its generation reaches the cap: the
+/// slot is left permanently dead (`live = false`) and never
+/// pushed back to the free list, so no future `RegionId` is
+/// ever minted with that (slot, generation) pair again.
+///
+/// The cost is that a single thread hammering `Region::new`/
+/// `drop` back-to-back in a tight loop grows the slab by one
+/// permanently-retired entry every `MAX_GENERATION` (~65,536)
+/// uses of that slot — a few bytes of `Vec` growth per 65k
+/// iterations, i.e. negligible even across a billion-iteration
+/// run (~15k retired entries, ~100KB).
+struct RegionSlab {
+    /// `generation[slot]` — the generation value that makes
+    /// `slot` currently live (if `live[slot]` is true) or the
+    /// last generation it held (if dead/retired).
+    generation: Vec<u32>,
+    /// `live[slot]` — whether `slot`'s region is currently
+    /// alive.
+    live: Vec<bool>,
+    /// Slot indices available for reuse. A slot that hit
+    /// `MAX_GENERATION` on drop is *not* pushed here — see the
+    /// wraparound note above.
+    free: Vec<u32>,
+}
+
+impl RegionSlab {
+    const fn new() -> Self {
+        RegionSlab {
+            generation: Vec::new(),
+            live: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self) -> RegionId {
+        if let Some(slot) = self.free.pop() {
+            let idx = slot as usize;
+            // Slots are only ever freed with generation <
+            // MAX_GENERATION (see drop_region), so this bump
+            // never exceeds the cap.
+            let next_gen = self.generation[idx] + 1;
+            self.generation[idx] = next_gen;
+            self.live[idx] = true;
+            return RegionId::pack(slot, next_gen);
+        }
+        let idx = self.generation.len();
+        assert!(
+            idx < MAX_SLOTS,
+            "cs_gc::Region: exceeded {MAX_SLOTS} concurrently-live regions on one thread"
+        );
+        self.generation.push(1);
+        self.live.push(true);
+        RegionId::pack(idx as u32, 1)
+    }
+
+    fn drop_region(&mut self, id: RegionId) {
+        let (slot, generation) = id.unpack();
+        let idx = slot as usize;
+        debug_assert_eq!(
+            self.generation[idx], generation,
+            "cs_gc::Region: slab generation mismatch on drop (double-drop or corrupted id?)"
+        );
+        self.live[idx] = false;
+        if generation < MAX_GENERATION {
+            self.free.push(slot);
+        }
+        // else: retire — see the wraparound note on `RegionSlab`.
+    }
+
+    fn is_live(&self, id: RegionId) -> bool {
+        let (slot, generation) = id.unpack();
+        let idx = slot as usize;
+        idx < self.live.len() && self.live[idx] && self.generation[idx] == generation
+    }
+
+    #[cfg(test)]
+    fn live_count(&self) -> usize {
+        self.live.iter().filter(|&&l| l).count()
     }
 }
 
@@ -179,12 +322,12 @@ impl Default for Region {
 }
 
 thread_local! {
-    /// Set of `RegionId`s for regions currently alive on this
-    /// thread. `Region::new` inserts; `Region::Drop` removes
-    /// **before** the underlying Bump arena frees, so the
-    /// validity check in `Gc<T>` methods can detect
-    /// use-after-region-drop.
-    static LIVE_REGION_IDS: RefCell<HashSet<RegionId>> = RefCell::new(HashSet::new());
+    /// Epoch slab tracking regions currently alive on this
+    /// thread. `Region::new` allocates a slot; `Region::Drop`
+    /// marks it dead **before** the underlying Bump arena
+    /// frees, so the validity check in `Gc<T>` methods can
+    /// detect use-after-region-drop. See [`RegionSlab`].
+    static REGION_SLAB: RefCell<RegionSlab> = const { RefCell::new(RegionSlab::new()) };
 }
 
 /// Check that `region_id` corresponds to a region currently
@@ -193,14 +336,16 @@ thread_local! {
 ///
 /// **Gap E-6:** runs unconditionally in every build (debug
 /// and release) — protecting against use-after-region-drop
-/// UB in production is worth the ~5ns/deref cost. Layer-5
+/// UB in production is worth the cost. **cs-6hb:** that cost
+/// is now a TLS access + `Vec` index + generation compare
+/// (see [`RegionSlab`]), not a hashed-set lookup. Layer-5
 /// escape analysis, once fully wired, eliminates this path
 /// for compiled programs (all `Gc::new_in` sites become
 /// statically safe).
 #[inline]
 pub(crate) fn assert_region_live(region_id: RegionId) {
-    LIVE_REGION_IDS.with(|s| {
-        if !s.borrow().contains(&region_id) {
+    REGION_SLAB.with(|s| {
+        if !s.borrow().is_live(region_id) {
             panic!(
                 "cs_gc::Gc<T>: region {region_id:?} dropped while \
                  a handle into it is still outstanding (use-after-region-drop)"
@@ -215,7 +360,7 @@ pub(crate) fn assert_region_live(region_id: RegionId) {
 /// freed (release-mode best-effort to avoid UB).
 #[inline]
 pub(crate) fn is_region_live(region_id: RegionId) -> bool {
-    LIVE_REGION_IDS.with(|s| s.borrow().contains(&region_id))
+    REGION_SLAB.with(|s| s.borrow().is_live(region_id))
 }
 
 /// Test-only accessor for the live-region-id count. Used by
@@ -223,7 +368,7 @@ pub(crate) fn is_region_live(region_id: RegionId) -> bool {
 /// bookkeeping; not exposed beyond the crate.
 #[cfg(test)]
 pub(crate) fn live_region_count() -> usize {
-    LIVE_REGION_IDS.with(|s| s.borrow().len())
+    REGION_SLAB.with(|s| s.borrow().live_count())
 }
 
 impl Region {
@@ -234,10 +379,7 @@ impl Region {
     /// can validate that handles into this region are still
     /// in scope.
     pub fn new() -> Self {
-        let id = RegionId::fresh();
-        LIVE_REGION_IDS.with(|s| {
-            s.borrow_mut().insert(id);
-        });
+        let id = REGION_SLAB.with(|s| s.borrow_mut().alloc());
         Region {
             id,
             arena: Bump::new(),
@@ -322,19 +464,19 @@ impl Drop for Region {
         for dtor in dtors.into_iter().rev() {
             dtor();
         }
-        // Unregister this region from the live-id set BEFORE
-        // the underlying Bump arena frees its memory.
-        // `Gc<T>` operations check this set; an outstanding
-        // handle accessed after region drop would panic if
-        // we'd missed this step (which is correct — the
-        // access would otherwise hit freed memory).
+        // Mark this region's slot dead in the slab BEFORE the
+        // underlying Bump arena frees its memory. `Gc<T>`
+        // operations check the slab; an outstanding handle
+        // accessed after region drop would panic if we'd
+        // missed this step (which is correct — the access
+        // would otherwise hit freed memory).
         //
         // Field-drop order: fields drop in declaration order
         // after this Drop fn returns. `id` is Copy so it's
         // unaffected; the Bump arena drops last (when this fn
         // returns), freeing all allocations.
-        LIVE_REGION_IDS.with(|s| {
-            s.borrow_mut().remove(&self.id);
+        REGION_SLAB.with(|s| {
+            s.borrow_mut().drop_region(self.id);
         });
     }
 }
