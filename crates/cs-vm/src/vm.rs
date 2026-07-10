@@ -11748,7 +11748,18 @@ fn run_dispatch(
         let Some(frame) = frames.last_mut() else {
             return Err(VmError::new("vm stack underflow"));
         };
-        if frame.ip >= frame.insts.len() {
+        // Borrow-by-reference dispatch: avoids cloning the instruction (and
+        // its Value payload for Const) per VM tick. Owned data is taken only
+        // in the arms that need it (Const stack-push, Call/TailCall).
+        //
+        // Normal termination goes through the `Inst::Return` arm below —
+        // every compiled body (top-level and per-lambda) ends with an
+        // explicit `Return`. The bounds-checked `.get()` here is a
+        // defensive fallback for any frame whose insts run out without
+        // one, folding what used to be a separate always-executed
+        // `ip >= len` check into the fetch itself.
+        let inst_ip = frame.ip;
+        let Some(inst_ref) = frame.insts.get(inst_ip) else {
             // End of frame: pop, keep top of stack as result.
             frames.pop();
             if frames.is_empty() {
@@ -11757,12 +11768,7 @@ fn run_dispatch(
                     .ok_or_else(|| VmError::new("empty stack at exit"));
             }
             continue;
-        }
-        // Borrow-by-reference dispatch: avoids cloning the instruction (and
-        // its Value payload for Const) per VM tick. Owned data is taken only
-        // in the arms that need it (Const stack-push, Call/TailCall).
-        let inst_ref = &frame.insts[frame.ip];
-        let inst_ip = frame.ip;
+        };
         frame.ip += 1;
         match inst_ref {
             Inst::Const(v) => stack.push(v.clone()),

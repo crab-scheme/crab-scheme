@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use cs_core::{Symbol, Value};
+use cs_core::{Number, Symbol, Value};
 use cs_diag::Span;
 use cs_ir::{CoreExpr, Params};
 
@@ -92,7 +92,13 @@ pub fn compile_with_globals_and_primops(
         primops,
         &mut scope,
     )?;
+    // Every compiled body — top-level and per-lambda (see the Lambda arm
+    // of `compile_expr`) — ends with an explicit `Return` so the VM's
+    // dispatch loop can treat falling off the end of a frame's insts as
+    // a defensive fallback rather than the primary termination check.
+    buf.push(Inst::Return, expr.span());
     let (insts, spans) = buf.finish();
+    let (insts, spans) = peephole(insts, spans);
     Ok(Bytecode {
         insts: Rc::new(insts),
         spans: Rc::new(spans),
@@ -367,6 +373,200 @@ fn primop_to_inst(op: PrimOp) -> Inst {
     }
 }
 
+/// Post-codegen peephole pass, run once on every compiled body (top-level
+/// and per-lambda) right after codegen finishes, before `detect_fast_primop`
+/// sees the shape — folding can shrink a body into the 4-inst fast-primop
+/// pattern that wouldn't have matched pre-fold. Three sub-passes, applied in
+/// order:
+///  1. Constant folding: `Const(a); Const(b); <Fx2 op>` -> `Const(folded)`
+///     when both operands are compile-time fixnums and the checked op
+///     doesn't overflow (an overflow falls through to the runtime's
+///     bignum-promoting generic path, which this pass doesn't replicate).
+///  2. Dead-store cancellation: `SetVar(s); Const(Unspecified); Pop` (the
+///     exact shape `CoreExpr::Set` emits in non-tail `begin` position) ->
+///     `SetVar(s)`.
+///  3. Jump threading: a `Jump`/conditional-branch target that lands on an
+///     unconditional `Jump` is redirected straight to that `Jump`'s own
+///     target, chased transitively.
+///
+/// Sub-passes 1 and 2 delete instructions, which requires remapping every
+/// jump target that crosses the deleted span; `compact` builds that remap.
+/// Both patterns are only ever emitted as one atomic, contiguous unit by a
+/// single `compile_expr` call (a primop `App`'s arg0/arg1/op, or a `Set`'s
+/// SetVar/Const/Pop) — jump targets are always `out.len()` snapshots taken
+/// at `compile_expr` call boundaries, so no jump can land mid-pattern.
+fn peephole(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<Span>) {
+    let (insts, spans) = peephole_fold_consts(insts, spans);
+    let (insts, spans) = peephole_cancel_dead_set(insts, spans);
+    let mut insts = insts;
+    peephole_thread_jumps(&mut insts);
+    (insts, spans)
+}
+
+fn branch_target(inst: &Inst) -> Option<usize> {
+    match inst {
+        Inst::Jump(t)
+        | Inst::JumpIfFalse(t)
+        | Inst::BranchOnGeFx2(t)
+        | Inst::BranchOnGtFx2(t)
+        | Inst::BranchOnLeFx2(t)
+        | Inst::BranchOnLtFx2(t)
+        | Inst::BranchOnNeFx2(t) => Some(*t),
+        _ => None,
+    }
+}
+
+fn set_branch_target(inst: &mut Inst, new_target: usize) {
+    match inst {
+        Inst::Jump(t)
+        | Inst::JumpIfFalse(t)
+        | Inst::BranchOnGeFx2(t)
+        | Inst::BranchOnGtFx2(t)
+        | Inst::BranchOnLeFx2(t)
+        | Inst::BranchOnLtFx2(t)
+        | Inst::BranchOnNeFx2(t) => *t = new_target,
+        _ => {}
+    }
+}
+
+/// Rebuild `insts`/`spans`, dropping every index where `deleted[i]` is set
+/// and substituting `replace[i]` for the instruction at a kept index `i`
+/// when present. Returns the new vectors plus an `old_to_new` map (length
+/// `insts.len() + 1`) where `old_to_new[i]` is the new index that a jump
+/// target of `i` should be rewritten to — the next surviving instruction at
+/// or after logical position `i`, so a target that pointed into a deleted
+/// span resumes exactly where execution would have continued.
+/// `old_to_new[insts.len()]` is the new one-past-the-end index.
+fn compact(
+    insts: Vec<Inst>,
+    spans: Vec<Span>,
+    deleted: &[bool],
+    mut replace: HashMap<usize, Inst>,
+) -> (Vec<Inst>, Vec<Span>, Vec<usize>) {
+    let len = insts.len();
+    let mut new_insts = Vec::with_capacity(len);
+    let mut new_spans = Vec::with_capacity(len);
+    let mut old_to_new = vec![0usize; len + 1];
+    for (i, (inst, span)) in insts.into_iter().zip(spans).enumerate() {
+        old_to_new[i] = new_insts.len();
+        if deleted[i] {
+            continue;
+        }
+        let inst = replace.remove(&i).unwrap_or(inst);
+        new_insts.push(inst);
+        new_spans.push(span);
+    }
+    old_to_new[len] = new_insts.len();
+    (new_insts, new_spans, old_to_new)
+}
+
+fn remap_targets(insts: &mut [Inst], old_to_new: &[usize]) {
+    for inst in insts.iter_mut() {
+        if let Some(t) = branch_target(inst) {
+            set_branch_target(inst, old_to_new[t]);
+        }
+    }
+}
+
+fn as_fixnum_const(inst: &Inst) -> Option<i64> {
+    match inst {
+        Inst::Const(Value::Number(Number::Fixnum(v))) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Fold a 2-arg fixnum primop over compile-time-known operands, matching
+/// the runtime's `fixnum_binop2_nb`/`fixnum_cmp2_nb` fast-path semantics
+/// exactly (checked arithmetic; `None` on overflow leaves folding to the
+/// runtime's generic bignum-promoting path).
+fn fold_fixnum_op(op: &Inst, a: i64, b: i64) -> Option<Value> {
+    match op {
+        Inst::AddFx2 => a.checked_add(b).map(|v| Value::Number(Number::Fixnum(v))),
+        Inst::SubFx2 => a.checked_sub(b).map(|v| Value::Number(Number::Fixnum(v))),
+        Inst::MulFx2 => a.checked_mul(b).map(|v| Value::Number(Number::Fixnum(v))),
+        Inst::LtFx2 => Some(Value::Boolean(a < b)),
+        Inst::LeFx2 => Some(Value::Boolean(a <= b)),
+        Inst::GtFx2 => Some(Value::Boolean(a > b)),
+        Inst::GeFx2 => Some(Value::Boolean(a >= b)),
+        Inst::EqFx2 => Some(Value::Boolean(a == b)),
+        _ => None,
+    }
+}
+
+fn peephole_fold_consts(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<Span>) {
+    let len = insts.len();
+    if len < 3 {
+        return (insts, spans);
+    }
+    let mut deleted = vec![false; len];
+    let mut replace = HashMap::new();
+    let mut i = 0;
+    while i + 2 < len {
+        if let (Some(a), Some(b)) = (as_fixnum_const(&insts[i]), as_fixnum_const(&insts[i + 1])) {
+            if let Some(folded) = fold_fixnum_op(&insts[i + 2], a, b) {
+                replace.insert(i, Inst::Const(folded));
+                deleted[i + 1] = true;
+                deleted[i + 2] = true;
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if replace.is_empty() {
+        return (insts, spans);
+    }
+    let (mut insts, spans, old_to_new) = compact(insts, spans, &deleted, replace);
+    remap_targets(&mut insts, &old_to_new);
+    (insts, spans)
+}
+
+fn peephole_cancel_dead_set(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<Span>) {
+    let len = insts.len();
+    if len < 3 {
+        return (insts, spans);
+    }
+    let mut deleted = vec![false; len];
+    let mut any = false;
+    for i in 0..len - 2 {
+        if matches!(insts[i], Inst::SetVar(_))
+            && matches!(insts[i + 1], Inst::Const(Value::Unspecified))
+            && matches!(insts[i + 2], Inst::Pop)
+        {
+            deleted[i + 1] = true;
+            deleted[i + 2] = true;
+            any = true;
+        }
+    }
+    if !any {
+        return (insts, spans);
+    }
+    let (mut insts, spans, old_to_new) = compact(insts, spans, &deleted, HashMap::new());
+    remap_targets(&mut insts, &old_to_new);
+    (insts, spans)
+}
+
+fn peephole_thread_jumps(insts: &mut [Inst]) {
+    let len = insts.len();
+    for i in 0..len {
+        let Some(mut t) = branch_target(&insts[i]) else {
+            continue;
+        };
+        let mut hops = 0;
+        while t < len && hops <= len {
+            let Inst::Jump(next) = &insts[t] else {
+                break;
+            };
+            if *next == t {
+                break;
+            }
+            t = *next;
+            hops += 1;
+        }
+        set_branch_target(&mut insts[i], t);
+    }
+}
+
 fn compile_expr(
     expr: &CoreExpr,
     out: &mut InstBuf,
@@ -613,6 +813,7 @@ fn compile_expr(
                 Params { fixed, rest } => (fixed.clone(), *rest),
             };
             let (body_insts, body_spans) = body_buf.finish();
+            let (body_insts, body_spans) = peephole(body_insts, body_spans);
             let fast = detect_fast_primop(&body_insts, &body_spans, &fixed);
             let lambda_idx = lambdas.len();
             lambdas.push(CompiledLambda {
