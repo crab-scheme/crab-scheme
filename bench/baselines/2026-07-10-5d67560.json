@@ -1,0 +1,247 @@
+{
+  "sha": "5d67560",
+  "date": "2026-07-10",
+  "timing_source": "hyperfine",
+  "cells": [
+    {
+      "benchmark": "fib",
+      "tier": "walker",
+      "median_s": 0.1319841362,
+      "stddev_s": 0.006016931393048116,
+      "max_rss_bytes": 11812864,
+      "bytes_allocated_total": 2224,
+      "alloc_count_total": 42,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "fib",
+      "tier": "vm",
+      "median_s": 0.0246611552,
+      "stddev_s": 0.003965875927486482,
+      "max_rss_bytes": 11730944,
+      "bytes_allocated_total": 2224,
+      "alloc_count_total": 42,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "fib",
+      "tier": "vm-jit",
+      "median_s": 0.006210145659999999,
+      "stddev_s": 0.001861581448140228,
+      "max_rss_bytes": 14254080,
+      "bytes_allocated_total": 2224,
+      "alloc_count_total": 42,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "tak",
+      "tier": "walker",
+      "median_s": 0.04543724034,
+      "stddev_s": 0.002880121606649062,
+      "max_rss_bytes": 11878400,
+      "bytes_allocated_total": 2176,
+      "alloc_count_total": 41,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "tak",
+      "tier": "vm",
+      "median_s": 0.012855558400000001,
+      "stddev_s": 0.0014653662951767939,
+      "max_rss_bytes": 11714560,
+      "bytes_allocated_total": 2176,
+      "alloc_count_total": 41,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "tak",
+      "tier": "vm-jit",
+      "median_s": 0.00632399168,
+      "stddev_s": 0.0019630087521203448,
+      "max_rss_bytes": 14352384,
+      "bytes_allocated_total": 2176,
+      "alloc_count_total": 41,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "ack",
+      "tier": "walker",
+      "median_s": 0.12051407496000001,
+      "stddev_s": 0.02143239309094864,
+      "max_rss_bytes": 12451840,
+      "bytes_allocated_total": 2176,
+      "alloc_count_total": 41,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "ack",
+      "tier": "vm",
+      "median_s": 0.021594420000000003,
+      "stddev_s": 0.004894728337681029,
+      "max_rss_bytes": 11796480,
+      "bytes_allocated_total": 2176,
+      "alloc_count_total": 41,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "ack",
+      "tier": "vm-jit",
+      "median_s": 0.007218635780000001,
+      "stddev_s": 0.1485363394749084,
+      "max_rss_bytes": 14368768,
+      "bytes_allocated_total": 2176,
+      "alloc_count_total": 41,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "nqueens",
+      "tier": "walker",
+      "median_s": 0.12163061254,
+      "stddev_s": 0.01590649596153647,
+      "max_rss_bytes": 24100864,
+      "bytes_allocated_total": 364032,
+      "alloc_count_total": 4153,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "nqueens",
+      "tier": "vm",
+      "median_s": 0.02826029084,
+      "stddev_s": 0.009286144488483953,
+      "max_rss_bytes": 11714560,
+      "bytes_allocated_total": 364032,
+      "alloc_count_total": 4153,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "nqueens",
+      "tier": "vm-jit",
+      "median_s": 0.02361448294,
+      "stddev_s": 0.0054172904341671,
+      "max_rss_bytes": 19955712,
+      "bytes_allocated_total": 364032,
+      "alloc_count_total": 4153,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "mandelbrot",
+      "tier": "walker",
+      "median_s": 0.41617778764,
+      "stddev_s": 0.11253422306112311,
+      "max_rss_bytes": 16023552,
+      "bytes_allocated_total": 2224,
+      "alloc_count_total": 42,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "mandelbrot",
+      "tier": "vm",
+      "median_s": 0.07517219424,
+      "stddev_s": 0.008933601015506738,
+      "max_rss_bytes": 11796480,
+      "bytes_allocated_total": 2224,
+      "alloc_count_total": 42,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "mandelbrot",
+      "tier": "vm-jit",
+      "median_s": 0.01602067386,
+      "stddev_s": 0.005550164486296572,
+      "max_rss_bytes": 16564224,
+      "bytes_allocated_total": 2224,
+      "alloc_count_total": 42,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "spectral-norm",
+      "tier": "walker",
+      "median_s": 0.34488170518,
+      "stddev_s": 0.04375231460332893,
+      "max_rss_bytes": 13418496,
+      "bytes_allocated_total": 2368,
+      "alloc_count_total": 45,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "spectral-norm",
+      "tier": "vm",
+      "median_s": 0.09165996164000001,
+      "stddev_s": 0.011223026352849245,
+      "max_rss_bytes": 11927552,
+      "bytes_allocated_total": 2368,
+      "alloc_count_total": 45,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "spectral-norm",
+      "tier": "vm-jit",
+      "median_s": 0.018217714660000002,
+      "stddev_s": 0.004288469151838047,
+      "max_rss_bytes": 19677184,
+      "bytes_allocated_total": 2368,
+      "alloc_count_total": 45,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "binary-trees",
+      "tier": "walker",
+      "median_s": 0.14477120298,
+      "stddev_s": 0.00787042030173707,
+      "max_rss_bytes": 12189696,
+      "bytes_allocated_total": 11416880,
+      "alloc_count_total": 129754,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "binary-trees",
+      "tier": "vm",
+      "median_s": 0.0423240448,
+      "stddev_s": 0.004681285789209289,
+      "max_rss_bytes": 12140544,
+      "bytes_allocated_total": 11416880,
+      "alloc_count_total": 129754,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "binary-trees",
+      "tier": "vm-jit",
+      "median_s": 0.014192175640000002,
+      "stddev_s": 0.003724499801387393,
+      "max_rss_bytes": 27230208,
+      "bytes_allocated_total": 11416880,
+      "alloc_count_total": 129754,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "alloc-stress",
+      "tier": "walker",
+      "median_s": 0.14173420536000003,
+      "stddev_s": 0.023600530249056735,
+      "max_rss_bytes": 12009472,
+      "bytes_allocated_total": 17602224,
+      "alloc_count_total": 200042,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "alloc-stress",
+      "tier": "vm",
+      "median_s": 0.03325596604,
+      "stddev_s": 0.00620151039897334,
+      "max_rss_bytes": 11862016,
+      "bytes_allocated_total": 17602224,
+      "alloc_count_total": 200042,
+      "live_slots": 0
+    },
+    {
+      "benchmark": "alloc-stress",
+      "tier": "vm-jit",
+      "median_s": 0.016199655540000003,
+      "stddev_s": 0.004575018487966738,
+      "max_rss_bytes": 14680064,
+      "bytes_allocated_total": 17602224,
+      "alloc_count_total": 200042,
+      "live_slots": 0
+    }
+  ]
+}
