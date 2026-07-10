@@ -11508,12 +11508,22 @@ impl cs_gc::cycle::CycleVisit for Bindings {
             }
             let payload = nb_payload_of(bits);
             // Shift-decompress + strip region flag (matches the decode
-            // in `to_value`); the arms below borrow via `from_raw_jit`.
-            let (ptr, _is_region) = nb_decode_gc_ptr(payload);
+            // in `to_value`); the arms below borrow via
+            // `decode_gc_handle`, which routes Region-backed pointers
+            // through `from_raw_jit_region` instead of treating them
+            // as an Rc allocation (region and Rc allocations have
+            // different in-memory layouts — RegionSlot has no RcBox
+            // header, so decoding a region pointer via `from_raw_jit`
+            // would deref garbage). Region values ARE reachable here:
+            // `with-region` allocations can be stored into an `Env`
+            // binding with no escape-analysis enforcement yet, and an
+            // Rc-backed closure capturing that env can register as a
+            // cycle candidate, walking down into this Bindings.
+            let (ptr, is_region) = nb_decode_gc_ptr(payload);
             match tag {
                 t if t == NB_TAG_PAIR => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Pair>::from_raw_jit(ptr)
+                        decode_gc_handle::<cs_core::Pair>(ptr, is_region)
                     });
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
@@ -11521,7 +11531,7 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 }
                 t if t == NB_TAG_VECTOR => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<std::cell::RefCell<Vec<Value>>>::from_raw_jit(ptr)
+                        decode_gc_handle::<std::cell::RefCell<Vec<Value>>>(ptr, is_region)
                     });
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
@@ -11529,7 +11539,7 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 }
                 t if t == NB_TAG_STRING => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<std::cell::RefCell<String>>::from_raw_jit(ptr)
+                        decode_gc_handle::<std::cell::RefCell<String>>(ptr, is_region)
                     });
                     // String holds no Gc<...> children; register
                     // identity for cycle target check, then stop.
@@ -11537,13 +11547,13 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 }
                 t if t == NB_TAG_BYTEVECTOR => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<std::cell::RefCell<Vec<u8>>>::from_raw_jit(ptr)
+                        decode_gc_handle::<std::cell::RefCell<Vec<u8>>>(ptr, is_region)
                     });
                     let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_HASHTABLE => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Hashtable>::from_raw_jit(ptr)
+                        decode_gc_handle::<cs_core::Hashtable>(ptr, is_region)
                     });
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
@@ -11551,13 +11561,13 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 }
                 t if t == NB_TAG_PORT => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Port>::from_raw_jit(ptr)
+                        decode_gc_handle::<cs_core::Port>(ptr, is_region)
                     });
                     let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_PROMISE => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<cs_core::Promise>::from_raw_jit(ptr)
+                        decode_gc_handle::<cs_core::Promise>(ptr, is_region)
                     });
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
@@ -11567,7 +11577,7 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 t if t == NB_TAG_PROCEDURE => {}
                 _ => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        cs_gc::Gc::<Value>::from_raw_jit(ptr)
+                        decode_gc_handle::<Value>(ptr, is_region)
                     });
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
@@ -11607,6 +11617,150 @@ impl cs_gc::cycle::CycleVisit for Env {
             return;
         }
         self.bindings.borrow().visit_children(ctx);
+    }
+}
+
+// cs-4wk: regression coverage for the region-pointer routing fix in
+// `Bindings::visit_children` above. Exercises `Bindings` directly
+// (rather than through the Scheme-level `Value::Procedure ->
+// Procedure::visit_closure_children -> VmClosure -> Env -> Bindings`
+// chain) because `VmClosure`'s `Procedure` impl does not currently
+// override `visit_closure_children` — it inherits the trait's empty
+// default — so the synchronous cycle detector never actually reaches
+// a VM closure's captured env today. That's a separate, pre-existing
+// gap (see cs-f0k); it doesn't change that `Bindings::visit_children`
+// must decode region pointers correctly for whenever that gap closes,
+// or for any other caller (present or future) that visits a
+// `Bindings` directly.
+#[cfg(all(test, feature = "regions"))]
+mod bindings_cycle_visit_region_tests {
+    use super::*;
+    use cs_gc::cycle::cycle_check;
+    use cs_gc::{Gc, Region};
+
+    /// Before the fix, every NanboxValue slot decoded through
+    /// `Gc::from_raw_jit` (the Rc path) even when the payload's
+    /// region flag was set. `RegionSlot`'s header (`strong: u32,
+    /// region_id: u32`) has a different layout than `RcBox`'s (two
+    /// `Cell<usize>` counts), so reconstructing an `Rc<Pair>` over a
+    /// region pointer computes the wrong header offset and the
+    /// subsequent deref reads garbage. `ManuallyDrop` only
+    /// suppresses the erroneous refcount/dealloc on drop — the read
+    /// during the walk itself is already corrupt. Builds a
+    /// `Bindings` frame holding one region-allocated `Pair` slot and
+    /// walks it via the real `CycleVisitor` machinery
+    /// (`cycle_check`), which invokes `Bindings::visit_children`
+    /// exactly as the synchronous detector would.
+    #[test]
+    fn visit_children_decodes_region_pair_without_corruption() {
+        let region = Region::new();
+        let p = cs_core::Pair::new_in(&region, Value::fixnum(11), Value::fixnum(22));
+        assert!(Gc::is_region(&p), "test setup: pair must be region-backed");
+        let nb = NanboxValue::from_value(Value::Pair(p));
+
+        let mut bindings = Bindings::default();
+        match &mut bindings {
+            Bindings::Small(v) => v.push((Symbol(0), nb)),
+            Bindings::Large(_) => unreachable!("default Bindings starts Small"),
+        }
+
+        // Wrap in a fresh Gc so `cycle_check` can walk it as a root
+        // and hand `Bindings::visit_children` a real `CycleVisitor`
+        // — the same object the fixed code decodes `ptr`/`is_region`
+        // through via `decode_gc_handle`.
+        let gc_bindings = Gc::new(bindings);
+        let found = cycle_check(&gc_bindings);
+        assert!(
+            found.is_none(),
+            "no cycle exists in this shape; a wrong region decode \
+             would corrupt the walk before ever reaching this check"
+        );
+    }
+
+    /// Same shape, but the region pair's car/cdr are re-decoded and
+    /// value-checked via a second, independent `cycle_check` call —
+    /// guards against a silent wrong-offset read that happens to
+    /// avoid a hard crash but would still misbehave on repeated
+    /// visits (e.g. reading a stale/aliased header on the second
+    /// pass).
+    #[test]
+    fn visit_children_stable_across_repeated_walks() {
+        let region = Region::new();
+        let p = cs_core::Pair::new_in(&region, Value::fixnum(1), Value::fixnum(2));
+        let nb = NanboxValue::from_value(Value::Pair(p));
+        let mut bindings = Bindings::default();
+        match &mut bindings {
+            Bindings::Small(v) => v.push((Symbol(0), nb)),
+            Bindings::Large(_) => unreachable!("default Bindings starts Small"),
+        }
+        let gc_bindings = Gc::new(bindings);
+        for _ in 0..3 {
+            assert!(cycle_check(&gc_bindings).is_none());
+        }
+    }
+
+    /// Deterministic byte-level demonstration of the exact
+    /// corruption `decode_gc_handle` fixes, isolated from the
+    /// walk's leaf-skipping (`Pair::visit_children` never even
+    /// derefs a Fixnum car/cdr, so the two tests above can't by
+    /// themselves prove the *read* is correct — a Fixnum value
+    /// never gets far enough to matter to them).
+    ///
+    /// `Gc::into_raw_jit` on a Region-backed handle returns a
+    /// pointer to the **start of `RegionSlot<T>`** (header +
+    /// value). `Rc::into_raw` (what the old, unconditional
+    /// `Gc::from_raw_jit` reconstructs via) returns a pointer to
+    /// **just the value**, past `RcBox`'s header. Because
+    /// `Rc<T>::deref` re-derives the value address from the
+    /// pointer it was given using a *constant, `Rc`-shaped*
+    /// offset (not by reading anything from memory), feeding it a
+    /// `RegionSlot`-shaped pointer round-trips back to that exact
+    /// same address — i.e. it reads starting at `RegionSlot`'s
+    /// `strong: Cell<u32>` field instead of skipping past
+    /// `strong` + `region_id` (8 bytes) to the real payload. This
+    /// test reconstructs the same raw handle both ways and shows
+    /// the old path's read landing 8 bytes early.
+    #[test]
+    fn from_raw_jit_rc_path_misreads_region_pair_vs_from_raw_jit_region() {
+        let region = Region::new();
+        let p = cs_core::Pair::new_in(&region, Value::fixnum(11), Value::fixnum(22));
+        assert!(Gc::is_region(&p));
+        let raw_ptr = Gc::into_raw_jit(p);
+
+        // The correct decode (what `decode_gc_handle` now routes
+        // to for a region-flagged payload): reads the stored
+        // values back exactly.
+        let right = std::mem::ManuallyDrop::new(unsafe {
+            decode_gc_handle::<cs_core::Pair>(raw_ptr, true)
+        });
+        match right.car() {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 11),
+            other => panic!("expected Fixnum(11) via decode_gc_handle, got {other:?}"),
+        }
+        match right.cdr() {
+            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 22),
+            other => panic!("expected Fixnum(22) via decode_gc_handle, got {other:?}"),
+        }
+
+        // The pre-fix decode (unconditional `Gc::from_raw_jit`,
+        // the Rc path): must NOT read back the same values — its
+        // read starts 8 bytes into `RegionSlot`'s header instead
+        // of the payload, so `car()` reads `Pair`'s first field
+        // out of `{strong: u32, region_id: u32}` header bytes
+        // rather than the real `Value::fixnum(11)`.
+        let wrong = std::mem::ManuallyDrop::new(unsafe {
+            cs_gc::Gc::<cs_core::Pair>::from_raw_jit(raw_ptr)
+        });
+        let wrong_car_is_correct =
+            matches!(wrong.car(), Value::Number(cs_core::Number::Fixnum(11)));
+        assert!(
+            !wrong_car_is_correct,
+            "the Rc-path decode was expected to misread the region \
+             pair's header bytes as car -- if this ever spuriously \
+             reads Fixnum(11) the header bytes happened to alias a \
+             valid-looking Fixnum by chance; the bug (reading the \
+             wrong offset) is still present regardless"
+        );
     }
 }
 
