@@ -911,11 +911,94 @@ pub trait Procedure: fmt::Debug + 'static {
     fn name(&self) -> Option<&str> {
         None
     }
+    /// Cheap discriminant for the concrete `Procedure` impl, so call
+    /// sites (cs-vm's dispatch loop) can `match` once instead of
+    /// running a sequential chain of `downcast_ref` probes (each an
+    /// independent `TypeId` compare). The downcast inside the winning
+    /// match arm is still required to get at the concrete type's
+    /// fields — `kind()` only picks which single downcast to do.
+    /// Defaults to `Other` for exotic/test-only impls that no
+    /// dispatch site needs to distinguish.
+    fn kind(&self) -> ProcKind {
+        ProcKind::Other
+    }
     /// Visit every `Gc<...>` child this procedure holds in its
     /// closure environment. Default impl is empty — appropriate
     /// for builtins and zero-payload procedure markers. Closures,
     /// continuations, and Parameter override it.
     fn visit_closure_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {}
+}
+
+/// Discriminant for every concrete `Procedure` impl that a dispatch
+/// site actually distinguishes. See [`Procedure::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProcKind {
+    /// Anything without a dedicated variant (test-only impls, future
+    /// additions not yet wired into a `match`). `downcast_ref` chains
+    /// remain the fallback for these.
+    Other,
+    Parameter,
+    // cs-runtime tree-walker procedure types.
+    Builtin,
+    Closure,
+    Continuation,
+    HostBuiltin,
+    // cs-vm bytecode-tier procedure types.
+    VmClosure,
+    VmBuiltin,
+    VmBuiltinSyms,
+    VmHostBuiltin,
+    VmApply,
+    VmMap,
+    VmForEach,
+    VmFilter,
+    VmFind,
+    VmAny,
+    VmEvery,
+    VmFoldLeft,
+    VmFoldRight,
+    VmReduce,
+    VmCount,
+    VmPartition,
+    VmValues,
+    VmCallWithValues,
+    VmVectorMap,
+    VmVectorForEach,
+    VmVectorFold,
+    VmVectorFilter,
+    VmStringMap,
+    VmStringForEach,
+    VmHashtableWalk,
+    VmHashtableForEach,
+    VmHashtableFold,
+    VmHashtableUpdate,
+    VmUnfold,
+    VmListSort,
+    VmVectorSort,
+    VmVectorSortBang,
+    VmTabulate,
+    VmRemove,
+    VmForce,
+    VmEval,
+    VmDisplay,
+    VmWrite,
+    VmNewline,
+    VmWithOutputToString,
+    VmWithInputFromString,
+    VmWithOutputToFile,
+    VmWithInputFromFile,
+    VmCurrentInputPort,
+    VmCurrentOutputPort,
+    VmRaise,
+    VmErrorFn,
+    VmAssertionViolation,
+    VmWithExceptionHandler,
+    VmCallCc,
+    VmDynamicWind,
+    VmCurrentContinuationMarks,
+    VmContinuation,
+    VmAotClosure,
 }
 
 /// A dynamic parameter procedure (R6RS `make-parameter`). Lives in cs-core
@@ -932,6 +1015,9 @@ impl Procedure for Parameter {
     }
     fn name(&self) -> Option<&str> {
         Some("parameter")
+    }
+    fn kind(&self) -> ProcKind {
+        ProcKind::Parameter
     }
     fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         self.cell.borrow().visit_children(ctx);
