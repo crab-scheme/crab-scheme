@@ -4,10 +4,19 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cs_core::{Value, WriteMode};
 use cs_diag::{render_with, Diagnostic, SourceMap};
 use cs_runtime::Runtime;
+
+/// Execution tier selection for `--tier`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Tier {
+    Walker,
+    Vm,
+    #[value(name = "vm-jit")]
+    VmJit,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -22,7 +31,7 @@ struct Cli {
 
     /// Execution tier: tree-walker (default) or vm (bytecode).
     #[arg(long = "tier", value_name = "TIER", default_value = "walker")]
-    tier: String,
+    tier: Tier,
 
     /// When to color diagnostics: auto (TTY-dependent), always, or never.
     #[arg(long = "color", value_name = "WHEN", default_value = "auto")]
@@ -192,8 +201,8 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let via_vm = cli.tier == "vm" || cli.tier == "vm-jit";
-    let with_jit = cli.tier == "vm-jit";
+    let via_vm = cli.tier == Tier::Vm || cli.tier == Tier::VmJit;
+    let with_jit = cli.tier == Tier::VmJit;
     let color = color_enabled(&cli.color);
 
     if let Some(expr) = cli.expr {
