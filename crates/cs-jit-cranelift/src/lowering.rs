@@ -7039,10 +7039,21 @@ fn lower_inst_uniform_nb(
             // The motivating case is spectral-norm's `matrix-elt`
             // where `(/ (* ij (+ ij 1)) 2)` is always exact.
             &Inst::Div(dst, lhs, rhs) => {
-                let a = lookup(map, lhs)?;
-                let bv = lookup(map, rhs)?;
-                let r = emit_nb_div_fixnum_fast(b, helpers.div, a, bv);
-                map.insert(dst, r);
+                if let (Some(&ra), Some(&rb)) = (raw.get(&lhs), raw.get(&rhs)) {
+                    // Raw-lane fast path, same shape as Add/Sub/Mul's
+                    // `lower_nb_arith`: skip the Fixnum-tag check since
+                    // both operands are already proven Fixnum. The
+                    // result may be a non-Fixnum (Rational) NB carrier
+                    // on a non-exact divide, so — unlike Add/Sub/Mul —
+                    // it does not join the raw lane.
+                    let r = emit_unboxed_fixnum_div(b, helpers.div, ra, rb);
+                    map.insert(dst, r);
+                } else {
+                    let a = lookup(map, lhs)?;
+                    let bv = lookup(map, rhs)?;
+                    let r = emit_nb_div_fixnum_fast(b, helpers.div, a, bv);
+                    map.insert(dst, r);
+                }
             }
             &Inst::Lt(dst, lhs, rhs) => {
                 if let (Some(&ra), Some(&rb)) = (raw.get(&lhs), raw.get(&rhs)) {
@@ -7216,8 +7227,7 @@ fn lower_inst_uniform_nb(
             // i64 is accepted natively.
             &Inst::VecAlloc(dst, n_op, fill) => {
                 let n_nb = lookup(map, n_op)?;
-                let payload = b.ins().band_imm(n_nb, cs_vm::vm::NB_PAYLOAD_MASK as i64);
-                let shl = b.ins().ishl_imm(payload, 17);
+                let shl = b.ins().ishl_imm(n_nb, 17);
                 let n_raw = b.ins().sshr_imm(shl, 17);
                 let f_v = lookup(map, fill)?;
                 let call = b.ins().call(helpers.alloc_vector, &[n_raw, f_v]);
@@ -7228,8 +7238,7 @@ fn lower_inst_uniform_nb(
             &Inst::VecRef(dst, vec, idx) => {
                 let v_v = lookup(map, vec)?;
                 let i_nb = lookup(map, idx)?;
-                let payload = b.ins().band_imm(i_nb, cs_vm::vm::NB_PAYLOAD_MASK as i64);
-                let shl = b.ins().ishl_imm(payload, 17);
+                let shl = b.ins().ishl_imm(i_nb, 17);
                 let i_raw = b.ins().sshr_imm(shl, 17);
                 let call = b.ins().call(helpers.vector_ref, &[v_v, i_raw]);
                 let result = b.inst_results(call)[0];
@@ -7239,8 +7248,7 @@ fn lower_inst_uniform_nb(
             &Inst::VecSet(dst, vec, idx, x) => {
                 let v_v = lookup(map, vec)?;
                 let i_nb = lookup(map, idx)?;
-                let payload = b.ins().band_imm(i_nb, cs_vm::vm::NB_PAYLOAD_MASK as i64);
-                let shl = b.ins().ishl_imm(payload, 17);
+                let shl = b.ins().ishl_imm(i_nb, 17);
                 let i_raw = b.ins().sshr_imm(shl, 17);
                 let x_v = lookup(map, x)?;
                 let call = b.ins().call(helpers.vector_set, &[v_v, i_raw, x_v]);
@@ -9124,9 +9132,7 @@ fn unbox_nb_fixnum(
     b: &mut FunctionBuilder,
     nb: cranelift_codegen::ir::Value,
 ) -> cranelift_codegen::ir::Value {
-    use cs_vm::vm::NB_PAYLOAD_MASK;
-    let payload = b.ins().band_imm(nb, NB_PAYLOAD_MASK as i64);
-    let shl = b.ins().ishl_imm(payload, 17);
+    let shl = b.ins().ishl_imm(nb, 17);
     b.ins().sshr_imm(shl, 17)
 }
 
@@ -9633,19 +9639,19 @@ fn emit_nb_arith_fixnum_fast(
     // FAST: extract Fixnum payloads, do op, check overflow.
     b.switch_to_block(fast_bb);
     b.seal_block(fast_bb);
-    let a_payload = b.ins().band_imm(a, NB_PAYLOAD_MASK as i64);
-    let b_payload = b.ins().band_imm(bv, NB_PAYLOAD_MASK as i64);
-    let a_shl = b.ins().ishl_imm(a_payload, 17);
+    let a_shl = b.ins().ishl_imm(a, 17);
     let av = b.ins().sshr_imm(a_shl, 17);
-    let b_shl = b.ins().ishl_imm(b_payload, 17);
+    let b_shl = b.ins().ishl_imm(bv, 17);
     let bvv = b.ins().sshr_imm(b_shl, 17);
     let raw = fast_op(b, av, bvv);
     let raw_shl = b.ins().ishl_imm(raw, 17);
     let raw_ext = b.ins().sshr_imm(raw_shl, 17);
     let fits = b.ins().icmp(IntCC::Equal, raw, raw_ext);
     let ok_bb = b.create_block();
-    let ov_bb = b.create_block();
-    b.ins().brif(fits, ok_bb, &[], ov_bb, &[]);
+    // Overflow falls straight into `slow_bb` (shared with the
+    // not-both-Fixnum case below) instead of a separate block that
+    // just re-emitted the same slow call.
+    b.ins().brif(fits, ok_bb, &[], slow_bb, &[]);
 
     b.switch_to_block(ok_bb);
     b.seal_block(ok_bb);
@@ -9653,13 +9659,6 @@ fn emit_nb_arith_fixnum_fast(
     let encoded = b.ins().bor_imm(payload_only, NB_SIGNATURE_BITS as i64);
     b.ins()
         .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(encoded)]);
-
-    b.switch_to_block(ov_bb);
-    b.seal_block(ov_bb);
-    let call_ov = b.ins().call(slow_fnref, &[a, bv]);
-    let r_ov = b.inst_results(call_ov)[0];
-    b.ins()
-        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_ov)]);
 
     b.switch_to_block(slow_bb);
     b.seal_block(slow_bb);
@@ -9724,11 +9723,9 @@ fn emit_nb_div_fixnum_fast(
     // INT_MIN / -1 overflow case before sdiv (those would trap).
     b.switch_to_block(try_fast_bb);
     b.seal_block(try_fast_bb);
-    let a_payload = b.ins().band_imm(a, NB_PAYLOAD_MASK as i64);
-    let b_payload = b.ins().band_imm(bv, NB_PAYLOAD_MASK as i64);
-    let a_shl = b.ins().ishl_imm(a_payload, 17);
+    let a_shl = b.ins().ishl_imm(a, 17);
     let av = b.ins().sshr_imm(a_shl, 17);
-    let b_shl = b.ins().ishl_imm(b_payload, 17);
+    let b_shl = b.ins().ishl_imm(bv, 17);
     let bvv = b.ins().sshr_imm(b_shl, 17);
 
     let b_nonzero = b.ins().icmp_imm(IntCC::NotEqual, bvv, 0);
@@ -9775,6 +9772,76 @@ fn emit_nb_div_fixnum_fast(
     b.block_params(join_bb)[0]
 }
 
+/// Raw-lane counterpart to `emit_nb_div_fixnum_fast`: `a`/`bv` are raw
+/// sign-extended operands already proven Fixnum (no tag check needed),
+/// same shape as `emit_unboxed_fixnum_arith` for Add/Sub/Mul. Division
+/// still needs its own guards (b != 0, no sdiv-trap, exact result) since
+/// a non-exact quotient isn't a Fixnum — on any guard failure this boxes
+/// both operands and falls back to the same `slow_fnref` (`vm_value_div_nb`)
+/// the boxed path calls, so it returns an NB carrier rather than joining
+/// the raw lane like the other arith ops do.
+fn emit_unboxed_fixnum_div(
+    b: &mut FunctionBuilder,
+    slow_fnref: cranelift_codegen::ir::FuncRef,
+    a: cranelift_codegen::ir::Value,
+    bv: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    use cs_vm::vm::NB_PAYLOAD_MASK;
+
+    let b_nonzero = b.ins().icmp_imm(IntCC::NotEqual, bv, 0);
+    // sdiv trap on i64::MIN / -1; gate explicitly.
+    let a_eq_min = b.ins().icmp_imm(IntCC::Equal, a, i64::MIN);
+    let b_eq_neg1 = b.ins().icmp_imm(IntCC::Equal, bv, -1);
+    let would_overflow = b.ins().band(a_eq_min, b_eq_neg1);
+    let no_overflow = b.ins().bxor_imm(would_overflow, 1);
+    let safe_to_divide = b.ins().band(b_nonzero, no_overflow);
+
+    let do_div_bb = b.create_block();
+    let encode_bb = b.create_block();
+    let slow_bb = b.create_block();
+    let join_bb = b.create_block();
+    b.append_block_param(join_bb, I64);
+    b.ins().brif(safe_to_divide, do_div_bb, &[], slow_bb, &[]);
+
+    // Do the divide, check rem == 0 and quot fits 47-bit Fixnum.
+    b.switch_to_block(do_div_bb);
+    b.seal_block(do_div_bb);
+    let quot = b.ins().sdiv(a, bv);
+    let rem = b.ins().srem(a, bv);
+    let rem_zero = b.ins().icmp_imm(IntCC::Equal, rem, 0);
+    let quot_shl = b.ins().ishl_imm(quot, 17);
+    let quot_ext = b.ins().sshr_imm(quot_shl, 17);
+    let quot_fits = b.ins().icmp(IntCC::Equal, quot, quot_ext);
+    let fast_ok = b.ins().band(rem_zero, quot_fits);
+    b.ins().brif(fast_ok, encode_bb, &[], slow_bb, &[]);
+
+    // Fast path: encode quot as NB Fixnum.
+    b.switch_to_block(encode_bb);
+    b.seal_block(encode_bb);
+    let payload_only = b.ins().band_imm(quot, NB_PAYLOAD_MASK as i64);
+    let encoded = b
+        .ins()
+        .bor_imm(payload_only, cs_vm::vm::NB_SIGNATURE_BITS as i64);
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(encoded)]);
+
+    // Slow path: box the raw operands back to NB and call
+    // vm_value_div_nb. Reached on divide-by-zero, sdiv overflow,
+    // non-exact result, or quot out of 47-bit range.
+    b.switch_to_block(slow_bb);
+    b.seal_block(slow_bb);
+    let a_nb = box_raw_fixnum(b, a);
+    let b_nb = box_raw_fixnum(b, bv);
+    let call_slow = b.ins().call(slow_fnref, &[a_nb, b_nb]);
+    let r_slow = b.inst_results(call_slow)[0];
+    b.ins()
+        .jump(join_bb, &[cranelift_codegen::ir::BlockArg::Value(r_slow)]);
+
+    b.switch_to_block(join_bb);
+    b.seal_block(join_bb);
+    b.block_params(join_bb)[0]
+}
+
 /// Emit the inline Fixnum-Fixnum fast path for an NB-typed comparison
 /// (`Lt`/`Eq`). The 0/1 result of the underlying `icmp` is or'd with
 /// the `Boolean(false)` NB bit pattern — adding the low bit if true,
@@ -9790,9 +9857,7 @@ fn emit_nb_cmp_fixnum_fast(
         cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value,
 ) -> cranelift_codegen::ir::Value {
-    use cs_vm::vm::{
-        NanboxValue, NB_PAYLOAD_MASK, NB_SIGNATURE_BITS, NB_SIGNATURE_MASK, NB_TAG_MASK,
-    };
+    use cs_vm::vm::{NanboxValue, NB_SIGNATURE_BITS, NB_SIGNATURE_MASK, NB_TAG_MASK};
 
     let combined_mask = (NB_SIGNATURE_MASK | NB_TAG_MASK) as i64;
     let fixnum_pattern = NB_SIGNATURE_BITS as i64;
@@ -9812,11 +9877,9 @@ fn emit_nb_cmp_fixnum_fast(
 
     b.switch_to_block(fast_bb);
     b.seal_block(fast_bb);
-    let a_payload = b.ins().band_imm(a, NB_PAYLOAD_MASK as i64);
-    let b_payload = b.ins().band_imm(bv, NB_PAYLOAD_MASK as i64);
-    let a_shl = b.ins().ishl_imm(a_payload, 17);
+    let a_shl = b.ins().ishl_imm(a, 17);
     let av = b.ins().sshr_imm(a_shl, 17);
-    let b_shl = b.ins().ishl_imm(b_payload, 17);
+    let b_shl = b.ins().ishl_imm(bv, 17);
     let bvv = b.ins().sshr_imm(b_shl, 17);
     let cmp = fast_cmp(b, av, bvv); // i8 (icmp result) of 0/1.
                                     // Widen to i64 so we can or-in the NB_FALSE pattern.
