@@ -169,19 +169,15 @@ pub struct Lowerer<M: Module = JITModule> {
     /// FuncId of `vm_equal_gc(a, b) -> i64`. `Inst::EqualAny` lowers
     /// to this. R7RS deep structural equality. ADR 0012 D-2 (iter DZ).
     equal_func: cranelift_module::FuncId,
-    /// FuncId of `vm_call_general(callee: i64, args_ptr: *const i64,
-    /// n_args: usize) -> i64`. `Inst::CallGeneral` lowers to a
-    /// Cranelift call against this — the slow-path miss handler for
-    /// non-self, non-builtin closure calls (ADR 0012 D-1, iter BU).
+    /// FuncId of `vm_ic_call(callee: i64, args_ptr: *const i64,
+    /// n_args: usize, slot_ptr: *const c_void) -> i64` (cs-hz5). The
+    /// fused IC call-site helper: does the peek + slot compare +
+    /// dispatch in one extern call instead of the JIT emitting its
+    /// own peek/compare/branch to two separate targets
+    /// (`vm_closure_id_peek` + `vm_ic_dispatch`/`vm_call_general`).
     /// `usize` is modeled as `i64` in the Cranelift signature; the
     /// helper truncates internally.
-    call_general_func: cranelift_module::FuncId,
-    /// FuncId of `vm_ic_dispatch(callee: i64, args_ptr: *const i64,
-    /// n_args: usize, jit_ptr: *const u8) -> i64`. The IC hot path
-    /// (`Inst::CallGeneral` hit branch) calls this instead of a bare
-    /// `call_indirect`: it installs the callee's env / bytecode /
-    /// stack-map-frame TLS guards first (ADR 0012 D-1, iter JI).
-    ic_dispatch_func: cranelift_module::FuncId,
+    ic_call_func: cranelift_module::FuncId,
     /// FuncId of `vm_jit_set_tailcall(callee: i64, args_ptr: *const i64,
     /// n: i64) -> i64`. A tail-position `Call`/`CallGeneral` lowers to a
     /// call against this (instead of the IC dispatch) + a `return`, so
@@ -192,10 +188,6 @@ pub struct Lowerer<M: Module = JITModule> {
     /// Strategy C). Called by speculatively-unboxed Fixnum arithmetic on
     /// 47-bit overflow to request a deopt to bytecode.
     request_deopt_func: cranelift_module::FuncId,
-    /// FuncId of `vm_closure_id_peek(callee: i64) -> u32`. Used by
-    /// the IC hot path (ADR 0012 D-1, iter BY) to read a callee's
-    /// closure id without consuming the Gc handle.
-    closure_id_peek_func: cranelift_module::FuncId,
     /// FuncId of `vm_alloc_vector_gc(n, fill) -> i64`.
     /// `Inst::VecAlloc` lowers to this (ADR 0012 D-2, iter BV).
     alloc_vector_func: cranelift_module::FuncId,
@@ -902,12 +894,10 @@ impl Lowerer<JITModule> {
         builder.symbol("vm_eq_any_gc", cs_vm::vm::vm_eq_any_gc as *const u8);
         // ADR 0012 D-2 (iter DZ) — equal? deep structural equality.
         builder.symbol("vm_equal_gc", cs_vm::vm::vm_equal_gc as *const u8);
-        // ADR 0012 D-1 (iter BU) — slow-path general Call. Lowered
-        // from `Inst::CallGeneral` whenever the bytecode's call
-        // target is neither `self` nor a known builtin.
-        builder.symbol("vm_call_general", cs_vm::vm::vm_call_general as *const u8);
-        // ADR 0012 D-1 (iter JI) — IC hot-path dispatch helper.
-        builder.symbol("vm_ic_dispatch", cs_vm::vm::vm_ic_dispatch as *const u8);
+        // cs-hz5 — fused IC call-site helper (peek + slot compare +
+        // dispatch in one extern call). Lowered from `Inst::Call` /
+        // `Inst::CallGeneral` in non-tail position.
+        builder.symbol("vm_ic_call", cs_vm::vm::vm_ic_call as *const u8);
         // ADR 0019 — proper-tail-call bounce. A JIT body in tail
         // position calls this to stash (callee, args) and returns a
         // placeholder; the dispatch trampoline re-runs it in constant
@@ -922,10 +912,6 @@ impl Lowerer<JITModule> {
         builder.symbol(
             "vm_jit_request_deopt",
             cs_vm::vm::vm_jit_request_deopt as *const u8,
-        );
-        builder.symbol(
-            "vm_closure_id_peek",
-            cs_vm::vm::vm_closure_id_peek as *const u8,
         );
         builder.symbol(
             "vm_alloc_vector_gc",
@@ -2127,45 +2113,28 @@ impl<M: Module> Lowerer<M> {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_equal_gc: {e}")))?;
 
-        // vm_call_general(callee: i64, args_ptr: i64, n_args: i64) -> i64.
-        // The Rust signature takes `*const i64` + `usize`; Cranelift
-        // models pointers and `usize` as `i64` on the 64-bit hosts we
-        // support, and the helper's Rust prologue casts back.
-        let mut call_general_sig = module.make_signature();
-        call_general_sig.params.push(AbiParam::new(I64)); // callee Gc handle
-        call_general_sig.params.push(AbiParam::new(I64)); // args buffer pointer
-        call_general_sig.params.push(AbiParam::new(I64)); // n_args
-                                                          // ADR 0012 D-1 (iter BY) — IC slot pointer for miss-handler
-                                                          // update. Null when the caller hasn't allocated a slot.
-        call_general_sig.params.push(AbiParam::new(I64));
-        call_general_sig.returns.push(AbiParam::new(I64));
-        let call_general_func = module
+        // cs-hz5 — vm_ic_call(callee: i64, args_ptr: i64, n_args: i64,
+        // slot_ptr: i64) -> i64. Fused IC call-site helper: peek +
+        // slot compare + dispatch in one extern call (replaces the
+        // former separate `vm_closure_id_peek` peek plus
+        // `vm_ic_dispatch` / `vm_call_general` two-target branch).
+        // The Rust signature takes `*const i64` + `usize` +
+        // `*const c_void`; Cranelift models pointers and `usize` as
+        // `i64` on the 64-bit hosts we support, and the helper's Rust
+        // prologue casts back.
+        let mut ic_call_sig = module.make_signature();
+        ic_call_sig.params.push(AbiParam::new(I64)); // callee Gc handle
+        ic_call_sig.params.push(AbiParam::new(I64)); // args buffer pointer
+        ic_call_sig.params.push(AbiParam::new(I64)); // n_args
+        ic_call_sig.params.push(AbiParam::new(I64)); // slot_ptr
+        ic_call_sig.returns.push(AbiParam::new(I64));
+        let ic_call_func = module
             .declare_function(
-                "vm_call_general",
+                "vm_ic_call",
                 cranelift_module::Linkage::Import,
-                &call_general_sig,
+                &ic_call_sig,
             )
-            .map_err(|e| JitError::Codegen(format!("declare_function vm_call_general: {e}")))?;
-
-        // ADR 0012 D-1 (iter JI) — vm_ic_dispatch(callee: i64,
-        // args_ptr: i64, n_args: i64, jit_ptr: i64) -> i64. The IC
-        // hot path calls this on a slot hit instead of a bare
-        // `call_indirect`: it installs the callee's env / bytecode /
-        // stack-map-frame TLS guards before running the cached body.
-        let mut ic_dispatch_sig = module.make_signature();
-        ic_dispatch_sig.params.push(AbiParam::new(I64)); // callee Gc handle
-        ic_dispatch_sig.params.push(AbiParam::new(I64)); // args buffer pointer
-        ic_dispatch_sig.params.push(AbiParam::new(I64)); // n_args
-        ic_dispatch_sig.params.push(AbiParam::new(I64)); // cached jit_ptr
-        ic_dispatch_sig.params.push(AbiParam::new(I64)); // slot_ptr (for cached_param_types read)
-        ic_dispatch_sig.returns.push(AbiParam::new(I64));
-        let ic_dispatch_func = module
-            .declare_function(
-                "vm_ic_dispatch",
-                cranelift_module::Linkage::Import,
-                &ic_dispatch_sig,
-            )
-            .map_err(|e| JitError::Codegen(format!("declare_function vm_ic_dispatch: {e}")))?;
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_ic_call: {e}")))?;
 
         // ADR 0019 — vm_jit_set_tailcall(callee: i64, args_ptr: i64,
         // n: i64) -> i64. Stashes a proper tail call for the dispatch
@@ -2198,20 +2167,6 @@ impl<M: Module> Lowerer<M> {
             .map_err(|e| {
                 JitError::Codegen(format!("declare_function vm_jit_request_deopt: {e}"))
             })?;
-
-        // vm_closure_id_peek(i64) -> i32 (u32 zero-extends).
-        let mut closure_id_peek_sig = module.make_signature();
-        closure_id_peek_sig.params.push(AbiParam::new(I64));
-        closure_id_peek_sig
-            .returns
-            .push(AbiParam::new(cranelift_codegen::ir::types::I32));
-        let closure_id_peek_func = module
-            .declare_function(
-                "vm_closure_id_peek",
-                cranelift_module::Linkage::Import,
-                &closure_id_peek_sig,
-            )
-            .map_err(|e| JitError::Codegen(format!("declare_function vm_closure_id_peek: {e}")))?;
 
         // ADR 0012 D-2 (iter BV) — vector op helpers.
         // vm_alloc_vector_gc(n: i64, fill: i64) -> i64
@@ -4471,11 +4426,9 @@ impl<M: Module> Lowerer<M> {
             value_ge_nb_func,
             eq_any_func,
             equal_func,
-            call_general_func,
-            ic_dispatch_func,
+            ic_call_func,
             set_tailcall_func,
             request_deopt_func,
-            closure_id_peek_func,
             alloc_vector_func,
             vector_ref_func,
             vector_set_func,
@@ -5383,9 +5336,9 @@ impl<M: Module> Lowerer<M> {
                     .module
                     .declare_func_in_func(self.value_drop_func, builder.func),
                 self_fn: self.module.declare_func_in_func(inner_id, builder.func),
-                call_general: self
+                ic_call: self
                     .module
-                    .declare_func_in_func(self.call_general_func, builder.func),
+                    .declare_func_in_func(self.ic_call_func, builder.func),
                 set_tailcall: self
                     .module
                     .declare_func_in_func(self.set_tailcall_func, builder.func),
@@ -5413,12 +5366,6 @@ impl<M: Module> Lowerer<M> {
                 make_closure: self
                     .module
                     .declare_func_in_func(self.make_closure_func, builder.func),
-                closure_id_peek: self
-                    .module
-                    .declare_func_in_func(self.closure_id_peek_func, builder.func),
-                ic_dispatch: self
-                    .module
-                    .declare_func_in_func(self.ic_dispatch_func, builder.func),
                 assq: self
                     .module
                     .declare_func_in_func(self.assq_func, builder.func),
@@ -6727,10 +6674,11 @@ struct NbHelpers {
     // Refcount management for Any-shape values.
     value_clone: cranelift_codegen::ir::FuncRef,
     value_drop: cranelift_codegen::ir::FuncRef,
-    // Self-recursion (the inner func) and the general-call slow
-    // path. `vm_call_general(callee, args_ptr, n_args, slot_ptr)`.
+    // Self-recursion (the inner func) and the fused IC call-site
+    // helper (cs-hz5). `vm_ic_call(callee, args_ptr, n_args,
+    // slot_ptr)` — peek + slot compare + dispatch in one extern call.
     self_fn: cranelift_codegen::ir::FuncRef,
-    call_general: cranelift_codegen::ir::FuncRef,
+    ic_call: cranelift_codegen::ir::FuncRef,
     // ADR 0019 — proper-tail-call bounce. `vm_jit_set_tailcall(callee,
     // args_ptr, n_args) -> i64`. Emitted for tail-position Call /
     // CallGeneral instead of the IC dispatch.
@@ -6749,15 +6697,6 @@ struct NbHelpers {
     tick_reductions: Option<cranelift_codegen::ir::FuncRef>,
     env_define_local_nb: cranelift_codegen::ir::FuncRef,
     make_closure: cranelift_codegen::ir::FuncRef,
-    // IC hot path (CallGeneral): `vm_closure_id_peek(callee) -> u32`
-    // reads the callee's lambda id without consuming the handle;
-    // `vm_ic_dispatch(callee, args_ptr, n_args, jit_ptr, slot_ptr)`
-    // runs the cached native body with the same env / bytecode /
-    // stack-map TLS guards `try_dispatch_jit_nb` installs. Mirrors
-    // the specialized tier's CallGeneral plumbing so uniform-NB
-    // sites also get IC speedups when the callee tiers up.
-    closure_id_peek: cranelift_codegen::ir::FuncRef,
-    ic_dispatch: cranelift_codegen::ir::FuncRef,
     // #50 — typed list builtins (pointer-in → pointer/boolean out). All
     // `vm_*_gc` helpers decode NB carriers natively, so uniform-NB calls
     // the same ones the specialized tier does.
@@ -7420,9 +7359,9 @@ fn lower_inst_uniform_nb(
                     .map(|a| lookup(map, *a))
                     .collect::<Result<_, _>>()?;
 
-                // Stack-allocate the args buffer (`vm_call_general` /
-                // `vm_ic_dispatch` both take `*const i64` + count). At
-                // least 8 bytes so `stack_addr` is valid for n == 0.
+                // Stack-allocate the args buffer (`vm_ic_call` takes
+                // `*const i64` + count). At least 8 bytes so
+                // `stack_addr` is valid for n == 0.
                 let buf_bytes = std::cmp::max(8u32, (n as u32) * 8);
                 let buf_slot = b.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
@@ -7443,68 +7382,17 @@ fn lower_inst_uniform_nb(
                 let slot_ptr_const = ic_slot as *const crate::ic::IcSlot as i64;
                 let slot_addr_v = b.ins().iconst(I64, slot_ptr_const);
 
-                // Peek callee's lambda id (doesn't consume the handle).
-                let peek_inst = b.ins().call(helpers.closure_id_peek, &[callee_v]);
-                let peeked_id_i32 = b.inst_results(peek_inst)[0];
-                // Cached id is u32 at offset 0 of IcSlot (#[repr(C)]).
-                let cached_id_i32 = b.ins().load(
-                    cranelift_codegen::ir::types::I32,
-                    cranelift_codegen::ir::MemFlags::new(),
-                    slot_addr_v,
-                    0,
-                );
-                let id_match = b.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    peeked_id_i32,
-                    cached_id_i32,
-                );
-                let zero32 = b.ins().iconst(cranelift_codegen::ir::types::I32, 0);
-                let cached_nonzero = b.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::NotEqual,
-                    cached_id_i32,
-                    zero32,
-                );
-                let take_hit = b.ins().band(id_match, cached_nonzero);
-
-                let hit_block = b.create_block();
-                let miss_block = b.create_block();
-                let join_block = b.create_block();
-                b.append_block_param(join_block, I64);
-                b.ins().brif(take_hit, hit_block, &[], miss_block, &[]);
-
-                // ===== Hit =====
-                b.switch_to_block(hit_block);
-                b.seal_block(hit_block);
-                let cached_jit_ptr_v =
-                    b.ins()
-                        .load(I64, cranelift_codegen::ir::MemFlags::new(), slot_addr_v, 8);
-                let hit_inst = b.ins().call(
-                    helpers.ic_dispatch,
-                    &[callee_v, buf_addr, n_args_v, cached_jit_ptr_v, slot_addr_v],
-                );
-                let hit_result = b.inst_results(hit_inst)[0];
-                b.ins().jump(
-                    join_block,
-                    &[cranelift_codegen::ir::BlockArg::Value(hit_result)],
-                );
-
-                // ===== Miss =====
-                b.switch_to_block(miss_block);
-                b.seal_block(miss_block);
-                let miss_inst = b.ins().call(
-                    helpers.call_general,
+                // cs-hz5 — a single call to the fused helper. It does
+                // the peek + slot compare + hit/miss dispatch itself
+                // (`vm_closure_id_peek` + `vm_ic_dispatch` /
+                // `vm_call_general`, unchanged), so the JIT body no
+                // longer pays for an inline compare whose both
+                // branches were extern calls anyway.
+                let call = b.ins().call(
+                    helpers.ic_call,
                     &[callee_v, buf_addr, n_args_v, slot_addr_v],
                 );
-                let miss_result = b.inst_results(miss_inst)[0];
-                b.ins().jump(
-                    join_block,
-                    &[cranelift_codegen::ir::BlockArg::Value(miss_result)],
-                );
-
-                // ===== Join =====
-                b.switch_to_block(join_block);
-                b.seal_block(join_block);
-                let result = b.block_params(join_block)[0];
+                let result = b.inst_results(call)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(*dst, result);
             }

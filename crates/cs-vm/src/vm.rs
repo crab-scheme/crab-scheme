@@ -9926,6 +9926,56 @@ pub unsafe extern "C" fn vm_closure_id_peek(callee: i64) -> u32 {
     id
 }
 
+/// Fused IC call-site helper (cs-hz5). The JIT used to emit its own
+/// peek (`vm_closure_id_peek`) + slot compare + branch to one of two
+/// extern calls (`vm_ic_dispatch` / `vm_call_general`). Since both
+/// branch targets are themselves extern calls, the JIT-side compare
+/// bought nothing but an extra C-ABI round trip (plus the peek's
+/// refcount incref/decref) per executed call site. This helper does
+/// the peek + compare + dispatch in one call, so the JIT body emits
+/// a single `call vm_ic_call` instead of the peek/compare/branch/
+/// two-target shape.
+///
+/// Replicates `vm_closure_id_peek` + the slot hit/miss branch exactly:
+/// hit (`peeked_id == cached_id && cached_id != 0`) dispatches via
+/// `vm_ic_dispatch` with the slot's cached jit ptr; miss falls
+/// through to `vm_call_general`, which populates the slot.
+///
+/// # Safety
+///
+/// Same contract as `vm_call_general` / `vm_ic_dispatch`: `callee` is
+/// a live owned Any-tagged Gc handle (consumed by whichever branch
+/// runs); `args_ptr` points to `n_args` consecutive live owned
+/// Any-tagged Gc handles (each consumed); `slot_ptr` is a
+/// `Box::leak`'d `IcSlotShim` with process-lifetime validity, or
+/// null is not accepted here (the JIT always allocates one per
+/// call site).
+#[no_mangle]
+pub unsafe extern "C" fn vm_ic_call(
+    callee: i64,
+    args_ptr: *const i64,
+    n_args: usize,
+    slot_ptr: *const std::ffi::c_void,
+) -> i64 {
+    let peeked_id = unsafe { vm_closure_id_peek(callee) };
+    // SAFETY: slot_ptr was Box::leak'd by the lowering site for an
+    // IcSlotShim-compatible IcSlot; the address is stable for the
+    // process lifetime. Single-threaded execution means no
+    // concurrent writer.
+    let slot = unsafe { &*(slot_ptr as *const crate::ic_compat::IcSlotShim) };
+    let cached_id = slot
+        .cached_closure_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if cached_id != 0 && peeked_id == cached_id {
+        let jit_ptr = slot
+            .cached_jit_ptr
+            .load(std::sync::atomic::Ordering::Relaxed) as *const u8;
+        unsafe { vm_ic_dispatch(callee, args_ptr, n_args, jit_ptr, slot_ptr) }
+    } else {
+        unsafe { vm_call_general(callee, args_ptr, n_args, slot_ptr) }
+    }
+}
+
 /// `vm_make_closure(lambda_idx)` — JIT helper that builds a fresh
 /// `VmClosure` for a nested-lambda site, mirroring the
 /// `Inst::MakeClosure` arm of `run_dispatch`. Reads the enclosing
