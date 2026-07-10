@@ -69,6 +69,12 @@ pub fn compile_with_globals_and_primops(
 ) -> Result<Bytecode, CompileError> {
     let mut buf = InstBuf::new();
     let mut lambdas: Vec<CompiledLambda> = Vec::new();
+    // cs-grt: shared const pool for the whole compiled program (top-level
+    // body + every nested lambda body). `compile_expr` interns each
+    // literal/folded-global `Value` here and emits `Inst::Const(idx)`;
+    // finalized to `Rc<Vec<NanboxValue>>` below and shared by `Bytecode`
+    // and every `CompiledLambda`.
+    let mut consts: Vec<Value> = Vec::new();
     // Names that are mutated anywhere in the program — top-level
     // `define` lowers to `CoreExpr::Set`, as does `set!`. Treat them
     // as a synthetic scope so the global-fold optimization in
@@ -91,6 +97,7 @@ pub fn compile_with_globals_and_primops(
         globals,
         primops,
         &mut scope,
+        &mut consts,
     )?;
     // Every compiled body — top-level and per-lambda (see the Lambda arm
     // of `compile_expr`) — ends with an explicit `Return` so the VM's
@@ -98,11 +105,21 @@ pub fn compile_with_globals_and_primops(
     // a defensive fallback rather than the primary termination check.
     buf.push(Inst::Return, expr.span());
     let (insts, spans) = buf.finish();
-    let (insts, spans) = peephole(insts, spans);
+    let (insts, spans) = peephole(insts, spans, &mut consts);
+    let const_pool: Rc<Vec<crate::vm::NanboxValue>> = Rc::new(
+        consts
+            .into_iter()
+            .map(crate::vm::NanboxValue::from_value)
+            .collect(),
+    );
+    for lambda in lambdas.iter_mut() {
+        lambda.consts = Rc::clone(&const_pool);
+    }
     Ok(Bytecode {
         insts: Rc::new(insts),
         spans: Rc::new(spans),
         lambdas: Rc::new(lambdas),
+        consts: const_pool,
     })
 }
 
@@ -306,7 +323,7 @@ fn match_primop_2arg<'a>(
 /// Map a primop comparison to the fused "branch on negation" instruction.
 /// The branch fires when the original comparison is false (i.e., we should
 /// take the alt branch of the surrounding `if`).
-fn branch_on_not(op: PrimOp, target: usize) -> Inst {
+fn branch_on_not(op: PrimOp, target: u32) -> Inst {
     match op {
         PrimOp::Lt => Inst::BranchOnGeFx2(target),
         PrimOp::Le => Inst::BranchOnGtFx2(target),
@@ -322,7 +339,12 @@ fn branch_on_not(op: PrimOp, target: usize) -> Inst {
 /// describing it. The VM's call sites use this to skip Env+Frame setup for
 /// trivially small bodies — by far the common case for lambdas passed to
 /// map/fold (`(lambda (x) (* x x))`, `(lambda (a b) (+ a b))`, etc).
-fn detect_fast_primop(body: &[Inst], spans: &[Span], params: &[Symbol]) -> Option<FastPrimopBody> {
+fn detect_fast_primop(
+    body: &[Inst],
+    spans: &[Span],
+    params: &[Symbol],
+    consts: &[Value],
+) -> Option<FastPrimopBody> {
     if body.len() != 4 {
         return None;
     }
@@ -335,7 +357,7 @@ fn detect_fast_primop(body: &[Inst], spans: &[Span], params: &[Symbol]) -> Optio
                 .iter()
                 .position(|p| p == s)
                 .map(|i| FastArg::Param(i as u8)),
-            Inst::Const(v) => Some(FastArg::Const(v.clone())),
+            Inst::Const(idx) => Some(FastArg::Const(consts[*idx as usize].clone())),
             _ => None,
         }
     };
@@ -395,14 +417,18 @@ fn primop_to_inst(op: PrimOp) -> Inst {
 /// single `compile_expr` call (a primop `App`'s arg0/arg1/op, or a `Set`'s
 /// SetVar/Const/Pop) — jump targets are always `out.len()` snapshots taken
 /// at `compile_expr` call boundaries, so no jump can land mid-pattern.
-fn peephole(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<Span>) {
-    let (insts, spans) = peephole_fold_consts(insts, spans);
-    let (insts, spans) = peephole_cancel_dead_set(insts, spans);
+fn peephole(insts: Vec<Inst>, spans: Vec<Span>, consts: &mut Vec<Value>) -> (Vec<Inst>, Vec<Span>) {
+    let (insts, spans) = peephole_fold_consts(insts, spans, consts);
+    let (insts, spans) = peephole_cancel_dead_set(insts, spans, consts);
     let mut insts = insts;
     peephole_thread_jumps(&mut insts);
     (insts, spans)
 }
 
+/// Jump/branch target as a plain `usize` instruction index — `Inst`
+/// stores it as `u32` (cs-grt); the peephole passes below stay in
+/// `usize` internally (matching `Vec<Inst>::len()`) and cast at this
+/// boundary.
 fn branch_target(inst: &Inst) -> Option<usize> {
     match inst {
         Inst::Jump(t)
@@ -411,12 +437,13 @@ fn branch_target(inst: &Inst) -> Option<usize> {
         | Inst::BranchOnGtFx2(t)
         | Inst::BranchOnLeFx2(t)
         | Inst::BranchOnLtFx2(t)
-        | Inst::BranchOnNeFx2(t) => Some(*t),
+        | Inst::BranchOnNeFx2(t) => Some(*t as usize),
         _ => None,
     }
 }
 
 fn set_branch_target(inst: &mut Inst, new_target: usize) {
+    let new_target = new_target as u32;
     match inst {
         Inst::Jump(t)
         | Inst::JumpIfFalse(t)
@@ -468,9 +495,12 @@ fn remap_targets(insts: &mut [Inst], old_to_new: &[usize]) {
     }
 }
 
-fn as_fixnum_const(inst: &Inst) -> Option<i64> {
+fn as_fixnum_const(inst: &Inst, consts: &[Value]) -> Option<i64> {
     match inst {
-        Inst::Const(Value::Number(Number::Fixnum(v))) => Some(*v),
+        Inst::Const(idx) => match &consts[*idx as usize] {
+            Value::Number(Number::Fixnum(v)) => Some(*v),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -493,7 +523,11 @@ fn fold_fixnum_op(op: &Inst, a: i64, b: i64) -> Option<Value> {
     }
 }
 
-fn peephole_fold_consts(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<Span>) {
+fn peephole_fold_consts(
+    insts: Vec<Inst>,
+    spans: Vec<Span>,
+    consts: &mut Vec<Value>,
+) -> (Vec<Inst>, Vec<Span>) {
     let len = insts.len();
     if len < 3 {
         return (insts, spans);
@@ -502,9 +536,13 @@ fn peephole_fold_consts(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<S
     let mut replace = HashMap::new();
     let mut i = 0;
     while i + 2 < len {
-        if let (Some(a), Some(b)) = (as_fixnum_const(&insts[i]), as_fixnum_const(&insts[i + 1])) {
+        if let (Some(a), Some(b)) = (
+            as_fixnum_const(&insts[i], consts),
+            as_fixnum_const(&insts[i + 1], consts),
+        ) {
             if let Some(folded) = fold_fixnum_op(&insts[i + 2], a, b) {
-                replace.insert(i, Inst::Const(folded));
+                let idx = intern_const(consts, folded);
+                replace.insert(i, Inst::Const(idx));
                 deleted[i + 1] = true;
                 deleted[i + 2] = true;
                 i += 3;
@@ -521,7 +559,11 @@ fn peephole_fold_consts(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<S
     (insts, spans)
 }
 
-fn peephole_cancel_dead_set(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, Vec<Span>) {
+fn peephole_cancel_dead_set(
+    insts: Vec<Inst>,
+    spans: Vec<Span>,
+    consts: &[Value],
+) -> (Vec<Inst>, Vec<Span>) {
     let len = insts.len();
     if len < 3 {
         return (insts, spans);
@@ -529,8 +571,12 @@ fn peephole_cancel_dead_set(insts: Vec<Inst>, spans: Vec<Span>) -> (Vec<Inst>, V
     let mut deleted = vec![false; len];
     let mut any = false;
     for i in 0..len - 2 {
+        let const_unspecified = matches!(
+            &insts[i + 1],
+            Inst::Const(idx) if matches!(consts.get(*idx as usize), Some(Value::Unspecified))
+        );
         if matches!(insts[i], Inst::SetVar(_))
-            && matches!(insts[i + 1], Inst::Const(Value::Unspecified))
+            && const_unspecified
             && matches!(insts[i + 2], Inst::Pop)
         {
             deleted[i + 1] = true;
@@ -557,16 +603,27 @@ fn peephole_thread_jumps(insts: &mut [Inst]) {
             let Inst::Jump(next) = &insts[t] else {
                 break;
             };
-            if *next == t {
+            let next = *next as usize;
+            if next == t {
                 break;
             }
-            t = *next;
+            t = next;
             hops += 1;
         }
         set_branch_target(&mut insts[i], t);
     }
 }
 
+/// Intern `v` into the shared const pool, returning its index. No
+/// dedup — each call site gets its own pool slot; the pool only needs to
+/// be pre-encoded, not minimal.
+fn intern_const(consts: &mut Vec<Value>, v: Value) -> u32 {
+    let idx = consts.len() as u32;
+    consts.push(v);
+    idx
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_expr(
     expr: &CoreExpr,
     out: &mut InstBuf,
@@ -575,11 +632,13 @@ fn compile_expr(
     globals: &HashMap<Symbol, Value>,
     primops: &HashMap<Symbol, PrimOp>,
     scope: &mut Vec<HashSet<Symbol>>,
+    consts: &mut Vec<Value>,
 ) -> Result<(), CompileError> {
     let span = expr.span();
     match expr {
         CoreExpr::Const { value, .. } => {
-            out.push(Inst::Const(value.clone()), span);
+            let idx = intern_const(consts, value.clone());
+            out.push(Inst::Const(idx), span);
             Ok(())
         }
         CoreExpr::Ref { name, .. } => {
@@ -605,7 +664,8 @@ fn compile_expr(
             if !is_locally_bound(scope, *name) {
                 if let Some(v) = globals.get(name) {
                     if matches!(v, Value::Procedure(_)) {
-                        out.push(Inst::Const(v.clone()), span);
+                        let idx = intern_const(consts, v.clone());
+                        out.push(Inst::Const(idx), span);
                         return Ok(());
                     }
                 }
@@ -618,9 +678,10 @@ fn compile_expr(
             value,
             span: s,
         } => {
-            compile_expr(value, out, lambdas, false, globals, primops, scope)?;
+            compile_expr(value, out, lambdas, false, globals, primops, scope, consts)?;
             out.push(Inst::SetVar(*name), *s);
-            out.push(Inst::Const(Value::Unspecified), *s);
+            let idx = intern_const(consts, Value::Unspecified);
+            out.push(Inst::Const(idx), *s);
             Ok(())
         }
         CoreExpr::If {
@@ -633,41 +694,51 @@ fn compile_expr(
             // primop App, emit `<a> <b> BranchOn<NotOp>(alt_start)` and
             // skip materializing the boolean.
             if let Some((op, a, b)) = match_primop_2arg(cond, scope, primops) {
-                compile_expr(a, out, lambdas, false, globals, primops, scope)?;
-                compile_expr(b, out, lambdas, false, globals, primops, scope)?;
+                compile_expr(a, out, lambdas, false, globals, primops, scope, consts)?;
+                compile_expr(b, out, lambdas, false, globals, primops, scope, consts)?;
                 let jif_idx = out.len();
-                out.push(branch_on_not(op, usize::MAX), *s);
-                compile_expr(then, out, lambdas, is_tail, globals, primops, scope)?;
+                out.push(branch_on_not(op, u32::MAX), *s);
+                compile_expr(then, out, lambdas, is_tail, globals, primops, scope, consts)?;
                 let jmp_idx = out.len();
-                out.push(Inst::Jump(usize::MAX), *s);
-                let alt_start = out.len();
+                out.push(Inst::Jump(u32::MAX), *s);
+                let alt_start = out.len() as u32;
                 out.replace(jif_idx, branch_on_not(op, alt_start));
-                compile_expr(alt, out, lambdas, is_tail, globals, primops, scope)?;
-                let after = out.len();
+                compile_expr(alt, out, lambdas, is_tail, globals, primops, scope, consts)?;
+                let after = out.len() as u32;
                 out.replace(jmp_idx, Inst::Jump(after));
                 return Ok(());
             }
-            compile_expr(cond, out, lambdas, false, globals, primops, scope)?;
+            compile_expr(cond, out, lambdas, false, globals, primops, scope, consts)?;
             let jif_idx = out.len();
-            out.push(Inst::JumpIfFalse(usize::MAX), *s);
-            compile_expr(then, out, lambdas, is_tail, globals, primops, scope)?;
+            out.push(Inst::JumpIfFalse(u32::MAX), *s);
+            compile_expr(then, out, lambdas, is_tail, globals, primops, scope, consts)?;
             let jmp_idx = out.len();
-            out.push(Inst::Jump(usize::MAX), *s);
-            let alt_start = out.len();
+            out.push(Inst::Jump(u32::MAX), *s);
+            let alt_start = out.len() as u32;
             out.replace(jif_idx, Inst::JumpIfFalse(alt_start));
-            compile_expr(alt, out, lambdas, is_tail, globals, primops, scope)?;
-            let after = out.len();
+            compile_expr(alt, out, lambdas, is_tail, globals, primops, scope, consts)?;
+            let after = out.len() as u32;
             out.replace(jmp_idx, Inst::Jump(after));
             Ok(())
         }
         CoreExpr::Begin { exprs, span: s } => {
             if exprs.is_empty() {
-                out.push(Inst::Const(Value::Unspecified), *s);
+                let idx = intern_const(consts, Value::Unspecified);
+                out.push(Inst::Const(idx), *s);
                 return Ok(());
             }
             for (i, e) in exprs.iter().enumerate() {
                 let last = i + 1 == exprs.len();
-                compile_expr(e, out, lambdas, is_tail && last, globals, primops, scope)?;
+                compile_expr(
+                    e,
+                    out,
+                    lambdas,
+                    is_tail && last,
+                    globals,
+                    primops,
+                    scope,
+                    consts,
+                )?;
                 if !last {
                     out.push(Inst::Pop, e.span());
                 }
@@ -686,10 +757,10 @@ fn compile_expr(
             // tail position. When `body` ends in a `TailCall`, the
             // frame (and its mark) is reused, so a wcm reached through
             // the tail call replaces rather than accumulates.
-            compile_expr(key, out, lambdas, false, globals, primops, scope)?;
-            compile_expr(val, out, lambdas, false, globals, primops, scope)?;
+            compile_expr(key, out, lambdas, false, globals, primops, scope, consts)?;
+            compile_expr(val, out, lambdas, false, globals, primops, scope, consts)?;
             out.push(Inst::PushMark, *s);
-            compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+            compile_expr(body, out, lambdas, is_tail, globals, primops, scope, consts)?;
             Ok(())
         }
         CoreExpr::App {
@@ -703,8 +774,12 @@ fn compile_expr(
                 if let CoreExpr::Ref { name, .. } = &**func {
                     if !is_locally_bound(scope, *name) {
                         if let Some(op) = primops.get(name).copied() {
-                            compile_expr(&args[0], out, lambdas, false, globals, primops, scope)?;
-                            compile_expr(&args[1], out, lambdas, false, globals, primops, scope)?;
+                            compile_expr(
+                                &args[0], out, lambdas, false, globals, primops, scope, consts,
+                            )?;
+                            compile_expr(
+                                &args[1], out, lambdas, false, globals, primops, scope, consts,
+                            )?;
                             out.push(primop_to_inst(op), *s);
                             return Ok(());
                         }
@@ -730,11 +805,11 @@ fn compile_expr(
                                 // Compile a, then for each subsequent
                                 // arg compile + emit the primop.
                                 compile_expr(
-                                    &args[0], out, lambdas, false, globals, primops, scope,
+                                    &args[0], out, lambdas, false, globals, primops, scope, consts,
                                 )?;
                                 for rest in &args[1..] {
                                     compile_expr(
-                                        rest, out, lambdas, false, globals, primops, scope,
+                                        rest, out, lambdas, false, globals, primops, scope, consts,
                                     )?;
                                     out.push(primop_to_inst(op), *s);
                                 }
@@ -775,17 +850,19 @@ fn compile_expr(
                     scope.push(frame);
                     out.push(Inst::EnterScope, *lam_s);
                     let name = params.fixed[0];
-                    compile_expr(&args[0], out, lambdas, false, globals, primops, scope)?;
+                    compile_expr(
+                        &args[0], out, lambdas, false, globals, primops, scope, consts,
+                    )?;
                     out.push(Inst::DefineLocal(name), args[0].span());
-                    compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+                    compile_expr(body, out, lambdas, is_tail, globals, primops, scope, consts)?;
                     out.push(Inst::LeaveScope, body.span());
                     scope.pop();
                     return Ok(());
                 }
             }
-            compile_expr(func, out, lambdas, false, globals, primops, scope)?;
+            compile_expr(func, out, lambdas, false, globals, primops, scope, consts)?;
             for a in args {
-                compile_expr(a, out, lambdas, false, globals, primops, scope)?;
+                compile_expr(a, out, lambdas, false, globals, primops, scope, consts)?;
             }
             if is_tail {
                 out.push(Inst::TailCall(args.len()), *s);
@@ -806,15 +883,24 @@ fn compile_expr(
             }
             scope.push(frame);
             let mut body_buf = InstBuf::new();
-            compile_expr(body, &mut body_buf, lambdas, true, globals, primops, scope)?;
+            compile_expr(
+                body,
+                &mut body_buf,
+                lambdas,
+                true,
+                globals,
+                primops,
+                scope,
+                consts,
+            )?;
             body_buf.push(Inst::Return, body.span());
             scope.pop();
             let (fixed, rest) = match params {
                 Params { fixed, rest } => (fixed.clone(), *rest),
             };
             let (body_insts, body_spans) = body_buf.finish();
-            let (body_insts, body_spans) = peephole(body_insts, body_spans);
-            let fast = detect_fast_primop(&body_insts, &body_spans, &fixed);
+            let (body_insts, body_spans) = peephole(body_insts, body_spans, consts);
+            let fast = detect_fast_primop(&body_insts, &body_spans, &fixed, consts);
             let lambda_idx = lambdas.len();
             lambdas.push(CompiledLambda {
                 params: fixed,
@@ -824,6 +910,11 @@ fn compile_expr(
                 fast,
                 self_bind: None,
                 profile: Default::default(),
+                // cs-grt: filled in by `compile_with_globals_and_primops`
+                // once the whole program's const pool is finalized (this
+                // lambda's own body may still be mid-compile relative to
+                // siblings that add more consts).
+                consts: Rc::new(Vec::new()),
             });
             out.push(Inst::MakeClosure(lambda_idx), *s);
             Ok(())
@@ -892,7 +983,9 @@ fn compile_expr(
                         scope.push(frame);
                         for &i in &order {
                             let (name, lam_expr) = (&bindings[i].0, &bindings[i].1);
-                            compile_expr(lam_expr, out, lambdas, false, globals, primops, scope)?;
+                            compile_expr(
+                                lam_expr, out, lambdas, false, globals, primops, scope, consts,
+                            )?;
                             // compile_expr(Lambda) pushes its CompiledLambda
                             // LAST (inner lambdas are pushed during the body
                             // compile), so the MakeClosure just emitted refers
@@ -902,7 +995,7 @@ fn compile_expr(
                             out.push(Inst::EnterScope, *s);
                             out.push(Inst::DefineLocal(*name), lam_expr.span());
                         }
-                        compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+                        compile_expr(body, out, lambdas, is_tail, globals, primops, scope, consts)?;
                         for _ in &order {
                             out.push(Inst::LeaveScope, body.span());
                         }
@@ -915,14 +1008,15 @@ fn compile_expr(
             scope.push(frame);
             out.push(Inst::EnterScope, *s);
             for (name, _) in bindings {
-                out.push(Inst::Const(Value::Unspecified), *s);
+                let idx = intern_const(consts, Value::Unspecified);
+                out.push(Inst::Const(idx), *s);
                 out.push(Inst::DefineLocal(*name), *s);
             }
             for (name, expr) in bindings {
-                compile_expr(expr, out, lambdas, false, globals, primops, scope)?;
+                compile_expr(expr, out, lambdas, false, globals, primops, scope, consts)?;
                 out.push(Inst::DefineLocal(*name), expr.span());
             }
-            compile_expr(body, out, lambdas, is_tail, globals, primops, scope)?;
+            compile_expr(body, out, lambdas, is_tail, globals, primops, scope, consts)?;
             out.push(Inst::LeaveScope, body.span());
             scope.pop();
             Ok(())

@@ -35,6 +35,13 @@ use cs_core::{Number, SymbolTable, Value};
 use cs_diag::Span;
 use cs_vm::jit_translate::bytecode_to_rir;
 use cs_vm::opcode::{CompiledLambda, Inst as VmInst};
+use cs_vm::vm::NanboxValue;
+
+/// cs-grt: build a `CompiledLambda`-ready const pool from plain `Value`s,
+/// in the order each `VmInst::Const(idx)` below expects.
+fn const_pool(vals: Vec<Value>) -> Rc<Vec<NanboxValue>> {
+    Rc::new(vals.into_iter().map(NanboxValue::from_value).collect())
+}
 
 /// Hand-built bytecode for:
 ///   (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
@@ -59,17 +66,22 @@ use cs_vm::opcode::{CompiledLambda, Inst as VmInst};
 fn fact_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
     let n = syms.intern("n");
     let fact = syms.intern("fact");
+    let consts = const_pool(vec![
+        Value::Number(Number::Fixnum(0)),
+        Value::Number(Number::Fixnum(1)),
+        Value::Number(Number::Fixnum(1)),
+    ]);
     let body = vec![
         VmInst::LoadVar(n),
-        VmInst::Const(Value::Number(Number::Fixnum(0))),
+        VmInst::Const(0),
         VmInst::EqFx2,
         VmInst::JumpIfFalse(6),
-        VmInst::Const(Value::Number(Number::Fixnum(1))),
+        VmInst::Const(1),
         VmInst::Return,
         VmInst::LoadVar(n),
         VmInst::LoadVar(fact),
         VmInst::LoadVar(n),
-        VmInst::Const(Value::Number(Number::Fixnum(1))),
+        VmInst::Const(2),
         VmInst::SubFx2,
         VmInst::Call(1),
         VmInst::MulFx2,
@@ -84,6 +96,7 @@ fn fact_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
         fast: None,
         profile: Default::default(),
         self_bind: None,
+        consts,
     };
     (lam, fact)
 }
@@ -108,21 +121,26 @@ fn workspace_target_dir() -> PathBuf {
 fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
     let n = syms.intern("n");
     let fib = syms.intern("fib");
+    let consts = const_pool(vec![
+        Value::Number(Number::Fixnum(2)),
+        Value::Number(Number::Fixnum(1)),
+        Value::Number(Number::Fixnum(2)),
+    ]);
     let body = vec![
         VmInst::LoadVar(n),
-        VmInst::Const(Value::Number(Number::Fixnum(2))),
+        VmInst::Const(0),
         VmInst::LtFx2,
         VmInst::JumpIfFalse(6),
         VmInst::LoadVar(n),
         VmInst::Return,
         VmInst::LoadVar(fib),
         VmInst::LoadVar(n),
-        VmInst::Const(Value::Number(Number::Fixnum(1))),
+        VmInst::Const(1),
         VmInst::SubFx2,
         VmInst::Call(1),
         VmInst::LoadVar(fib),
         VmInst::LoadVar(n),
-        VmInst::Const(Value::Number(Number::Fixnum(2))),
+        VmInst::Const(2),
         VmInst::SubFx2,
         VmInst::Call(1),
         VmInst::AddFx2,
@@ -137,6 +155,7 @@ fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
         fast: None,
         profile: Default::default(),
         self_bind: None,
+        consts,
     };
     (lam, fib)
 }

@@ -58,7 +58,7 @@ impl Drop for AotModeGuard {
 fn aot_mode() -> bool {
     AOT_MODE.with(|c| c.get())
 }
-use crate::vm::{Env, VmClosure};
+use crate::vm::{vm_value_clone_gc, Env, NanboxValue, VmClosure};
 
 /// Errors the translator can surface. `Unsupported` is the dominant
 /// signal — when the runtime asks the JIT to compile a closure
@@ -511,7 +511,7 @@ pub fn bytecode_to_rir_full(
             | Inst::BranchOnLeFx2(t)
             | Inst::BranchOnLtFx2(t)
             | Inst::BranchOnNeFx2(t) => {
-                starts.insert(*t);
+                starts.insert(*t as usize);
                 if i + 1 < body.len() {
                     starts.insert(i + 1);
                 }
@@ -643,12 +643,20 @@ pub fn bytecode_to_rir_full(
             let op = &body[ip];
             ip += 1;
             match op {
-                Inst::Const(v) => {
+                Inst::Const(idx) => {
+                    // cs-grt: `Inst::Const` holds a pool index, not an
+                    // inline `Value`. Peek the pooled `NanboxValue` via
+                    // an incref/decode round-trip — the pool entry
+                    // itself must stay live for later executions of
+                    // this Const, so we clone (incref) rather than
+                    // consume it.
+                    let nb = lambda.consts[*idx as usize];
+                    let v = unsafe { NanboxValue(vm_value_clone_gc(nb.0)).to_value() };
                     // Procedure constants (compiler-folded builtins
                     // like `quotient`, `bitwise-and`) get pushed as
                     // BuiltinRef sentinels. The matching Call N
                     // consumes them and emits a specialized RIR op.
-                    if let cs_core::Value::Procedure(p) = v {
+                    if let cs_core::Value::Procedure(p) = &v {
                         if let Some(name) = p.name() {
                             // Leak the name into 'static. Builtins
                             // we lower have stable static names; the
@@ -659,7 +667,7 @@ pub fn bytecode_to_rir_full(
                             continue;
                         }
                     }
-                    let c = value_to_const(v)?;
+                    let c = value_to_const(&v)?;
                     let dst = alloc();
                     let t = match c {
                         Const::Flonum(_) => Type::Flonum,
@@ -892,7 +900,8 @@ pub fn bytecode_to_rir_full(
                     } else {
                         cond_raw
                     };
-                    let target_block = lookup_block(&offset_to_block, *target, "JumpIfFalse")?;
+                    let target_block =
+                        lookup_block(&offset_to_block, *target as usize, "JumpIfFalse")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "JumpIfFalse fall")?;
                     // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
                     // markers before the branch so they survive across
@@ -936,7 +945,8 @@ pub fn bytecode_to_rir_full(
                 Inst::BranchOnGeFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
-                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnGeFx2")?;
+                    let target_block =
+                        lookup_block(&offset_to_block, *target as usize, "BranchOnGeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGeFx2 fall")?;
                     // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
                     // markers before the branch so they survive across
@@ -979,7 +989,8 @@ pub fn bytecode_to_rir_full(
                 Inst::BranchOnGtFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
-                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnGtFx2")?;
+                    let target_block =
+                        lookup_block(&offset_to_block, *target as usize, "BranchOnGtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnGtFx2 fall")?;
                     // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
                     // markers before the branch so they survive across
@@ -1018,7 +1029,8 @@ pub fn bytecode_to_rir_full(
                 Inst::BranchOnLeFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, b, a);
-                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnLeFx2")?;
+                    let target_block =
+                        lookup_block(&offset_to_block, *target as usize, "BranchOnLeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLeFx2 fall")?;
                     // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
                     // markers before the branch so they survive across
@@ -1061,7 +1073,8 @@ pub fn bytecode_to_rir_full(
                 Inst::BranchOnLtFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
                     let cond = emit_typed_lt(&mut insts, &mut value_types, &mut alloc, a, b);
-                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnLtFx2")?;
+                    let target_block =
+                        lookup_block(&offset_to_block, *target as usize, "BranchOnLtFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnLtFx2 fall")?;
                     // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
                     // markers before the branch so they survive across
@@ -1100,7 +1113,8 @@ pub fn bytecode_to_rir_full(
                 Inst::BranchOnNeFx2(target) => {
                     let (a, b) = pop_two_values(&mut sim_stack)?;
                     let cond = emit_typed_eq(&mut insts, &mut value_types, &mut alloc, a, b);
-                    let target_block = lookup_block(&offset_to_block, *target, "BranchOnNeFx2")?;
+                    let target_block =
+                        lookup_block(&offset_to_block, *target as usize, "BranchOnNeFx2")?;
                     let fall_block = lookup_block(&offset_to_block, ip, "BranchOnNeFx2 fall")?;
                     // RC3 iter 2.13 — materialize SelfRef / BuiltinRef
                     // markers before the branch so they survive across
@@ -1141,7 +1155,7 @@ pub fn bytecode_to_rir_full(
                     break;
                 }
                 Inst::Jump(target) => {
-                    let target_block = lookup_block(&offset_to_block, *target, "Jump")?;
+                    let target_block = lookup_block(&offset_to_block, *target as usize, "Jump")?;
                     // RC3 iter 2.13 — same marker-materialization as
                     // JumpIfFalse so the markers flow as Values.
                     materialize_markers_at_branch(
@@ -8611,8 +8625,15 @@ fn value_to_const(v: &cs_core::Value) -> Result<Const, TranslateError> {
 mod tests {
     use super::*;
     use crate::opcode::{CompiledLambda, FastPrimopBody, Inst};
+    use crate::vm::NanboxValue;
     use cs_core::{Number, SymbolTable, Value};
     use std::rc::Rc;
+
+    /// cs-grt: build a `CompiledLambda`-ready const pool from plain
+    /// `Value`s, in the order each `Inst::Const(idx)` below expects.
+    fn test_pool(vals: Vec<Value>) -> Rc<Vec<NanboxValue>> {
+        Rc::new(vals.into_iter().map(NanboxValue::from_value).collect())
+    }
 
     fn make_fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, Symbol) {
         let n = syms.intern("n");
@@ -8636,21 +8657,26 @@ mod tests {
         //  15: Call 1
         //  16: AddFx2
         //  17: Return
+        let consts = test_pool(vec![
+            Value::Number(Number::Fixnum(2)),
+            Value::Number(Number::Fixnum(1)),
+            Value::Number(Number::Fixnum(2)),
+        ]);
         let body = vec![
             Inst::LoadVar(n),
-            Inst::Const(Value::Number(Number::Fixnum(2))),
+            Inst::Const(0),
             Inst::LtFx2,
             Inst::JumpIfFalse(6),
             Inst::LoadVar(n),
             Inst::Return,
             Inst::LoadVar(fib),
             Inst::LoadVar(n),
-            Inst::Const(Value::Number(Number::Fixnum(1))),
+            Inst::Const(1),
             Inst::SubFx2,
             Inst::Call(1),
             Inst::LoadVar(fib),
             Inst::LoadVar(n),
-            Inst::Const(Value::Number(Number::Fixnum(2))),
+            Inst::Const(2),
             Inst::SubFx2,
             Inst::Call(1),
             Inst::AddFx2,
@@ -8665,6 +8691,7 @@ mod tests {
             fast: None as Option<FastPrimopBody>,
             self_bind: None,
             profile: Default::default(),
+            consts,
         };
         (l, fib)
     }
@@ -8698,12 +8725,8 @@ mod tests {
         // f(x) = x + 1
         let mut syms = SymbolTable::new();
         let x = syms.intern("x");
-        let body = vec![
-            Inst::LoadVar(x),
-            Inst::Const(Value::Number(Number::Fixnum(1))),
-            Inst::AddFx2,
-            Inst::Return,
-        ];
+        let consts = test_pool(vec![Value::Number(Number::Fixnum(1))]);
+        let body = vec![Inst::LoadVar(x), Inst::Const(0), Inst::AddFx2, Inst::Return];
         let len = body.len();
         let lam = CompiledLambda {
             params: vec![x],
@@ -8713,6 +8736,7 @@ mod tests {
             fast: None,
             self_bind: None,
             profile: Default::default(),
+            consts,
         };
         let f = bytecode_to_rir(&lam, "addone", None).unwrap();
         assert_eq!(f.blocks.len(), 1);
@@ -8744,6 +8768,7 @@ mod tests {
             fast: None,
             self_bind: None,
             profile: Default::default(),
+            consts: test_pool(vec![]),
         };
         let f = bytecode_to_rir(&lam, "f", None).expect("free-var LoadVar should translate");
         // Look for the EnvLookup in block 0's insts.
@@ -8765,9 +8790,10 @@ mod tests {
         // (g 1) — calls non-self. The LoadVar(g) for a free var
         // is promoted to `EnvLookupAny` inline so the callee
         // arrives as an Any-tagged Gc handle for vm_call_general.
+        let consts = test_pool(vec![Value::Number(Number::Fixnum(1))]);
         let body = vec![
             Inst::LoadVar(g),
-            Inst::Const(Value::Number(Number::Fixnum(1))),
+            Inst::Const(0),
             Inst::Call(1),
             Inst::Return,
         ];
@@ -8780,6 +8806,7 @@ mod tests {
             fast: None,
             self_bind: None,
             profile: Default::default(),
+            consts,
         };
         let f = bytecode_to_rir(&lam, "f", None).expect("translate succeeded");
         let has_general = f
@@ -8818,6 +8845,7 @@ mod tests {
             fast: None,
             self_bind: None,
             profile: Default::default(),
+            consts: test_pool(vec![]),
         };
         match bytecode_to_rir(&lam, "f", None) {
             Err(TranslateError::Unsupported(msg)) => assert!(msg.contains("rest")),
