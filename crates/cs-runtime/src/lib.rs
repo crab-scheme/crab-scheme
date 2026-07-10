@@ -3428,13 +3428,74 @@ impl Runtime {
             eprintln!("crabscheme (aot): unbound builtin `{name}`");
             return cs_vm::vm::vm_value_to_nb(Value::Unspecified);
         };
-        // Borrow-decode: the AOT'd caller keeps owning its arg carriers.
-        let arg_vals: Vec<Value> = args
-            .iter()
-            .map(|&a| cs_vm::vm::vm_nb_borrow_to_value(a))
-            .collect();
+        self.aot_dispatch_builtin_with(proc, name, args)
+    }
+
+    /// cs-7rz — same dispatch as [`Self::aot_dispatch_builtin`], but the
+    /// `name` → `Value` resolution comes from `cache` instead of a fresh
+    /// `SymbolTable::intern` + top-level env lookup.
+    ///
+    /// `cache` holds this call site's already-resolved builtin `Value`
+    /// once it's been looked up on this thread. This is sound because
+    /// `AOT_RUNTIME`'s top-level env is populated once at `Runtime::new()`
+    /// and never subsequently mutated by AOT'd user code (it exists
+    /// purely as a name→builtin resolution table, not the AOT program's
+    /// own top-level scope — user-level defines are lowered to native
+    /// Rust functions, not routed through this env). A given call site
+    /// always resolves the same literal name, so the first resolution is
+    /// valid for the process's remaining lifetime on this thread.
+    fn aot_dispatch_builtin_cached(
+        &mut self,
+        cache: &AotBuiltinCache,
+        name: &str,
+        args: &[i64],
+    ) -> i64 {
+        let cached = cache.0.borrow().clone();
+        let proc = match cached {
+            Some(v) => v,
+            None => {
+                let sym = self.syms.intern(name);
+                let Some(v) = self.top.get(sym) else {
+                    eprintln!("crabscheme (aot): unbound builtin `{name}`");
+                    return cs_vm::vm::vm_value_to_nb(Value::Unspecified);
+                };
+                *cache.0.borrow_mut() = Some(v.clone());
+                v
+            }
+        };
+        self.aot_dispatch_builtin_with(proc, name, args)
+    }
+
+    /// Shared invocation tail for [`Self::aot_dispatch_builtin`] and
+    /// [`Self::aot_dispatch_builtin_cached`] once `proc` is resolved.
+    ///
+    /// cs-7rz — args up to `INLINE_ARGS` decode into a stack array
+    /// instead of a heap `Vec`; most stdlib builtins (`not`, `car`,
+    /// `+`, …) take 1-2 args, so this turns a per-call heap
+    /// allocation into a per-call-site cost of zero.
+    fn aot_dispatch_builtin_with(&mut self, proc: Value, name: &str, args: &[i64]) -> i64 {
+        const INLINE_ARGS: usize = 4;
         let mut ctx = EvalCtx::new(self.top.clone(), &mut self.syms, &mut self.macros);
-        match crate::eval::apply_procedure(&proc, &arg_vals, &mut ctx) {
+        // Borrow-decode: the AOT'd caller keeps owning its arg carriers.
+        let result = if args.len() <= INLINE_ARGS {
+            let mut buf: [Value; INLINE_ARGS] = [
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+                Value::Unspecified,
+            ];
+            for (slot, &a) in buf.iter_mut().zip(args) {
+                *slot = cs_vm::vm::vm_nb_borrow_to_value(a);
+            }
+            crate::eval::apply_procedure(&proc, &buf[..args.len()], &mut ctx)
+        } else {
+            let arg_vals: Vec<Value> = args
+                .iter()
+                .map(|&a| cs_vm::vm::vm_nb_borrow_to_value(a))
+                .collect();
+            crate::eval::apply_procedure(&proc, &arg_vals, &mut ctx)
+        };
+        match result {
             Ok(v) => cs_vm::vm::vm_value_to_nb(v),
             Err(e) => {
                 eprintln!("crabscheme (aot): builtin `{name}`: {}", e.message());
@@ -3478,6 +3539,39 @@ pub fn aot_call_builtin(name: &str, args: &[i64]) -> i64 {
         let mut slot = cell.borrow_mut();
         let rt = slot.get_or_insert_with(Runtime::new);
         rt.aot_dispatch_builtin(name, args)
+    })
+}
+
+/// cs-7rz — per-call-site cache for [`aot_call_builtin_cached`].
+///
+/// The AOT emitter declares one `thread_local! { static: AotBuiltinCache
+/// }` per `CallBuiltin` site (mirrors the `AotIcSlot` pattern for
+/// `Call`/`CallGeneral` sites, see `cs_vm::vm::AotIcSlot`). Thread-local
+/// rather than a shared `static`: `AOT_RUNTIME` — and therefore the
+/// `Symbol` ids and `Value` this cache holds — is itself per-thread, so a
+/// cache shared across threads would mix up symbol tables.
+#[derive(Default)]
+pub struct AotBuiltinCache(RefCell<Option<Value>>);
+
+impl AotBuiltinCache {
+    pub const fn new() -> Self {
+        Self(RefCell::new(None))
+    }
+}
+
+/// cs-7rz — inline-cached variant of [`aot_call_builtin`].
+///
+/// Same contract, plus `cache` — a process-lifetime
+/// `&'static AotBuiltinCache` owned by the call site (one per
+/// `CallBuiltin` instruction in the AOT'd source, emitted as a local
+/// `thread_local!`). On a hit this skips `SymbolTable::intern` and the
+/// top-level env lookup entirely; see
+/// [`Runtime::aot_dispatch_builtin_cached`] for the soundness argument.
+pub fn aot_call_builtin_cached(cache: &AotBuiltinCache, name: &str, args: &[i64]) -> i64 {
+    AOT_RUNTIME.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let rt = slot.get_or_insert_with(Runtime::new);
+        rt.aot_dispatch_builtin_cached(cache, name, args)
     })
 }
 

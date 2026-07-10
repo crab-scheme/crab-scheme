@@ -2178,11 +2178,18 @@ fn inst_rhs(
                 .collect::<Vec<_>>()
                 .join(", ");
             let n = args.len();
+            // cs-7rz — per-call-site inline cache. Each dynamic
+            // Call/CallGeneral site gets its own block-scoped
+            // `static AotIcSlot`; the name doesn't need to be
+            // unique across call sites since each is emitted inside
+            // its own `{ ... }` block (a fresh lexical scope), same
+            // as every other local this codegen emits per site.
             (
                 *dst,
                 format!(
-                    "{{ let __aot_args: [i64; {n}] = [{args_csv}]; \
-                     unsafe {{ cs_vm::vm::vm_call_aot_procedure(v{}, __aot_args.as_ptr(), {n}) }} }}",
+                    "{{ static __AOT_IC: cs_vm::vm::AotIcSlot = cs_vm::vm::AotIcSlot::new(); \
+                     let __aot_args: [i64; {n}] = [{args_csv}]; \
+                     unsafe {{ cs_vm::vm::vm_call_aot_procedure_ic(&__AOT_IC, v{}, __aot_args.as_ptr(), {n}) }} }}",
                     callee.0
                 ),
             )
@@ -2225,9 +2232,17 @@ fn inst_rhs(
                 .map(|a| format!("v{}", a.0))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // cs-7rz — per-call-site inline cache, same rationale as the
+            // `Call`/`CallGeneral` `AotIcSlot` above: a block-scoped
+            // `thread_local!` so the name→builtin resolution (intern +
+            // top-level env lookup) happens once per call site per
+            // thread instead of on every single call.
             (
                 *dst,
-                format!("cs_runtime::aot_call_builtin({name:?}, &[{args_csv}])"),
+                format!(
+                    "{{ thread_local! {{ static __AOT_BC: cs_runtime::AotBuiltinCache = cs_runtime::AotBuiltinCache::new(); }} \
+                     __AOT_BC.with(|__c| cs_runtime::aot_call_builtin_cached(__c, {name:?}, &[{args_csv}])) }}"
+                ),
             )
         }
 
@@ -3598,8 +3613,11 @@ mod tests {
             terminator: Term::Return(Value(1)),
         });
         let src = emit_with(EmitMode::Nb, &f).unwrap();
+        // cs-7rz — the dispatch is now inline-cached: a block-scoped
+        // `thread_local!` AotBuiltinCache feeds `aot_call_builtin_cached`
+        // instead of the uncached `aot_call_builtin`.
         assert!(
-            src.contains(r#"cs_runtime::aot_call_builtin("string-append", &[v0])"#),
+            src.contains(r#"cs_runtime::aot_call_builtin_cached(__c, "string-append", &[v0])"#),
             "emitted: {src}"
         );
     }
