@@ -16528,6 +16528,121 @@ pub unsafe extern "C" fn vm_call_aot_procedure(
     f(proc_nb, captures_ptr, n_captures, args_ptr, n_args)
 }
 
+/// cs-7rz — per-call-site inline cache for `vm_call_aot_procedure`.
+///
+/// The AOT emitter declares one `static AotIcSlot` per `Call`/
+/// `CallGeneral` site (see `cs-aot`'s codegen); its address is
+/// stable for the process lifetime, same shape as the JIT's
+/// `IcSlot`. `cached_idx = u32::MAX` means "empty" (proc_table
+/// indices never reach `u32::MAX` — `ProcTable::NIL` reserves it).
+///
+/// Not `Sync`-guarded beyond the atomics: `proc_table` itself is
+/// thread-local (`RefCell`, one table per worker), so a given
+/// static slot only ever sees traffic from the single worker thread
+/// executing that call site's AOT'd function body.
+#[repr(C)]
+pub struct AotIcSlot {
+    cached_idx: std::sync::atomic::AtomicU32,
+    cached_fn_ptr: std::sync::atomic::AtomicUsize,
+    cached_arity: std::sync::atomic::AtomicU32,
+    cached_captures_ptr: std::sync::atomic::AtomicUsize,
+    cached_n_captures: std::sync::atomic::AtomicUsize,
+}
+
+impl AotIcSlot {
+    pub const fn new() -> Self {
+        Self {
+            cached_idx: std::sync::atomic::AtomicU32::new(u32::MAX),
+            cached_fn_ptr: std::sync::atomic::AtomicUsize::new(0),
+            cached_arity: std::sync::atomic::AtomicU32::new(0),
+            cached_captures_ptr: std::sync::atomic::AtomicUsize::new(0),
+            cached_n_captures: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Default for AotIcSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RC3/cs-7rz — inline-cached variant of [`vm_call_aot_procedure`].
+///
+/// Same contract as `vm_call_aot_procedure`, plus `slot` — a
+/// process-lifetime `&'static AotIcSlot` owned by the call site
+/// (one per `Call`/`CallGeneral` instruction in the AOT'd source,
+/// emitted as a local `static`). On a hit (`slot.cached_idx` matches
+/// the callee's proc_table index) this skips `proc_table::peek` and
+/// the `downcast_ref::<VmAotClosure>()` dynamic type check entirely
+/// — just an atomic load + compare + indirect call. On a miss it
+/// falls back to the full resolve path and repopulates the slot.
+///
+/// A hit's `n_args` is guaranteed to equal the arity validated at
+/// the miss that populated the slot: the AOT emitter fixes the
+/// argument count for a given call site at codegen time (it's the
+/// Scheme call expression's static arg count), so re-validating
+/// arity on every hit would be redundant — only the *identity* of
+/// the resolved closure can vary between calls to the same site.
+///
+/// # Safety
+///
+/// Same as `vm_call_aot_procedure`, plus `slot_ptr` must be a valid,
+/// process-lifetime-live `*const AotIcSlot` (the AOT emitter always
+/// passes the address of a local `static`).
+#[no_mangle]
+pub unsafe extern "C" fn vm_call_aot_procedure_ic(
+    slot_ptr: *const AotIcSlot,
+    proc_nb: i64,
+    args_ptr: *const i64,
+    n_args: usize,
+) -> i64 {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let bits = proc_nb as u64;
+    assert!(
+        nb_is_tagged(bits) && nb_tag_of(bits) == NB_TAG_PROCEDURE,
+        "vm_call_aot_procedure_ic: NB carrier 0x{bits:016x} is not NB_TAG_PROCEDURE"
+    );
+    let idx = nb_payload_of(bits) as u32;
+    let slot = unsafe { &*slot_ptr };
+
+    if slot.cached_idx.load(Relaxed) == idx {
+        let fn_ptr = slot.cached_fn_ptr.load(Relaxed);
+        let captures_ptr = slot.cached_captures_ptr.load(Relaxed) as *const i64;
+        let n_captures = slot.cached_n_captures.load(Relaxed);
+        let f: AotDispatchFn = std::mem::transmute(fn_ptr);
+        return f(proc_nb, captures_ptr, n_captures, args_ptr, n_args);
+    }
+
+    let p = proc_table::peek(idx);
+    let aot = p
+        .as_any()
+        .downcast_ref::<VmAotClosure>()
+        .expect("vm_call_aot_procedure_ic: procedure is not a VmAotClosure");
+    assert_eq!(
+        aot.arity as usize, n_args,
+        "vm_call_aot_procedure_ic: arity mismatch — procedure expects {}, got {}",
+        aot.arity, n_args
+    );
+    let (captures_ptr, n_captures) = if aot.captures.is_empty() {
+        (std::ptr::null::<i64>(), 0usize)
+    } else {
+        (aot.captures.as_ptr(), aot.captures.len())
+    };
+    slot.cached_fn_ptr.store(aot.fn_ptr, Relaxed);
+    slot.cached_arity.store(aot.arity, Relaxed);
+    slot.cached_captures_ptr
+        .store(captures_ptr as usize, Relaxed);
+    slot.cached_n_captures.store(n_captures, Relaxed);
+    // Publish the idx last: once it's visible, a concurrent (well,
+    // re-entrant single-threaded) hit reads a fully-populated slot.
+    slot.cached_idx.store(idx, Relaxed);
+
+    let f: AotDispatchFn = std::mem::transmute(aot.fn_ptr);
+    f(proc_nb, captures_ptr, n_captures, args_ptr, n_args)
+}
+
 #[cfg(test)]
 mod aot_proc_tests {
     use super::*;
