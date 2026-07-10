@@ -5,10 +5,16 @@ use std::rc::Rc;
 use cs_core::{Symbol, Value};
 use cs_diag::Span;
 
+use crate::vm::NanboxValue;
+
 #[derive(Clone, Debug)]
 pub enum Inst {
-    /// Push a constant onto the value stack.
-    Const(Value),
+    /// Push a constant onto the value stack. The `u32` is an index into
+    /// the owning [`Bytecode`] (or [`CompiledLambda`])'s `consts` pool —
+    /// see [`Bytecode::consts`]. Not an inline `Value`: keeping `Inst`
+    /// small (no 24-byte `Value` payload) improves icache density and
+    /// cuts per-actor cached-bytecode RSS (cs-grt).
+    Const(u32),
     /// Read a variable by name from the lexical environment chain. Pushes its value.
     LoadVar(Symbol),
     /// `set!` semantics: pops a value, walks the env chain looking for an
@@ -23,9 +29,9 @@ pub enum Inst {
     /// Pop and discard one value (used after non-tail expressions in `begin`).
     Pop,
     /// Conditional branch: pop a value; if falsy, jump to the offset; else fall through.
-    JumpIfFalse(usize),
+    JumpIfFalse(u32),
     /// Unconditional jump.
-    Jump(usize),
+    Jump(u32),
     /// Apply a procedure with N args. Args are on the stack with proc just under them.
     Call(usize),
     /// Tail call: replaces the current frame instead of pushing a new one.
@@ -91,15 +97,15 @@ pub enum Inst {
     // (Fixnum, Fixnum) — the boolean is then materialized and we behave
     // like the unfused LtFx2/JumpIfFalse pair.
     /// Fused `(if (<  a b) ...)` — branch when a >= b.
-    BranchOnGeFx2(usize),
+    BranchOnGeFx2(u32),
     /// Fused `(if (<= a b) ...)` — branch when a > b.
-    BranchOnGtFx2(usize),
+    BranchOnGtFx2(u32),
     /// Fused `(if (>  a b) ...)` — branch when a <= b.
-    BranchOnLeFx2(usize),
+    BranchOnLeFx2(u32),
     /// Fused `(if (>= a b) ...)` — branch when a < b.
-    BranchOnLtFx2(usize),
+    BranchOnLtFx2(u32),
     /// Fused `(if (=  a b) ...)` — branch when a != b.
-    BranchOnNeFx2(usize),
+    BranchOnNeFx2(u32),
 }
 
 /// A compiled program: instructions plus a table of nested compiled lambdas.
@@ -117,6 +123,13 @@ pub struct Bytecode {
     pub spans: Rc<Vec<Span>>,
     /// Compiled lambdas referenced by `MakeClosure` instructions.
     pub lambdas: Rc<Vec<CompiledLambda>>,
+    /// Const pool for this compiled program, pre-encoded to `NanboxValue`
+    /// at compile time. `Inst::Const(idx)` (both here and in every
+    /// `CompiledLambda` in `lambdas`, which share this same `Rc`) indexes
+    /// into it — execution is one `vm_value_clone_gc` incref + push,
+    /// instead of a `Value` clone + `NanboxValue::from_value` re-encode
+    /// on every hit (cs-grt).
+    pub consts: Rc<Vec<NanboxValue>>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +165,10 @@ pub struct CompiledLambda {
     /// aggregate hotness counter and tiers up. See
     /// [`crate::vm::LambdaProfile`]. (Post-M8 JIT plan, Stage 0.)
     pub profile: Rc<crate::vm::LambdaProfile>,
+    /// Same const pool as the owning [`Bytecode::consts`] (shared `Rc`,
+    /// set once by the compiler after the whole program's pool is
+    /// finalized). `Inst::Const(idx)` in `body` indexes into this.
+    pub consts: Rc<Vec<NanboxValue>>,
 }
 
 /// Either a positional reference to one of the lambda's params, or an
@@ -175,4 +192,19 @@ pub struct FastPrimopBody {
     /// Span of the primop call site, used for error messages on
     /// type-mismatch / overflow falling out of the fast path.
     pub span: Span,
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::Inst;
+
+    /// cs-grt: `Inst::Const(Value)` (24-byte `Value` payload) made `Inst`
+    /// ~32 bytes. Pooling consts to a `u32` index and shrinking jump/
+    /// branch targets to `u32` should land `Inst` at 16 bytes — the
+    /// largest remaining payload is the 8-byte `usize` arg count carried
+    /// by `Call`/`TailCall`/`MakeClosure`.
+    #[test]
+    fn inst_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<Inst>(), 16);
+    }
 }

@@ -12154,7 +12154,14 @@ fn run_dispatch(
         };
         frame.ip += 1;
         match inst_ref {
-            Inst::Const(v) => stack.push(v.clone()),
+            Inst::Const(idx) => {
+                // cs-grt: pre-encoded pool hit — one incref (no-op for
+                // inline immediates) instead of a `Value` clone +
+                // `NanboxValue::from_value` re-encode.
+                let nb = frame.bc.consts[*idx as usize];
+                let nb = NanboxValue(unsafe { vm_value_clone_gc(nb.0) });
+                stack.push_nb(nb);
+            }
             Inst::LoadVar(s) => {
                 let s = *s;
                 let nb = frame.env.get_nb(s).ok_or_else(|| {
@@ -12241,7 +12248,7 @@ fn run_dispatch(
                 unsafe { vm_value_drop_gc(nb.into_raw()) };
             }
             Inst::JumpIfFalse(target) => {
-                let target = *target;
+                let target = *target as usize;
                 let nb = stack
                     .pop_nb()
                     .ok_or_else(|| VmError::new("stack underflow on JumpIfFalse"))?;
@@ -12251,7 +12258,7 @@ fn run_dispatch(
                 unsafe { vm_value_drop_gc(nb.into_raw()) };
             }
             Inst::Jump(target) => {
-                frame.ip = *target;
+                frame.ip = *target as usize;
             }
             Inst::Call(n) | Inst::TailCall(n) => {
                 let n = *n;
@@ -14117,7 +14124,7 @@ fn run_dispatch(
             // materializes a boolean via generic_cmp2 then does a normal
             // JumpIfFalse.
             Inst::BranchOnGeFx2(target) => {
-                let target = *target;
+                let target = *target as usize;
                 if !fxbranch_nb(stack, |a, b| a >= b, target, &mut frame.ip) {
                     fallback_branch_nb(
                         stack,
@@ -14131,7 +14138,7 @@ fn run_dispatch(
                 }
             }
             Inst::BranchOnGtFx2(target) => {
-                let target = *target;
+                let target = *target as usize;
                 if !fxbranch_nb(stack, |a, b| a > b, target, &mut frame.ip) {
                     fallback_branch_nb(
                         stack,
@@ -14145,7 +14152,7 @@ fn run_dispatch(
                 }
             }
             Inst::BranchOnLeFx2(target) => {
-                let target = *target;
+                let target = *target as usize;
                 if !fxbranch_nb(stack, |a, b| a <= b, target, &mut frame.ip) {
                     fallback_branch_nb(
                         stack,
@@ -14159,7 +14166,7 @@ fn run_dispatch(
                 }
             }
             Inst::BranchOnLtFx2(target) => {
-                let target = *target;
+                let target = *target as usize;
                 if !fxbranch_nb(stack, |a, b| a < b, target, &mut frame.ip) {
                     fallback_branch_nb(
                         stack,
@@ -14173,7 +14180,7 @@ fn run_dispatch(
                 }
             }
             Inst::BranchOnNeFx2(target) => {
-                let target = *target;
+                let target = *target as usize;
                 if !fxbranch_nb(stack, |a, b| a != b, target, &mut frame.ip) {
                     fallback_branch_nb(
                         stack,
