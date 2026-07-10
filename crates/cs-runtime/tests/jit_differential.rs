@@ -10616,6 +10616,84 @@ fn diff_jit_ic_dispatch_fires_with_guards() {
 }
 
 #[test]
+fn diff_jit_ic_slot_warm_across_recompile() {
+    // cs-xop — before this fix, every JIT compile of a body with a
+    // CallGeneral/Call site `Box::leak`'d a *fresh* IcSlot for that
+    // site. A deopt-triggered recompile of the same lambda (see
+    // `diff_jit_recompile_on_arg_type_change`) therefore reset every
+    // call site's IC back to cold, discarding whatever warm state
+    // had accumulated. `IcTable` now keys slots by `(lambda_id,
+    // site_idx)`, so a recompile of the same lambda re-lowering the
+    // same call site reuses the same slot and its warm state.
+    //
+    // This test warms `apply-it`'s CallGeneral-on-`f` IC slot against
+    // `dup`, forces a recompile of `apply-it` via an arg-type-guard
+    // miss loop (same technique as
+    // `diff_jit_recompile_on_arg_type_change`), then asserts the
+    // recompiled body's very first call through that site is an IC
+    // *hit* rather than a cold miss-then-refill.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dup x) (cons x x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (apply-it f x) (f x))")
+        .unwrap();
+
+    // Phase 1: warm apply-it's JIT body and its IC slot against `dup`.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 4000) 'done \
+               (begin (apply-it dup (list i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+    cs_vm::vm::reset_jit_ic_hit_count();
+    cs_vm::vm::reset_jit_ic_miss_count();
+    rt.eval_str_via_vm("<diff>", "(apply-it dup (list 1))")
+        .unwrap();
+    assert!(
+        cs_vm::vm::jit_ic_hit_count() >= 1,
+        "IC slot never warmed before the recompile — test setup is broken"
+    );
+
+    // Phase 2: hammer apply-it with a mismatched `x` type (Fixnum
+    // instead of a pair) so its per-param type guard misses every
+    // call, bumping the deopt counter past
+    // `JIT_DEOPT_RECOMPILE_THRESHOLD` and clearing `jit_ptr` for
+    // recompile.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 1500) 'done \
+               (begin (apply-it dup i) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // Phase 3: back to the original call shape. This triggers the
+    // tier-up hook to recompile `apply-it` fresh, then immediately
+    // executes the new body's first call through its (recompiled)
+    // CallGeneral IC site.
+    cs_vm::vm::reset_jit_ic_hit_count();
+    cs_vm::vm::reset_jit_ic_miss_count();
+    let result = rt
+        .eval_str_via_vm("<diff>", "(apply-it dup (list 9))")
+        .unwrap();
+
+    let hits = cs_vm::vm::jit_ic_hit_count();
+    let misses = cs_vm::vm::jit_ic_miss_count();
+    assert!(
+        hits >= 1 && misses == 0,
+        "expected the recompiled body's IC slot to already be warm \
+         (hits={hits}, misses={misses}) — cs-xop regression: IC slots \
+         are resetting to cold on recompile"
+    );
+    match &result {
+        Value::Pair(_) => {}
+        other => panic!("expected pair, got {:?}", other),
+    }
+}
+
+#[test]
 fn diff_jit_callee_error_does_not_disable_jit() {
     // cs-4j3 — `vm_call_general` / `vm_ic_dispatch` used to `panic!`
     // when a callee reached via `vm_call_sync` returned `Err` (an

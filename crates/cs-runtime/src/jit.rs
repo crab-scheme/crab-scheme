@@ -173,7 +173,7 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
     // resolve free-var callees to top-level VmClosure bindings and
     // attempt leaf-callee inlining. `inline_depth = 0` because this
     // is the top-level body of a JIT'd function.
-    let rir = match bytecode_to_rir_full(
+    let mut rir = match bytecode_to_rir_full(
         lam,
         "anon-jit",
         closure.self_name(),
@@ -184,6 +184,13 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
         Ok(r) => r,
         Err(_) => return,
     };
+    // cs-xop — carry this lambda's stable process-wide identity through
+    // to the lowerer so its IC table (`cs_jit_cranelift::ic::IcTable`)
+    // can key call-site slots by `(lambda_id, site_idx)`. A deopt
+    // recompile of this same closure reaches this hook again with the
+    // same `lambda_id`, so it reuses its call sites' warm slots instead
+    // of leaking fresh cold ones.
+    rir.lambda_index = Some(lambda_id as usize);
     // ADR 0012 D-1 (closure-env capture fix) — record whether the
     // body builds a nested closure. If so, `try_dispatch_jit` must
     // install a params-bound invocation-frame env on JIT_CALLER_ENV

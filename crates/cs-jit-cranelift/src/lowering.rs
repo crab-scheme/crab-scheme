@@ -52,7 +52,7 @@ use cs_jit::JitError;
 use cs_rir::Block;
 use cs_rir::{Const, Function as RirFunction, Inst, Term, Value as RirValue};
 
-use crate::ic::IcTable;
+use crate::ic::{IcSlot, IcTable};
 
 /// Owns a Cranelift [`Module`] and emits one native function per
 /// `compile_uniform_nb` / `define_uniform_nb` call.
@@ -782,14 +782,15 @@ pub struct Lowerer<M: Module = JITModule> {
     /// FuncId of `vm_string_to_symbol_gc(s) -> i64`. ADR 0012 D-2
     /// (iter CY).
     string_to_symbol_func: cranelift_module::FuncId,
-    /// Per-module inline-cache slot storage. Indices into this
-    /// table identify call sites; the slot's address is intended
-    /// to be baked into JIT bodies as a constant pointer (ADR
-    /// 0012 D-1; design in `docs/research/jit_inline_cache.md`).
-    /// iter BR ships the table empty — call-site lowering (iter
-    /// BS+) is what allocates and references entries. Exposed
-    /// via [`Lowerer::ic_table_mut`] so future codegen can
-    /// reserve slots without reaching into private fields.
+    /// Per-module inline-cache slot storage, keyed by `(lambda_id,
+    /// site_idx)`. Every `Inst::Call`/`Inst::CallGeneral` site
+    /// lowered by `lower_inst_uniform_nb` asks this table for its
+    /// slot's address (via the per-compile `IcCtx`) and bakes that
+    /// address into the JIT body as a constant pointer (ADR 0012
+    /// D-1; design in `docs/research/jit_inline_cache.md`). cs-xop —
+    /// keying by lambda identity means a deopt recompile of the same
+    /// lambda reuses its call sites' warm slots instead of leaking
+    /// fresh cold ones.
     ic_table: IcTable,
 }
 
@@ -4663,25 +4664,24 @@ impl<M: Module> Lowerer<M> {
             string_copy_bang_func,
             symbol_to_string_func,
             string_to_symbol_func,
-            // iter BR: empty IC table. Iter BS+ will reserve a
-            // slot per Inst::Call as lowering walks the RIR.
+            // Empty IC table; `compile_inner_body_uniform_nb` reserves
+            // a slot per `Inst::Call`/`Inst::CallGeneral` site as
+            // lowering walks the RIR (see `IcCtx`).
             ic_table: IcTable::new(0),
             // AOT L3: JIT default keeps the outer trampoline Local.
             export_outer_as: None,
         })
     }
 
-    /// Mutable handle to the per-module IC table. Used by future
-    /// call-site lowering (iter BS+) to reserve a slot per
-    /// `Inst::Call`; iter BR exposes the accessor without any
-    /// in-tree caller so the shape can settle before codegen
-    /// piles on. See `docs/research/jit_inline_cache.md` §3.1.
+    /// Mutable handle to the per-module IC table. `ic_table_mut` has
+    /// no in-tree caller (lowering reaches the table through `self`
+    /// directly); kept as a public accessor for diagnostics and
+    /// tests. See `docs/research/jit_inline_cache.md` §3.1.
     pub fn ic_table_mut(&mut self) -> &mut IcTable {
         &mut self.ic_table
     }
 
-    /// Immutable view of the IC table. Tests and diagnostics
-    /// only — the lowering hot path uses `ic_table_mut`.
+    /// Immutable view of the IC table. Tests and diagnostics only.
     pub fn ic_table(&self) -> &IcTable {
         &self.ic_table
     }
@@ -5262,6 +5262,24 @@ impl<M: Module> Lowerer<M> {
         // is a proven raw Fixnum (a Fixnum param/const or an unboxed
         // arith result); consumers needing an NB carrier read value_map.
         let mut raw_map: HashMap<RirValue, cranelift_codegen::ir::Value> = HashMap::new();
+        // cs-xop — key this compile's IC slots by lambda identity so a
+        // deopt recompile of the same lambda reuses its warm slots
+        // instead of leaking fresh cold ones. `rir.lambda_index` is set
+        // by the runtime tier-up hook to `LambdaProfile::lambda_id` (a
+        // stable, process-wide, non-zero u32) — see `cs-runtime/src/
+        // jit.rs`. Callers that don't set it (AOT, hand-built test
+        // fixtures) get a namespaced fresh id via `fresh_id()`, tagged
+        // with the top bit so it can never collide with a real lambda_id
+        // (always < 2^32).
+        let ic_lambda_id = match rir.lambda_index {
+            Some(idx) => idx as u64,
+            None => self.fresh_id() | (1u64 << 63),
+        };
+        let mut ic_ctx = IcCtx {
+            table: &mut self.ic_table,
+            lambda_id: ic_lambda_id,
+            next_site: 0,
+        };
         {
             let mut builder = FunctionBuilder::new(&mut clif, &mut self.func_ctx);
             let nb_helpers = NbHelpers {
@@ -6163,6 +6181,7 @@ impl<M: Module> Lowerer<M> {
                         &nb_helpers,
                         &truncated,
                         raw_abi,
+                        &mut ic_ctx,
                     )?;
                     let args = tail_args.unwrap();
                     // iter-3 raw ABI: a tail self-call passes raw Fixnum
@@ -6207,6 +6226,7 @@ impl<M: Module> Lowerer<M> {
                         &nb_helpers,
                         &truncated,
                         raw_abi,
+                        &mut ic_ctx,
                     )?;
                     let callee_v = lookup(&value_map, callee)?;
                     let arg_vs: Vec<cranelift_codegen::ir::Value> = gargs
@@ -6238,6 +6258,7 @@ impl<M: Module> Lowerer<M> {
                         &nb_helpers,
                         blk,
                         raw_abi,
+                        &mut ic_ctx,
                     )?;
                     lower_terminator_uniform_nb(
                         &mut builder,
@@ -6965,6 +6986,32 @@ struct NbHelpers {
     make_string_buf: cranelift_codegen::ir::FuncRef,
 }
 
+/// cs-xop — threads the module's [`IcTable`] plus this compile's
+/// lambda identity through [`lower_inst_uniform_nb`] so each
+/// `Inst::Call` site asks the table for a stable, warm-state-
+/// preserving slot instead of `Box::leak`-ing a fresh one every
+/// compile. `next_site` is a per-compile ordinal — the call site's
+/// position among all `Inst::Call`/`CallGeneral` sites lowered for
+/// this lambda, in lowering order. It's reset to 0 once per
+/// `compile_inner_body_uniform_nb` call and threaded across every
+/// block (including the truncated tail-call blocks lowered
+/// separately), so a recompile of the same lambda that lowers its
+/// call sites in the same order asks for the same keys and reuses
+/// the same slots.
+struct IcCtx<'a> {
+    table: &'a mut IcTable,
+    lambda_id: u64,
+    next_site: u32,
+}
+
+impl<'a> IcCtx<'a> {
+    fn next_slot(&mut self) -> *const IcSlot {
+        let site = self.next_site;
+        self.next_site += 1;
+        self.table.get_or_alloc(self.lambda_id, site)
+    }
+}
+
 /// Stage 3 baseline-tier per-Inst lowering. Walks a single block's
 /// instructions and emits Cranelift IR for the supported subset.
 /// Returns `JitError::Unsupported(...)` on RIR variants the iter
@@ -6977,6 +7024,7 @@ fn lower_inst_uniform_nb(
     helpers: &NbHelpers,
     blk: &cs_rir::Block,
     raw_abi: bool,
+    ic_ctx: &mut IcCtx,
 ) -> Result<(), JitError> {
     for inst in &blk.insts {
         match inst {
@@ -7382,12 +7430,13 @@ fn lower_inst_uniform_nb(
                 let buf_addr = b.ins().stack_addr(I64, buf_slot, 0);
                 let n_args_v = b.ins().iconst(I64, n as i64);
 
-                // Per-site IC slot. Box::leak gives a stable
-                // process-lifetime address; the i64 constant baked
-                // into the body's pool is that address.
-                let ic_slot: &'static crate::ic::IcSlot =
-                    Box::leak(Box::new(crate::ic::IcSlot::new()));
-                let slot_ptr_const = ic_slot as *const crate::ic::IcSlot as i64;
+                // cs-xop — per-site IC slot, owned by the module's
+                // `IcTable` and keyed by (lambda_id, site ordinal) so a
+                // deopt recompile of this lambda reuses the same slot
+                // (and its warm state) instead of leaking a fresh cold
+                // one. The i64 constant baked into the body's pool is
+                // the slot's stable address.
+                let slot_ptr_const = ic_ctx.next_slot() as i64;
                 let slot_addr_v = b.ins().iconst(I64, slot_ptr_const);
 
                 // cs-hz5 — a single call to the fused helper. It does

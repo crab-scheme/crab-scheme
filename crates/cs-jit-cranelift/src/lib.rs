@@ -33,6 +33,13 @@ pub struct CraneliftBackend {
     /// `JitFn::cookie` -> finalized native pointer. Populated by
     /// [`compile`]; consumed by the runtime via [`native_ptr`].
     finalized: HashMap<u64, *const u8>,
+    /// cs-xop — `rir.lambda_index` (when set) -> the most recent
+    /// cookie compiled for that lambda. Lets [`compile`] recognize a
+    /// recompile of the same lambda (e.g. a deopt retry) and prune
+    /// the superseded cookie's `finalized` entry instead of
+    /// accumulating one stale bookkeeping entry per recompile for
+    /// the rest of the backend's lifetime.
+    finalized_by_lambda: HashMap<u64, u64>,
 }
 
 // SAFETY: The native pointers in `finalized` are owned by the
@@ -47,6 +54,7 @@ impl Default for CraneliftBackend {
             lowerer: None,
             next_cookie: 0,
             finalized: HashMap::new(),
+            finalized_by_lambda: HashMap::new(),
         }
     }
 }
@@ -67,6 +75,15 @@ impl JitBackend for CraneliftBackend {
         let ptr = lowerer.compile_uniform_nb(rir)?;
         let cookie = self.next_cookie;
         self.next_cookie += 1;
+        // cs-xop — a recompile of a lambda we've already compiled
+        // (same `lambda_index`) supersedes its prior cookie; drop that
+        // cookie's `finalized` entry instead of letting it linger
+        // forever now that nothing will ever look it up again.
+        if let Some(lambda_id) = rir.lambda_index {
+            if let Some(stale_cookie) = self.finalized_by_lambda.insert(lambda_id as u64, cookie) {
+                self.finalized.remove(&stale_cookie);
+            }
+        }
         self.finalized.insert(cookie, ptr);
         Ok(JitFn {
             backend: "cranelift",

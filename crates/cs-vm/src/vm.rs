@@ -253,6 +253,21 @@ thread_local! {
 /// why iter BS opts NOT to scan: the refcount-only invariant is
 /// strictly safer than conservative scanning under the consume-on-
 /// use ABI.
+///
+/// cs-xop — considered replacing the `RefCell<Vec<Rc<_>>>` backing
+/// `ACTIVE_JIT_FRAMES` with a `Cell`-based intrusive stack (each
+/// guard as a node, linked via a raw `prev` pointer, no `Vec`/
+/// `RefCell` at all). Declined: an intrusive node needs a stable
+/// address to link against, but `JitFrameGuard` is returned by value
+/// from `install()` and then bound to a local — Rust gives no
+/// language guarantee that the returned value isn't moved before
+/// settling into that binding (NRVO is a codegen detail, not a
+/// guarantee), so recording `&self as *const _` inside `install`
+/// would risk a stale link. Making that sound needs `Pin` (or a
+/// two-step "construct, then link" API the two call sites would have
+/// to opt into), which is more churn than this slimming pass
+/// justifies. The `Vec` push/pop this guard drives is already
+/// amortized O(1) with no allocation in the steady state.
 struct JitFrameGuard {
     pushed: bool,
 }
@@ -10247,7 +10262,18 @@ fn run_jit_body_once(
             }
         }
         for (i, nb) in args.iter().enumerate() {
-            argv[i] = unsafe { vm_value_clone_gc(nb.into_raw()) };
+            let raw = nb.into_raw();
+            // cs-xop — `vm_value_clone_gc` already no-ops for inline
+            // immediates (fixnums/booleans/characters/flonums own no
+            // refcount), but reaching that check still costs a real
+            // call. Inline the check here so the dispatch prologue
+            // skips the call entirely for the common all-immediate
+            // case instead of paying for it every JIT invocation.
+            argv[i] = if any_i64_is_inline(raw) {
+                raw
+            } else {
+                unsafe { vm_value_clone_gc(raw) }
+            };
         }
     } else {
         let param_types = closure.jit_param_types();
@@ -10297,7 +10323,12 @@ fn run_jit_body_once(
         let env = Env::child(closure.env.clone());
         let lam = &closure.bc.lambdas[closure.lambda_idx];
         for (name, nb) in lam.params.iter().zip(args.iter()) {
-            let cloned = unsafe { vm_value_clone_gc(nb.into_raw()) };
+            let raw = nb.into_raw();
+            let cloned = if any_i64_is_inline(raw) {
+                raw
+            } else {
+                unsafe { vm_value_clone_gc(raw) }
+            };
             env.define_nb(*name, NanboxValue(cloned));
         }
         // Named-let cycle break (CompiledLambda::self_bind): inner
