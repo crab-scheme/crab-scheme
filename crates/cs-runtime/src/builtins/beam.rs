@@ -476,6 +476,11 @@ pub fn primop_spawn_activation(source: String, handler: String) -> Result<ActorP
 /// invoke the handler with `ACTOR_CTX` pointing at this actor for the
 /// duration of that synchronous call only.
 async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: String) {
+    // cs-tds: see the matching comment in `green_source_body` — this
+    // future is pinned to one actor-dedicated `LocalWorkerPool` worker
+    // thread for its whole life, so disabling JIT tiering here needs no
+    // restore.
+    cs_vm::vm::set_jit_enabled(false);
     // Shared-Runtime: overlay this worker's shared base (builtins + bundled libs)
     // instead of a full Runtime::new() per actor (same lever as green_source_body).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
@@ -761,6 +766,13 @@ async fn green_source_body(
     entry: String,
     args: Vec<SendableValue>,
 ) {
+    // cs-tds: this whole future lives on one `LocalWorkerPool` worker
+    // thread for its entire life (tokio pins `spawn_local` tasks to the
+    // thread that owns their `LocalSet`), and that pool is dedicated to
+    // actor bodies — so disabling JIT tiering here is a once-per-task,
+    // no-restore-needed equivalent of disabling it once at worker-thread
+    // startup. See `cs_vm::vm::set_jit_enabled` doc.
+    cs_vm::vm::set_jit_enabled(false);
     // Shared-Runtime: a cheap per-actor Runtime overlaying this worker's shared
     // base (builtins + bundled libs), instead of a full `Runtime::new()` per
     // actor. The body's defines land in the per-actor overlay env; builtins /
@@ -1140,6 +1152,14 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // contexts never reach here, so the hook stays None and
     // the dispatch loop's per-op tick is a pure counter no-op.
     let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
+    // cs-tds: actor bodies run VM-only — the JIT is deliberately dropped
+    // for actors (perf/actor-vm-jit found it hung concurrent SET, with
+    // only marginal gain elsewhere). Clearing this per-invocation lets
+    // the Call/TailCall dispatch loop skip the tier-bump/jit_ptr checks
+    // that only matter for JIT tiering; a pooled worker thread reused by
+    // a non-actor caller has it restored to `true` by the Guard below.
+    let prev_jit_enabled = cs_vm::vm::jit_enabled();
+    cs_vm::vm::set_jit_enabled(false);
     // parallel-runtime C4.5: bridge the BR sweep's yield
     // hook to cs-vm's reduction counter. The same
     // per-iteration tick the bytecode dispatch loop uses
@@ -1154,6 +1174,7 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
         cs_gc::cycle_collector::install_sweep_yield_hook(Some(cs_vm::vm::vm_tick_reductions));
     struct Guard {
         prev_hook: Option<cs_vm::vm::VmYieldHook>,
+        prev_jit_enabled: bool,
         #[cfg(feature = "tracing-cycle-collector")]
         prev_sweep_hook: Option<cs_gc::cycle_collector::SweepYieldHook>,
     }
@@ -1165,12 +1186,14 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
             // pooled worker thread reused by a non-actor caller
             // doesn't see our hook.
             cs_vm::vm::install_yield_hook(self.prev_hook);
+            cs_vm::vm::set_jit_enabled(self.prev_jit_enabled);
             #[cfg(feature = "tracing-cycle-collector")]
             cs_gc::cycle_collector::install_sweep_yield_hook(self.prev_sweep_hook);
         }
     }
     let _g = Guard {
         prev_hook,
+        prev_jit_enabled,
         #[cfg(feature = "tracing-cycle-collector")]
         prev_sweep_hook,
     };

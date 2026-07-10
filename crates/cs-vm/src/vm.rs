@@ -10630,6 +10630,33 @@ pub fn reset_yield_count() {
     VM_YIELD_COUNT.with(|c| c.set(0));
 }
 
+thread_local! {
+    /// Whether the current thread ever dispatches through the JIT
+    /// (cs-tds). Actor `LocalSet` workers run VM-only — JIT is
+    /// deliberately dropped for actors (perf/actor-vm-jit found it hung
+    /// concurrent SET, with only marginal gain elsewhere) — yet every
+    /// `VmClosure` call was still paying for `profile.tier.bump()` and a
+    /// `jit_ptr()` null-check. `cs-actor`'s worker-thread entry point
+    /// clears this once per thread so the Call/TailCall dispatch loop
+    /// can skip that bookkeeping outright. Default `true` (every other
+    /// thread — tests, the CLI, non-actor embedding — keeps tiering up).
+    static VM_JIT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Set whether this thread's VM dispatch loop participates in JIT
+/// tiering. See [`VM_JIT_ENABLED`]. Intended to be called once, near
+/// the start of a worker thread's life (e.g. `cs-actor`'s
+/// `LocalWorkerPool` worker entry point).
+pub fn set_jit_enabled(enabled: bool) {
+    VM_JIT_ENABLED.with(|c| c.set(enabled));
+}
+
+/// Read whether this thread participates in JIT tiering. See
+/// [`VM_JIT_ENABLED`].
+pub fn jit_enabled() -> bool {
+    VM_JIT_ENABLED.with(|c| c.get())
+}
+
 /// Bump the reduction counter and fire the yield hook if the
 /// budget is exhausted. Called from the dispatch loop on every
 /// instruction, and (cs-gyb) from the JIT's tail-self back-edge
@@ -11356,6 +11383,9 @@ impl Procedure for VmClosure {
     fn name(&self) -> Option<&str> {
         Some("vm-closure")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmClosure
+    }
 }
 
 impl cs_gc::cycle::CycleVisit for VmClosure {
@@ -11807,6 +11837,55 @@ pub fn run(bc: &Bytecode, top_env: Rc<Env>, syms: &mut SymbolTable) -> Result<Va
     run_with_entry(Rc::new(bc.clone()), None, None, top_env, syms)
 }
 
+thread_local! {
+    /// Recycled `(ValueStack, Vec<Frame>)` pairs for [`run_with_entry`]
+    /// (cs-tds). A HO bridge call (`vm_call_sync` invoking a closure)
+    /// runs one full sub-VM per callback element — map/fold/filter/...
+    /// over an N-element list used to allocate a fresh `ValueStack` +
+    /// `Vec<Frame>` on every one of the N calls. Checking a pair out of
+    /// this pool (and back in on completion) turns the common tight-HO-
+    /// loop case into an amortized zero-alloc path.
+    static VM_RUN_SCRATCH: std::cell::RefCell<Vec<(ValueStack, Vec<Frame>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII handle for a checked-out `(ValueStack, Vec<Frame>)` scratch pair.
+/// Reentrancy-safe: each call takes its own pair from the pool (or
+/// allocates fresh if the pool is empty), so nested/recursive
+/// `run_with_entry` calls on the same thread never alias one pair.
+/// On normal drop, the pair is cleared and pushed back onto the pool.
+/// If the guard drops mid-panic-unwind, the pair is dropped instead of
+/// recycled — a frame/stack caught mid-unwind may be left in a partial
+/// state we don't want handed to the next call.
+struct RunScratchGuard(Option<(ValueStack, Vec<Frame>)>);
+
+impl RunScratchGuard {
+    fn checkout() -> Self {
+        let pair = VM_RUN_SCRATCH
+            .with(|p| p.borrow_mut().pop())
+            .unwrap_or_else(|| (ValueStack::new(), Vec::new()));
+        Self(Some(pair))
+    }
+
+    fn stack_frames(&mut self) -> (&mut ValueStack, &mut Vec<Frame>) {
+        let (stack, frames) = self.0.as_mut().expect("scratch pair checked out");
+        (stack, frames)
+    }
+}
+
+impl Drop for RunScratchGuard {
+    fn drop(&mut self) {
+        if let Some((mut stack, mut frames)) = self.0.take() {
+            if std::thread::panicking() {
+                return;
+            }
+            stack.truncate(0);
+            frames.clear();
+            VM_RUN_SCRATCH.with(|p| p.borrow_mut().push((stack, frames)));
+        }
+    }
+}
+
 /// Like [`run`] but accepts an already-shared `Rc<Bytecode>` (avoiding a
 /// heap allocation per call) and an optional `entry_insts`/`entry_spans`
 /// override for running a specific lambda body. `vm_call_sync` uses this
@@ -11820,16 +11899,17 @@ pub fn run_with_entry(
 ) -> Result<Value, VmError> {
     let insts = entry_insts.unwrap_or_else(|| bc.insts.clone());
     let spans = entry_spans.unwrap_or_else(|| bc.spans.clone());
-    let mut stack: ValueStack = ValueStack::new();
-    let mut frames: Vec<Frame> = vec![Frame {
+    let mut guard = RunScratchGuard::checkout();
+    let (stack, frames) = guard.stack_frames();
+    frames.push(Frame {
         insts,
         spans,
         ip: 0,
         env: top_env,
         bc,
         marks: None,
-    }];
-    let result = run_dispatch(&mut stack, &mut frames, syms);
+    });
+    let result = run_dispatch(stack, frames, syms);
     result.map_err(|mut e| {
         // Attach a backtrace: spans of the Call/TailCall instructions in
         // the outer frames at the point the error bubbled out. Innermost
@@ -12058,15 +12138,34 @@ fn run_dispatch(
                         .with_span(call_span));
                     }
                 };
-                {
-                    let any = func_proc.as_any();
-                    if let Some(closure) = any.downcast_ref::<VmClosure>() {
-                        let tier_bumped = closure.profile.tier.bump();
-                        if tier_bumped {
-                            let args = stack.slice_as_values(args_start..stack_len);
-                            fire_tier_up_hook(closure, &args);
+                // Single-dispatch on the discriminant (cs-tds): one enum
+                // load picks the arm instead of trying each concrete type
+                // in turn via a `downcast_ref` chain (each an independent
+                // `TypeId` compare). The `downcast_ref().unwrap()` inside
+                // each arm is infallible because `kind()` and the concrete
+                // impl are set together at the same `impl Procedure for`
+                // site — see cs_core::ProcKind.
+                match func_proc.kind() {
+                    cs_core::ProcKind::VmClosure => {
+                        let any = func_proc.as_any();
+                        let closure = any.downcast_ref::<VmClosure>().unwrap();
+                        let is_actor_worker = !jit_enabled();
+                        if !is_actor_worker {
+                            let tier_bumped = closure.profile.tier.bump();
+                            if tier_bumped {
+                                let args = stack.slice_as_values(args_start..stack_len);
+                                fire_tier_up_hook(closure, &args);
+                            }
                         }
-                        if !closure.jit_ptr().is_null() {
+                        if is_actor_worker {
+                            // Actor LocalSet workers run VM-only (JIT is
+                            // deliberately dropped for actors — perf/
+                            // actor-vm-jit found it hung concurrent SET
+                            // with only marginal gain). Skip the tier
+                            // bump/hook bookkeeping and the `jit_ptr()`
+                            // check below entirely; nothing installs a
+                            // jit_ptr on this thread anyway.
+                        } else if !closure.jit_ptr().is_null() {
                             // Stage 3: pull NB args via zero-cost copies
                             // into a stack-local array. No `Vec<Value>`
                             // materialization on the JIT dispatch boundary.
@@ -12182,7 +12281,9 @@ fn run_dispatch(
                         }
                         continue;
                     }
-                    if let Some(b) = any.downcast_ref::<VmBuiltin>() {
+                    cs_core::ProcKind::VmBuiltin => {
+                        let any = func_proc.as_any();
+                        let b = any.downcast_ref::<VmBuiltin>().unwrap();
                         // cs-h5v: for the tagged data-primitive builtins,
                         // try the inline fast path first — skips the
                         // arg-Vec materialization and indirect `(b.f)`
@@ -12227,7 +12328,9 @@ fn run_dispatch(
                         }
                         continue;
                     }
-                    if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
+                    cs_core::ProcKind::VmHostBuiltin => {
+                        let any = func_proc.as_any();
+                        let h = any.downcast_ref::<VmHostBuiltin>().unwrap();
                         let name = h.name;
                         let args = stack.slice_as_values_small(args_start..stack_len);
                         let raw = (h.f)(&args);
@@ -12249,7 +12352,9 @@ fn run_dispatch(
                         }
                         continue;
                     }
-                    if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
+                    cs_core::ProcKind::VmBuiltinSyms => {
+                        let any = func_proc.as_any();
+                        let b = any.downcast_ref::<VmBuiltinSyms>().unwrap();
                         let name = b.name;
                         let args = stack.slice_as_values_small(args_start..stack_len);
                         let raw = (b.f)(&args, syms);
@@ -12271,7 +12376,9 @@ fn run_dispatch(
                         }
                         continue;
                     }
-                    if let Some(param) = any.downcast_ref::<cs_core::Parameter>() {
+                    cs_core::ProcKind::Parameter => {
+                        let any = func_proc.as_any();
+                        let param = any.downcast_ref::<cs_core::Parameter>().unwrap();
                         let r = if n == 0 {
                             param.cell.borrow().clone()
                         } else if n == 1 {
@@ -12301,7 +12408,9 @@ fn run_dispatch(
                     //    next instruction.
                     // 2. No snapshot: fall back to the legacy
                     //    escape-only path via pending_escape unwind.
-                    if let Some(k) = any.downcast_ref::<VmContinuation>() {
+                    cs_core::ProcKind::VmContinuation => {
+                        let any = func_proc.as_any();
+                        let k = any.downcast_ref::<VmContinuation>().unwrap();
                         let v = if n == 0 {
                             Value::Unspecified
                         } else {
@@ -12326,6 +12435,10 @@ fn run_dispatch(
                         set_pending_escape(k.id, v);
                         return Err(VmError::new("__escape__"));
                     }
+                    // Every other kind (HO markers, exception/port/eval
+                    // markers, AOT closures, ...) falls through to the
+                    // slow path below, unchanged.
+                    _ => {}
                 }
                 // SLOW PATH: drain into Vec<Value> and pop func for HO marker
                 // dispatch. (map/fold/filter/raise/with-exception-handler/...)
@@ -14325,6 +14438,9 @@ impl Procedure for VmBuiltin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmBuiltin
+    }
 }
 
 /// Expected argument count for a [`DataPrimOp`]. The `Call` dispatch
@@ -14472,6 +14588,9 @@ impl Procedure for VmBuiltinSyms {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmBuiltinSyms
+    }
 }
 
 pub fn make_vm_builtin(name: &'static str, f: VmBuiltinFn) -> Value {
@@ -14527,6 +14646,9 @@ impl Procedure for VmHostBuiltin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmHostBuiltin
+    }
 }
 
 pub fn make_vm_host_builtin(
@@ -14548,6 +14670,9 @@ impl Procedure for VmApply {
     }
     fn name(&self) -> Option<&str> {
         Some("apply")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmApply
     }
 }
 
@@ -14577,6 +14702,9 @@ impl Procedure for VmMap {
     fn name(&self) -> Option<&str> {
         Some("map")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmMap
+    }
 }
 impl Procedure for VmForEach {
     fn as_any(&self) -> &dyn Any {
@@ -14584,6 +14712,9 @@ impl Procedure for VmForEach {
     }
     fn name(&self) -> Option<&str> {
         Some("for-each")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmForEach
     }
 }
 impl Procedure for VmFilter {
@@ -14593,6 +14724,9 @@ impl Procedure for VmFilter {
     fn name(&self) -> Option<&str> {
         Some("filter")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmFilter
+    }
 }
 impl Procedure for VmFind {
     fn as_any(&self) -> &dyn Any {
@@ -14600,6 +14734,9 @@ impl Procedure for VmFind {
     }
     fn name(&self) -> Option<&str> {
         Some("find")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmFind
     }
 }
 impl Procedure for VmAny {
@@ -14609,6 +14746,9 @@ impl Procedure for VmAny {
     fn name(&self) -> Option<&str> {
         Some("any")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmAny
+    }
 }
 impl Procedure for VmEvery {
     fn as_any(&self) -> &dyn Any {
@@ -14616,6 +14756,9 @@ impl Procedure for VmEvery {
     }
     fn name(&self) -> Option<&str> {
         Some("every")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmEvery
     }
 }
 
@@ -14661,6 +14804,9 @@ impl Procedure for VmFoldLeft {
     fn name(&self) -> Option<&str> {
         Some("fold-left")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmFoldLeft
+    }
 }
 impl Procedure for VmFoldRight {
     fn as_any(&self) -> &dyn Any {
@@ -14668,6 +14814,9 @@ impl Procedure for VmFoldRight {
     }
     fn name(&self) -> Option<&str> {
         Some("fold-right")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmFoldRight
     }
 }
 impl Procedure for VmReduce {
@@ -14677,6 +14826,9 @@ impl Procedure for VmReduce {
     fn name(&self) -> Option<&str> {
         Some("reduce")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmReduce
+    }
 }
 impl Procedure for VmCount {
     fn as_any(&self) -> &dyn Any {
@@ -14684,6 +14836,9 @@ impl Procedure for VmCount {
     }
     fn name(&self) -> Option<&str> {
         Some("count")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmCount
     }
 }
 impl Procedure for VmPartition {
@@ -14693,6 +14848,9 @@ impl Procedure for VmPartition {
     fn name(&self) -> Option<&str> {
         Some("partition")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmPartition
+    }
 }
 impl Procedure for VmValues {
     fn as_any(&self) -> &dyn Any {
@@ -14701,6 +14859,9 @@ impl Procedure for VmValues {
     fn name(&self) -> Option<&str> {
         Some("values")
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmValues
+    }
 }
 impl Procedure for VmCallWithValues {
     fn as_any(&self) -> &dyn Any {
@@ -14708,6 +14869,9 @@ impl Procedure for VmCallWithValues {
     }
     fn name(&self) -> Option<&str> {
         Some("call-with-values")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmCallWithValues
     }
 }
 
@@ -14764,13 +14928,16 @@ pub struct VmVectorSort;
 pub struct VmVectorSortBang;
 
 macro_rules! impl_proc_named {
-    ($t:ty, $name:expr) => {
+    ($t:ident, $name:expr) => {
         impl Procedure for $t {
             fn as_any(&self) -> &dyn Any {
                 self
             }
             fn name(&self) -> Option<&str> {
                 Some($name)
+            }
+            fn kind(&self) -> cs_core::ProcKind {
+                cs_core::ProcKind::$t
             }
         }
     };
@@ -15142,22 +15309,128 @@ pub fn vm_call_sync(
     match func {
         Value::Procedure(p) => {
             let any = p.as_any();
-            if let Some(b) = any.downcast_ref::<VmBuiltin>() {
-                return (b.f)(args).map_err(|e| VmError::new(format!("{}: {}", b.name, e)));
-            }
-            if let Some(b) = any.downcast_ref::<VmBuiltinSyms>() {
-                return (b.f)(args, syms).map_err(|e| VmError::new(format!("{}: {}", b.name, e)));
-            }
-            if let Some(h) = any.downcast_ref::<VmHostBuiltin>() {
-                return (h.f)(args).map_err(|e| VmError::new(format!("{}: {}", h.name, e)));
+            match p.kind() {
+                cs_core::ProcKind::VmBuiltin => {
+                    let b = any.downcast_ref::<VmBuiltin>().unwrap();
+                    return (b.f)(args).map_err(|e| VmError::new(format!("{}: {}", b.name, e)));
+                }
+                cs_core::ProcKind::VmBuiltinSyms => {
+                    let b = any.downcast_ref::<VmBuiltinSyms>().unwrap();
+                    return (b.f)(args, syms)
+                        .map_err(|e| VmError::new(format!("{}: {}", b.name, e)));
+                }
+                cs_core::ProcKind::VmHostBuiltin => {
+                    let h = any.downcast_ref::<VmHostBuiltin>().unwrap();
+                    return (h.f)(args).map_err(|e| VmError::new(format!("{}: {}", h.name, e)));
+                }
+                cs_core::ProcKind::VmApply => {
+                    if args.is_empty() {
+                        return Err(VmError::new("apply: 0 args"));
+                    }
+                    let inner = args[0].clone();
+                    let mut spread: Vec<Value> = args[1..args.len().saturating_sub(1)].to_vec();
+                    if args.len() >= 2 {
+                        let last = args[args.len() - 1].clone();
+                        let mut cur = last;
+                        loop {
+                            match cur {
+                                Value::Null => break,
+                                Value::Pair(p) => {
+                                    spread.push(p.car());
+                                    cur = p.cdr();
+                                }
+                                other => {
+                                    return Err(VmError::new(format!(
+                                        "apply: non-list tail ({})",
+                                        other.type_name()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    return vm_call_sync(&inner, &spread, syms);
+                }
+                cs_core::ProcKind::VmContinuation => {
+                    let k = any.downcast_ref::<VmContinuation>().unwrap();
+                    let v = if args.is_empty() {
+                        Value::Unspecified
+                    } else {
+                        args[0].clone()
+                    };
+                    set_pending_escape(k.id, v);
+                    return Err(VmError::new("__escape__"));
+                }
+                cs_core::ProcKind::VmValues => {
+                    if args.len() == 1 {
+                        return Ok(args[0].clone());
+                    }
+                    set_pending_values(args.to_vec());
+                    return Ok(Value::Unspecified);
+                }
+                cs_core::ProcKind::VmCallWithValues => {
+                    if args.len() != 2 {
+                        return Err(VmError::new("call-with-values: 2 args"));
+                    }
+                    let prev = take_pending_values();
+                    let prod_result = vm_call_sync(&args[0], &[], syms)?;
+                    let values = if let Some(vs) = take_pending_values() {
+                        vs
+                    } else {
+                        vec![prod_result]
+                    };
+                    if let Some(prev) = prev {
+                        set_pending_values(prev);
+                    }
+                    return vm_call_sync(&args[1], &values, syms);
+                }
+                // Recursively dispatch HO markers when they're called as
+                // the procedure target of vm_call_sync (e.g. (apply map
+                // proc lst)). Covers both the "pending-values" HO family
+                // (matched individually above) and every marker
+                // `ho_apply`/`is_pure_ho_marker` used to test via a
+                // downcast_ref chain.
+                cs_core::ProcKind::VmMap
+                | cs_core::ProcKind::VmForEach
+                | cs_core::ProcKind::VmFilter
+                | cs_core::ProcKind::VmFind
+                | cs_core::ProcKind::VmAny
+                | cs_core::ProcKind::VmEvery
+                | cs_core::ProcKind::VmFoldLeft
+                | cs_core::ProcKind::VmFoldRight
+                | cs_core::ProcKind::VmReduce
+                | cs_core::ProcKind::VmCount
+                | cs_core::ProcKind::VmPartition
+                | cs_core::ProcKind::VmVectorMap
+                | cs_core::ProcKind::VmVectorForEach
+                | cs_core::ProcKind::VmVectorFold
+                | cs_core::ProcKind::VmVectorFilter
+                | cs_core::ProcKind::VmStringMap
+                | cs_core::ProcKind::VmStringForEach
+                | cs_core::ProcKind::VmHashtableWalk
+                | cs_core::ProcKind::VmHashtableForEach
+                | cs_core::ProcKind::VmHashtableFold
+                | cs_core::ProcKind::VmHashtableUpdate
+                | cs_core::ProcKind::VmUnfold
+                | cs_core::ProcKind::VmListSort
+                | cs_core::ProcKind::VmVectorSort
+                | cs_core::ProcKind::VmVectorSortBang
+                | cs_core::ProcKind::VmTabulate
+                | cs_core::ProcKind::VmRemove
+                | cs_core::ProcKind::VmForce => {
+                    return ho_apply(func, args, syms);
+                }
+                _ => {}
             }
             if let Some(c) = any.downcast_ref::<VmClosure>() {
-                if c.profile.tier.bump() {
-                    fire_tier_up_hook(c, args);
-                }
-                if !c.jit_ptr().is_null() {
-                    if let Some(result) = try_dispatch_jit(c, args, syms) {
-                        return Ok(result);
+                let is_actor_worker = !jit_enabled();
+                if !is_actor_worker {
+                    if c.profile.tier.bump() {
+                        fire_tier_up_hook(c, args);
+                    }
+                    if !c.jit_ptr().is_null() {
+                        if let Some(result) = try_dispatch_jit(c, args, syms) {
+                            return Ok(result);
+                        }
                     }
                 }
                 let lam = &c.bc.lambdas[c.lambda_idx];
@@ -15194,82 +15467,11 @@ pub fn vm_call_sync(
                     syms,
                 );
             }
-            if any.downcast_ref::<VmApply>().is_some() {
-                if args.is_empty() {
-                    return Err(VmError::new("apply: 0 args"));
-                }
-                let inner = args[0].clone();
-                let mut spread: Vec<Value> = args[1..args.len().saturating_sub(1)].to_vec();
-                if args.len() >= 2 {
-                    let last = args[args.len() - 1].clone();
-                    let mut cur = last;
-                    loop {
-                        match cur {
-                            Value::Null => break,
-                            Value::Pair(p) => {
-                                spread.push(p.car());
-                                cur = p.cdr();
-                            }
-                            other => {
-                                return Err(VmError::new(format!(
-                                    "apply: non-list tail ({})",
-                                    other.type_name()
-                                )));
-                            }
-                        }
-                    }
-                }
-                return vm_call_sync(&inner, &spread, syms);
-            }
-            if let Some(k) = any.downcast_ref::<VmContinuation>() {
-                let v = if args.is_empty() {
-                    Value::Unspecified
-                } else {
-                    args[0].clone()
-                };
-                set_pending_escape(k.id, v);
-                return Err(VmError::new("__escape__"));
-            }
-            if any.downcast_ref::<VmValues>().is_some() {
-                if args.len() == 1 {
-                    return Ok(args[0].clone());
-                }
-                set_pending_values(args.to_vec());
-                return Ok(Value::Unspecified);
-            }
-            if any.downcast_ref::<VmCallWithValues>().is_some() {
-                if args.len() != 2 {
-                    return Err(VmError::new("call-with-values: 2 args"));
-                }
-                let prev = take_pending_values();
-                let prod_result = vm_call_sync(&args[0], &[], syms)?;
-                let values = if let Some(vs) = take_pending_values() {
-                    vs
-                } else {
-                    vec![prod_result]
-                };
-                if let Some(prev) = prev {
-                    set_pending_values(prev);
-                }
-                return vm_call_sync(&args[1], &values, syms);
-            }
-            // Recursively dispatch HO markers when they're called as the
-            // procedure target of vm_call_sync (e.g. (apply map proc lst)).
-            if any.downcast_ref::<VmMap>().is_some()
-                || any.downcast_ref::<VmForEach>().is_some()
-                || any.downcast_ref::<VmFilter>().is_some()
-                || any.downcast_ref::<VmFind>().is_some()
-                || any.downcast_ref::<VmAny>().is_some()
-                || any.downcast_ref::<VmEvery>().is_some()
-                || any.downcast_ref::<VmFoldLeft>().is_some()
-                || any.downcast_ref::<VmFoldRight>().is_some()
-                || any.downcast_ref::<VmReduce>().is_some()
-                || any.downcast_ref::<VmCount>().is_some()
-                || any.downcast_ref::<VmPartition>().is_some()
-                || is_pure_ho_marker(p.as_ref())
-            {
-                return ho_apply(func, args, syms);
-            }
+            // Every other kind (VmApply, VmContinuation, VmValues,
+            // VmCallWithValues, the HO-marker family) already returned
+            // above via the `match p.kind()`; anything left here (e.g.
+            // `ProcKind::Other`, or a non-VmClosure kind whose `if let`
+            // above declined) is genuinely unsupported in this context.
             Err(VmError::new("unsupported procedure type in vm_call_sync"))
         }
         _ => Err(VmError::new("not a procedure")),
@@ -16208,6 +16410,9 @@ impl cs_core::Procedure for VmAotClosure {
     }
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::VmAotClosure
     }
 }
 

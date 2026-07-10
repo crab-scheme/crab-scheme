@@ -20,7 +20,7 @@ pub use number::{NumError, Number};
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{
     make_parameter, CustomHashFns, FileOutputState, Hashtable, HtEqKind, Pair, Parameter, Port,
-    Procedure, Promise, PromiseState, StringInputState, Value, WriteMode,
+    ProcKind, Procedure, Promise, PromiseState, StringInputState, Value, WriteMode,
 };
 
 /// Re-export `Gc<T>` from `cs-gc` so the rest of the workspace can refer

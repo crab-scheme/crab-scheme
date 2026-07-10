@@ -40,6 +40,9 @@ impl Procedure for Builtin {
     fn name(&self) -> Option<&str> {
         Some(self.name)
     }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::Builtin
+    }
     // Builtin is a leaf — inherits the empty default
     // visit_closure_children from the Procedure trait under
     // countable-memory.
@@ -60,6 +63,9 @@ impl Procedure for Closure {
     }
     fn name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::Closure
     }
     fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
         // Dedup on the closure's own Rc identity AND descend
@@ -93,6 +99,9 @@ impl Procedure for Continuation {
     }
     fn name(&self) -> Option<&str> {
         Some("continuation")
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::Continuation
     }
     // Leaf — empty default visit_closure_children suffices.
 }
@@ -135,6 +144,9 @@ impl Procedure for HostBuiltin {
     }
     fn name(&self) -> Option<&str> {
         Some(self.name)
+    }
+    fn kind(&self) -> cs_core::ProcKind {
+        cs_core::ProcKind::HostBuiltin
     }
     // Empty default visit_closure_children — see Trace doc below
     // for why the FFI surface holds no traceable Scheme values.
