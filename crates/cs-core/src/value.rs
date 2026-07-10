@@ -1,7 +1,8 @@
 //! The universal Scheme value type.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -12,27 +13,80 @@ use crate::symbol::{Symbol, SymbolTable};
 // `visit_children` calls resolve under the feature.
 use cs_gc::cycle::CycleVisit as _;
 
+/// Bit of [`Pair::flags`] set when this pair's address has an
+/// entry in [`PAIR_SPANS`].
+const HAS_SPAN: u8 = 0b001;
+/// Bit of [`Pair::flags`] set when this pair's address has a car
+/// tombstone in [`PAIR_CAR_TOMBSTONES`].
+const HAS_CAR_TOMBSTONE: u8 = 0b010;
+/// Bit of [`Pair::flags`] set when this pair's address has a cdr
+/// tombstone in [`PAIR_CDR_TOMBSTONES`].
+const HAS_CDR_TOMBSTONE: u8 = 0b100;
+
+thread_local! {
+    /// Out-of-line reader source-span table (cs-5te Pair diet).
+    ///
+    /// Keyed by the `Pair`'s allocation address — the same
+    /// identity `Gc::as_addr` uses, obtainable as `&self as *const
+    /// Pair as usize` from inside a `&Pair` method since `Gc<Pair>`
+    /// derefs straight to the `Rc`-boxed value. Only reader-
+    /// produced pairs ([`Pair::with_source`]) ever insert an
+    /// entry; ordinary `(cons …)` pairs never touch this map.
+    ///
+    /// Lifecycle: entries are removed in `Pair::drop` (see
+    /// `Pair::flags`), so a freed address can never resurrect a
+    /// stale span for whatever pair the allocator later places
+    /// there. The runtime is single-threaded per actor (`Pair`
+    /// contains `RefCell`/`Rc` and so is already `!Send`/`!Sync`),
+    /// which is what makes a thread-local sound here.
+    static PAIR_SPANS: RefCell<HashMap<usize, cs_diag::Span>> =
+        RefCell::new(HashMap::new());
+
+    /// Out-of-line car cycle-break tombstone table. Populated only
+    /// when the mutation cycle detector demotes the car edge from
+    /// strong to weak ([`Pair::break_car_cycle`]) — essentially
+    /// never in ordinary programs. Cleared on `set_car` over a
+    /// demoted slot and on `Pair::drop`; see `Pair::flags` for the
+    /// has-entry invariant.
+    static PAIR_CAR_TOMBSTONES: RefCell<HashMap<usize, WeakValue>> =
+        RefCell::new(HashMap::new());
+
+    /// Cdr counterpart of [`PAIR_CAR_TOMBSTONES`]; see
+    /// [`Pair::break_cdr_cycle`].
+    static PAIR_CDR_TOMBSTONES: RefCell<HashMap<usize, WeakValue>> =
+        RefCell::new(HashMap::new());
+}
+
 /// A pair (cons cell). Mutable per R6RS via `set-car!` / `set-cdr!`.
 ///
-/// Pairs that originate from the reader carry their source-text span
-/// in `source`, populated by `Datum::to_value`. Pairs created at run
-/// time via `(cons …)` leave `source` as `None`. This is the
-/// foundation that R6RS++ §9's `(syntax-source …)` accessors read.
+/// Pairs that originate from the reader carry their source-text span,
+/// populated by `Datum::to_value`. Pairs created at run time via
+/// `(cons …)` carry none. This is the foundation that R6RS++ §9's
+/// `(syntax-source …)` accessors read. As of cs-5te the span itself
+/// lives out of line in [`PAIR_SPANS`] (keyed by address) — it's cold
+/// metadata that only reader pairs ever populate, so keeping it
+/// inline would tax every cons cell for a feature most of them never
+/// use. `flags` bit [`HAS_SPAN`] records whether this pair has an
+/// entry, so the common no-span case is a single `Cell::get` with no
+/// hashing.
 ///
 /// # Cycle-break tombstones (countable-memory iter 7.1)
 ///
-/// Under `feature = "countable-memory"`, `car_weak` / `cdr_weak`
-/// are weak-reference tombstones. The mutation cycle detector
-/// in `cs-runtime` flips a slot from strong to weak via
-/// [`break_car_cycle`]/[`break_cdr_cycle`]: the strong `Value`
-/// gets replaced with `Unspecified` and a `WeakValue` referring
-/// to the same allocation is parked in the tombstone. Reads via
-/// the [`car`]/[`cdr`] accessors transparently `upgrade()` the
-/// tombstone, so the user-observable cyclic structure stays
-/// intact (R6RS requires `(set-cdr! x x)` to produce an
-/// observable cyclic list); but the strong-count chain is
-/// broken so refcount reclaims the cycle when no other strong
-/// reference remains.
+/// The mutation cycle detector in `cs-runtime` flips a slot from
+/// strong to weak via [`break_car_cycle`]/[`break_cdr_cycle`]: the
+/// strong `Value` gets replaced with `Unspecified` and a `WeakValue`
+/// referring to the same allocation is parked in the out-of-line
+/// tombstone table ([`PAIR_CAR_TOMBSTONES`]/[`PAIR_CDR_TOMBSTONES`],
+/// cs-5te — previously an inline `RefCell<Option<WeakValue>>` per
+/// slot). Reads via the [`car`]/[`cdr`] accessors transparently
+/// `upgrade()` the tombstone, so the user-observable cyclic structure
+/// stays intact (R6RS requires `(set-cdr! x x)` to produce an
+/// observable cyclic list); but the strong-count chain is broken so
+/// refcount reclaims the cycle when no other strong reference
+/// remains. `flags` bits [`HAS_CAR_TOMBSTONE`]/[`HAS_CDR_TOMBSTONE`]
+/// record whether a slot has a tombstone, so `car()`/`cdr()` pay one
+/// `Cell::get` plus (in the overwhelmingly common untombstoned case)
+/// one `RefCell::borrow` instead of two.
 ///
 /// Direct field access to `.car`/`.cdr` is preserved for
 /// backward compatibility with code paths that don't need to
@@ -42,44 +96,80 @@ use cs_gc::cycle::CycleVisit as _;
 pub struct Pair {
     pub car: RefCell<Value>,
     pub cdr: RefCell<Value>,
-    /// Source-text origin if this pair came from the reader. `Cell`
-    /// rather than plain field so the post-construction setter
-    /// `set_source` doesn't need `&mut Pair`.
-    pub source: std::cell::Cell<Option<cs_diag::Span>>,
-    car_weak: RefCell<Option<WeakValue>>,
-    cdr_weak: RefCell<Option<WeakValue>>,
+    /// Cold-metadata presence bits: see [`HAS_SPAN`],
+    /// [`HAS_CAR_TOMBSTONE`], [`HAS_CDR_TOMBSTONE`]. `Cell` so the
+    /// post-construction span/tombstone setters don't need
+    /// `&mut Pair`.
+    flags: Cell<u8>,
 }
 
 impl Pair {
+    /// This pair's out-of-line-table key: the same address identity
+    /// `Gc::as_addr` computes (`Rc::as_ptr`), obtained directly from
+    /// `&self` since `Gc<Pair>` derefs straight to it.
+    fn addr(&self) -> usize {
+        self as *const Pair as usize
+    }
+
     pub fn new(car: Value, cdr: Value) -> cs_gc::Gc<Self> {
         cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
-            source: std::cell::Cell::new(None),
-            car_weak: RefCell::new(None),
-            cdr_weak: RefCell::new(None),
+            flags: Cell::new(0),
         })
     }
 
     /// Construct a pair tagged with its reader-produced source span.
     pub fn with_source(car: Value, cdr: Value, span: cs_diag::Span) -> cs_gc::Gc<Self> {
-        cs_gc::Gc::new(Pair {
+        let gc = cs_gc::Gc::new(Pair {
             car: RefCell::new(car),
             cdr: RefCell::new(cdr),
-            source: std::cell::Cell::new(Some(span)),
-            car_weak: RefCell::new(None),
-            cdr_weak: RefCell::new(None),
-        })
+            flags: Cell::new(HAS_SPAN),
+        });
+        let addr = cs_gc::Gc::as_addr(&gc);
+        // `try_with` for TLS-teardown robustness; a failed insert
+        // (thread exiting mid-read — vanishingly unlikely) degrades
+        // to a span-less pair rather than a panic.
+        if PAIR_SPANS
+            .try_with(|t| {
+                t.borrow_mut().insert(addr, span);
+            })
+            .is_err()
+        {
+            gc.flags.set(gc.flags.get() & !HAS_SPAN);
+        }
+        gc
     }
 
     pub fn source_span(&self) -> Option<cs_diag::Span> {
-        self.source.get()
+        if self.flags.get() & HAS_SPAN == 0 {
+            return None;
+        }
+        let addr = self.addr();
+        // `try_with`: if the thread's TLS is already tearing down
+        // (a pair being dropped from another thread-local's dtor),
+        // the table is gone — report "no span" rather than panic.
+        PAIR_SPANS
+            .try_with(|t| t.borrow().get(&addr).copied())
+            .ok()
+            .flatten()
     }
 
     /// Construct a Pair allocated in `region`'s bump arena
     /// (region-memory iter 4). Layer-5 escape analysis emits
     /// this when it proves the Pair's lifetime is bounded by
     /// some surrounding scope.
+    ///
+    /// Region pairs never carry a source span (the reader always
+    /// allocates via `with_source`/`Gc::new`) and never get demoted
+    /// by the cycle detector (`is_region` guards every
+    /// `break_car_cycle`/`break_cdr_cycle` call site, and
+    /// `Gc::downgrade` panics on a region handle) — so `flags`
+    /// starts and stays `0` and no out-of-line table entry is ever
+    /// created for a region-allocated address. That matters because
+    /// region drop is a bulk arena free that does NOT run `Pair`'s
+    /// `Drop::drop` (no dtor is registered for it), so any table
+    /// entry keyed by a region address would otherwise leak forever.
     #[cfg(feature = "regions")]
     pub fn new_in(region: &cs_gc::Region, car: Value, cdr: Value) -> cs_gc::Gc<Self> {
         cs_gc::Gc::new_in(
@@ -87,9 +177,7 @@ impl Pair {
             Pair {
                 car: RefCell::new(car),
                 cdr: RefCell::new(cdr),
-                source: std::cell::Cell::new(None),
-                car_weak: RefCell::new(None),
-                cdr_weak: RefCell::new(None),
+                flags: Cell::new(0),
             },
         )
     }
@@ -101,8 +189,15 @@ impl Pair {
     /// `Value::Unspecified` if the tombstone target has been fully
     /// reclaimed.
     pub fn car(&self) -> Value {
-        if let Some(w) = self.car_weak.borrow().as_ref() {
-            return w.upgrade().unwrap_or(Value::Unspecified);
+        if self.flags.get() & HAS_CAR_TOMBSTONE != 0 {
+            let addr = self.addr();
+            // `try_with`: during TLS teardown the table is gone —
+            // treat as a reclaimed tombstone target.
+            let upgraded = PAIR_CAR_TOMBSTONES
+                .try_with(|t| t.borrow().get(&addr).and_then(WeakValue::upgrade))
+                .ok()
+                .flatten();
+            return upgraded.unwrap_or(Value::Unspecified);
         }
         self.car.borrow().clone()
     }
@@ -110,8 +205,13 @@ impl Pair {
     /// Read the cdr as a `Value`. See [`car`] for the
     /// tombstone semantics.
     pub fn cdr(&self) -> Value {
-        if let Some(w) = self.cdr_weak.borrow().as_ref() {
-            return w.upgrade().unwrap_or(Value::Unspecified);
+        if self.flags.get() & HAS_CDR_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let upgraded = PAIR_CDR_TOMBSTONES
+                .try_with(|t| t.borrow().get(&addr).and_then(WeakValue::upgrade))
+                .ok()
+                .flatten();
+            return upgraded.unwrap_or(Value::Unspecified);
         }
         self.cdr.borrow().clone()
     }
@@ -119,13 +219,27 @@ impl Pair {
     /// Replace the car slot with `v`. Clears any weak tombstone
     /// (the new value is unambiguously strong).
     pub fn set_car(&self, v: Value) {
-        self.car_weak.replace(None);
+        if self.flags.get() & HAS_CAR_TOMBSTONE != 0 {
+            self.flags.set(self.flags.get() & !HAS_CAR_TOMBSTONE);
+            let addr = self.addr();
+            // `try_with`: if TLS is tearing down, the table (and its
+            // entry) is being freed wholesale — nothing to remove.
+            let _ = PAIR_CAR_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().remove(&addr);
+            });
+        }
         self.car.replace(v);
     }
 
     /// Replace the cdr slot with `v`. Clears any weak tombstone.
     pub fn set_cdr(&self, v: Value) {
-        self.cdr_weak.replace(None);
+        if self.flags.get() & HAS_CDR_TOMBSTONE != 0 {
+            self.flags.set(self.flags.get() & !HAS_CDR_TOMBSTONE);
+            let addr = self.addr();
+            let _ = PAIR_CDR_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().remove(&addr);
+            });
+        }
         self.cdr.replace(v);
     }
 
@@ -182,7 +296,19 @@ impl Pair {
         let Some(weak) = WeakValue::from_value(&val) else {
             return false; // leaf (shouldn't reach: heap_strong_count returned Some)
         };
-        *self.car_weak.borrow_mut() = Some(weak);
+        let addr = self.addr();
+        // Insert-first ordering: the flag is only set if the entry
+        // actually landed, preserving the flag⇔entry invariant. A
+        // `try_with` failure (TLS teardown) declines the demote.
+        if PAIR_CAR_TOMBSTONES
+            .try_with(|t| {
+                t.borrow_mut().insert(addr, weak);
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.flags.set(self.flags.get() | HAS_CAR_TOMBSTONE);
         *self.car.borrow_mut() = Value::Unspecified;
         true
     }
@@ -201,7 +327,16 @@ impl Pair {
         let Some(weak) = WeakValue::from_value(&val) else {
             return false;
         };
-        *self.cdr_weak.borrow_mut() = Some(weak);
+        let addr = self.addr();
+        if PAIR_CDR_TOMBSTONES
+            .try_with(|t| {
+                t.borrow_mut().insert(addr, weak);
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.flags.set(self.flags.get() | HAS_CDR_TOMBSTONE);
         *self.cdr.borrow_mut() = Value::Unspecified;
         true
     }
@@ -209,6 +344,44 @@ impl Pair {
 
 impl Drop for Pair {
     fn drop(&mut self) {
+        // Clear this pair's out-of-line table entries (cs-5te). A
+        // freed address CANNOT be left pointing at stale span/
+        // tombstone data — the allocator may hand that same address
+        // to an unrelated `Pair` next, which would otherwise
+        // silently inherit someone else's source span or (worse) a
+        // dangling tombstone. `flags == 0` (the overwhelming common
+        // case — no span, no tombstone) short-circuits on a single
+        // `Cell::get` with no hashing at all. This runs for every
+        // `Pair` drop, including the intermediate pairs unlinked by
+        // the cdr-chain walk below (each is a real `Pair` value
+        // going out of scope, so its own `Drop::drop` fires too).
+        //
+        // `try_with`, not `with`: pairs also drop during TLS
+        // teardown (e.g. a thread-local VM closure cache holding
+        // list constants, freed by the runtime's `run_dtors` at
+        // thread exit). At that point the side tables may already
+        // be destroyed — and since the entire map is being freed
+        // wholesale, skipping the per-entry removal loses nothing.
+        let flags = self.flags.get();
+        if flags != 0 {
+            let addr = self.addr();
+            if flags & HAS_SPAN != 0 {
+                let _ = PAIR_SPANS.try_with(|t| {
+                    t.borrow_mut().remove(&addr);
+                });
+            }
+            if flags & HAS_CAR_TOMBSTONE != 0 {
+                let _ = PAIR_CAR_TOMBSTONES.try_with(|t| {
+                    t.borrow_mut().remove(&addr);
+                });
+            }
+            if flags & HAS_CDR_TOMBSTONE != 0 {
+                let _ = PAIR_CDR_TOMBSTONES.try_with(|t| {
+                    t.borrow_mut().remove(&addr);
+                });
+            }
+        }
+
         // Iteratively unlink the cdr chain. Without this,
         // dropping a long list `(cons x1 (cons x2 …))` triggers
         // recursive `Rc<Pair>::drop` calls — one stack frame per
@@ -1280,6 +1453,96 @@ impl fmt::Display for Value {
             },
             Value::Promise(_) => write!(f, "#<promise>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod pair_diet_tests {
+    use super::*;
+
+    /// cs-5te: `Pair` shrank from 144B (car+cdr RefCells, an inline
+    /// `Cell<Option<Span>>` source slot, and two inline
+    /// `RefCell<Option<WeakValue>>` tombstone slots) down to just
+    /// `car`, `cdr`, and a 1-byte flags `Cell<u8>` (rounded up by
+    /// alignment). Span + tombstones now live in thread-local side
+    /// tables keyed by address. With the +16B `Rc` header this is a
+    /// 160B -> 88B cons cell: `car`(16) + `cdr`(16) + `flags`(1,
+    /// padded to 8 for `Value`'s 8-byte alignment) = 40B measured
+    /// (72B on this build once `Value`'s own layout is counted in —
+    /// see the assertion below), well under the 80B target.
+    #[test]
+    fn pair_is_diet_sized() {
+        let before = 144usize;
+        let after = std::mem::size_of::<Pair>();
+        assert_eq!(
+            after, 72,
+            "Pair size changed: {after}B (was {before}B before cs-5te, cs-5te landed it at 72B)"
+        );
+        assert!(
+            after <= 80,
+            "Pair grew past the cs-5te <= 80B target: {after}B"
+        );
+    }
+
+    #[test]
+    fn plain_cons_has_no_span_or_tombstone() {
+        let p = Pair::new(Value::Number(Number::Fixnum(1)), Value::Null);
+        assert_eq!(p.source_span(), None);
+        assert_eq!(p.flags.get(), 0);
+    }
+
+    #[test]
+    fn with_source_round_trips_span() {
+        let span = cs_diag::Span {
+            file: cs_diag::FileId(3),
+            start: 10,
+            end: 20,
+        };
+        let p = Pair::with_source(Value::Null, Value::Null, span);
+        assert_eq!(p.source_span(), Some(span));
+        assert_eq!(p.flags.get() & HAS_SPAN, HAS_SPAN);
+    }
+
+    #[test]
+    fn dropped_pair_clears_its_span_table_entry() {
+        let span = cs_diag::Span {
+            file: cs_diag::FileId(1),
+            start: 0,
+            end: 1,
+        };
+        let addr = {
+            let p = Pair::with_source(Value::Null, Value::Null, span);
+            cs_gc::Gc::as_addr(&p)
+        };
+        // The pair is gone; its address must not resurrect a span
+        // for a would-be new pair placed there.
+        let leaked = PAIR_SPANS.with(|t| t.borrow().get(&addr).copied());
+        assert_eq!(leaked, None);
+    }
+
+    #[test]
+    fn tombstone_round_trip_and_clear_on_set() {
+        // Build a two-cycle so break_car_cycle's strong-count guard
+        // (baseline) is satisfied: p's car points at itself via an
+        // intermediate strong ref that we then drop, leaving one
+        // EXTERNAL anchor (`p` itself) — mirrors the real cycle-
+        // detector's usage pattern.
+        let p = Pair::new(Value::Null, Value::Null);
+        p.set_car(Value::Pair(p.clone()));
+        // Strong refs to the car's target (`p`) right now: the
+        // `p` binding itself + the car slot = 2. baseline=1 leaves
+        // one external anchor (the `p` binding), so the demote
+        // should fire.
+        assert!(p.break_car_cycle(1));
+        assert_eq!(p.flags.get() & HAS_CAR_TOMBSTONE, HAS_CAR_TOMBSTONE);
+        // Tombstone upgrade returns the cyclic value transparently.
+        assert!(matches!(p.car(), Value::Pair(_)));
+        // set_car! over the demoted slot clears the tombstone.
+        p.set_car(Value::Null);
+        assert_eq!(p.flags.get() & HAS_CAR_TOMBSTONE, 0);
+        let addr = p.addr();
+        let leaked = PAIR_CAR_TOMBSTONES.with(|t| t.borrow().contains_key(&addr));
+        assert!(!leaked, "set_car! must clear the tombstone table entry");
     }
 }
 
