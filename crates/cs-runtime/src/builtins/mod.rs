@@ -3637,7 +3637,14 @@ fn b_list_to_string(args: &[Value]) -> Result<Value, String> {
 }
 
 fn b_string_append(args: &[Value]) -> Result<Value, String> {
-    let mut s = String::new();
+    let mut total_len = 0;
+    for a in args {
+        match a {
+            Value::String(part) => total_len += part.borrow().len(),
+            v => return Err(type_err("string-append", "string", v)),
+        }
+    }
+    let mut s = String::with_capacity(total_len);
     for a in args {
         match a {
             Value::String(part) => s.push_str(&part.borrow()),
@@ -9744,10 +9751,10 @@ fn b_utf8_to_string(args: &[Value]) -> Result<Value, String> {
 /// `(bytevector-append bv ...)` — concatenate any number of bytevectors
 /// into a fresh one (R6RS).
 fn b_bytevector_append(args: &[Value]) -> Result<Value, String> {
-    let mut out: Vec<u8> = Vec::new();
+    let mut total_len = 0;
     for (i, a) in args.iter().enumerate() {
         match a {
-            Value::ByteVector(b) => out.extend_from_slice(&b.borrow()),
+            Value::ByteVector(b) => total_len += b.borrow().len(),
             other => {
                 return Err(format!(
                     "bytevector-append: arg {} expected bytevector, got {}",
@@ -9755,6 +9762,12 @@ fn b_bytevector_append(args: &[Value]) -> Result<Value, String> {
                     other.type_name()
                 ));
             }
+        }
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(total_len);
+    for a in args {
+        if let Value::ByteVector(b) = a {
+            out.extend_from_slice(&b.borrow());
         }
     }
     Ok(Value::ByteVector(cs_core::Gc::new(
@@ -12971,10 +12984,10 @@ fn b_vector_copy(args: &[Value]) -> Result<Value, String> {
 
 /// `vector-append` (R7RS) — concatenate any number of vectors into a fresh one.
 fn b_vector_append(args: &[Value]) -> Result<Value, String> {
-    let mut out: Vec<Value> = Vec::new();
+    let mut total_len = 0;
     for (i, a) in args.iter().enumerate() {
         match a {
-            Value::Vector(v) => out.extend(v.borrow().iter().cloned()),
+            Value::Vector(v) => total_len += v.borrow().len(),
             other => {
                 return Err(format!(
                     "vector-append: argument {} is not a vector ({})",
@@ -12982,6 +12995,12 @@ fn b_vector_append(args: &[Value]) -> Result<Value, String> {
                     other.type_name()
                 ))
             }
+        }
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(total_len);
+    for a in args {
+        if let Value::Vector(v) = a {
+            out.extend(v.borrow().iter().cloned());
         }
     }
     Ok(Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(

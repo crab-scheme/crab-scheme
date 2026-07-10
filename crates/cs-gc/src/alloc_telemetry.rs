@@ -12,8 +12,10 @@
 //!
 //! ## Cost
 //!
-//! One relaxed atomic increment per `Gc::new` (~1ns
-//! amortised). Always on under
+//! `Gc::new` bumps a pair of thread-local `Cell<u64>`s (no
+//! atomic RMW on the hot path); the accessors and the
+//! per-thread `Drop` guard fold the thread-local pair into
+//! the process-global atomics. Always on under
 //! `feature = "countable-memory"`; no separate feature flag
 //! since the cost is negligible and the value (every benchmark
 //! reports real numbers) is high.
@@ -28,6 +30,7 @@
 //! values; the runtime's `Heap::reset_stats`-equivalent
 //! (under tracing) snapshots a baseline and subtracts.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cumulative bytes allocated across every `Gc::new` call on
@@ -49,26 +52,89 @@ pub(crate) static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// cheap.
 const RC_HEADER_BYTES: u64 = (2 * std::mem::size_of::<usize>()) as u64;
 
+/// Per-thread accumulator for the two counters. Bundled into
+/// one struct (rather than two separate `thread_local!`
+/// cells) so a single `Drop` impl flushes both into the
+/// global atomics when the thread tears down — two
+/// independent thread-locals have no guaranteed relative
+/// destruction order, which would risk one flushing after the
+/// other is already gone.
+struct LocalTelemetry {
+    bytes: Cell<u64>,
+    count: Cell<u64>,
+}
+
+impl Drop for LocalTelemetry {
+    fn drop(&mut self) {
+        flush(self.bytes.get(), self.count.get());
+    }
+}
+
+thread_local! {
+    static LOCAL: LocalTelemetry = const {
+        LocalTelemetry {
+            bytes: Cell::new(0),
+            count: Cell::new(0),
+        }
+    };
+}
+
+#[inline]
+fn flush(bytes: u64, count: u64) {
+    if bytes != 0 {
+        BYTES_ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
+    }
+    if count != 0 {
+        ALLOC_COUNT.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+/// Fold this thread's pending local counters into the global
+/// atomics and zero them. `try_with` rather than `with`
+/// because this can run from a context where `LOCAL` itself
+/// is already torn down (e.g. another TLS destructor running
+/// after `LOCAL`'s in unspecified inter-thread_local order);
+/// in that case there's nothing pending to flush.
+#[inline]
+fn flush_local() {
+    let _ = LOCAL.try_with(|c| {
+        flush(c.bytes.replace(0), c.count.replace(0));
+    });
+}
+
 /// Record an allocation of `T` going through `Gc::new`. Adds
-/// `size_of::<T>() + RC_HEADER_BYTES` to the byte counter and
-/// increments the count counter. Both writes are `Relaxed`
-/// since these are diagnostic counters — slight reordering
-/// across threads (if any thread ever materialises) is fine.
+/// `size_of::<T>() + RC_HEADER_BYTES` to a thread-local byte
+/// counter and increments a thread-local count counter — no
+/// atomic RMW on the hot path. The thread-local pair is
+/// folded into the process-global atomics by the accessors,
+/// `reset()`, and thread teardown.
 #[inline]
 pub(crate) fn record_alloc<T>() {
     let bytes = std::mem::size_of::<T>() as u64 + RC_HEADER_BYTES;
-    BYTES_ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
-    ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let ok = LOCAL.try_with(|c| {
+        c.bytes.set(c.bytes.get() + bytes);
+        c.count.set(c.count.get() + 1);
+    });
+    if ok.is_err() {
+        // LOCAL already torn down (called from a TLS
+        // destructor after ours ran) — fall back to a direct
+        // atomic add so the allocation isn't lost.
+        flush(bytes, 1);
+    }
 }
 
 /// Cumulative bytes since process start (or since the last
-/// `reset()` call). Cheap atomic load.
+/// `reset()` call). Flushes this thread's pending local
+/// counter first, then a cheap atomic load.
 pub fn bytes_allocated_total() -> u64 {
+    flush_local();
     BYTES_ALLOCATED.load(Ordering::Relaxed)
 }
 
-/// Cumulative allocation count. Cheap atomic load.
+/// Cumulative allocation count. Flushes this thread's pending
+/// local counter first, then a cheap atomic load.
 pub fn alloc_count_total() -> u64 {
+    flush_local();
     ALLOC_COUNT.load(Ordering::Relaxed)
 }
 
@@ -77,6 +143,7 @@ pub fn alloc_count_total() -> u64 {
 /// baseline. Mirrors `Heap::reset_stats` from the tracing
 /// variant.
 pub fn reset() {
+    flush_local();
     BYTES_ALLOCATED.store(0, Ordering::Relaxed);
     ALLOC_COUNT.store(0, Ordering::Relaxed);
 }
