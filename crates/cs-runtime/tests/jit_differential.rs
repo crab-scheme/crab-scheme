@@ -10616,6 +10616,73 @@ fn diff_jit_ic_dispatch_fires_with_guards() {
 }
 
 #[test]
+fn diff_jit_callee_error_does_not_disable_jit() {
+    // cs-4j3 — `vm_call_general` / `vm_ic_dispatch` used to `panic!`
+    // when a callee reached via `vm_call_sync` returned `Err` (an
+    // ordinary Scheme-level error, not a JIT type miss). Both are
+    // `extern "C"` (not `extern "C-unwind"`), and Rust aborts the
+    // whole process the instant an unwind tries to cross a plain
+    // `extern "C"` frame boundary — so an everyday user error
+    // reached through the JIT's CallGeneral/IC path used to crash
+    // the process outright. The fix requests
+    // `DEOPT_REASON_CALLEE_ERROR` and returns a discarded
+    // placeholder instead, so the call falls back to the bytecode
+    // interpreter (which raises the error normally, no panic) and
+    // JIT dispatch stays usable afterward.
+    let mut rt = Runtime::new();
+    rt.install_jit().unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (dup x) (cons x x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (boom x) (car x))")
+        .unwrap();
+    rt.eval_str_via_vm("<diff>", "(define (apply-it f x) (f x))")
+        .unwrap();
+    // Warm `apply-it`'s CallGeneral site and `dup` to native code —
+    // the IC slot ends up caching `dup`. `boom` is deliberately never
+    // called here, so it stays interpreted (no jit_ptr): the call
+    // below hits `apply-it`'s IC slot as a *miss* against `boom`,
+    // which routes through `vm_call_general`'s `vm_call_sync`
+    // fallback — the exact panic site this test guards.
+    rt.eval_str_via_vm(
+        "<diff>",
+        "(let loop ((i 0)) \
+           (if (= i 4000) 'done \
+               (begin (apply-it dup (list i)) (loop (+ i 1)))))",
+    )
+    .unwrap();
+
+    // `(car 5)` inside `boom`, dispatched through the JIT's
+    // CallGeneral machinery, must surface as a normal `Err` — not a
+    // process abort.
+    let err = rt.eval_str_via_vm("<diff>", "(apply-it boom 5)");
+    assert!(
+        err.is_err(),
+        "expected (car 5) inside a JIT-dispatched callee to raise a \
+         normal error, got {:?}",
+        err
+    );
+
+    // JIT dispatch must still be usable on this thread afterward — a
+    // permanent per-thread disable (the described failure mode) would
+    // silently demote every subsequent call to the walker/VM-only
+    // path instead of aborting outright.
+    cs_vm::vm::reset_jit_call_count();
+    let result = rt
+        .eval_str_via_vm("<diff>", "(apply-it dup (list 9))")
+        .unwrap();
+    match &result {
+        Value::Pair(_) => {}
+        other => panic!("expected pair, got {:?}", other),
+    }
+    let calls = cs_vm::vm::jit_call_count();
+    assert!(
+        calls >= 1,
+        "JIT dispatch never fired after the callee error (calls={calls}) — \
+         looks like the panic-through-extern-C path disabled JIT for the thread"
+    );
+}
+
+#[test]
 fn diff_jit_nested_closure_captures_params() {
     // ADR 0012 D-1 (closure-env capture fix) — a JIT-compiled
     // function that builds a nested closure must capture its own

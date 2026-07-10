@@ -665,6 +665,19 @@ pub const DEOPT_REASON_ARITH_MISS: u8 = 6;
 /// `run_jit_body_once` discards the result and retries through
 /// bytecode, which promotes to bignum correctly.
 pub const DEOPT_REASON_FIXNUM_OVERFLOW: u8 = 7;
+/// A callee reached from a JIT body via `vm_call_general` /
+/// `vm_ic_dispatch` (directly, or through the ADR 0019 tail-call
+/// trampoline) returned `Err` from `vm_call_sync` — an ordinary
+/// Scheme-level error (e.g. `(car '())`), not a JIT type miss.
+/// Mirrors `DEOPT_REASON_ARITH_MISS`: these `extern "C"` helpers
+/// must never let a Rust panic unwind across their own frame
+/// (unwinding past a plain `extern "C"` boundary aborts the whole
+/// process, not just this thread), so instead of panicking they
+/// request this deopt and return a discarded placeholder. The
+/// enclosing dispatch discards the whole JIT-body result and
+/// retries through bytecode, which re-raises the error with the
+/// correct span via the normal `Result`-based path.
+pub const DEOPT_REASON_CALLEE_ERROR: u8 = 8;
 
 /// Set the deopt sentinel. Called by JIT runtime helpers on a
 /// type miss before they return a placeholder value.
@@ -9364,13 +9377,17 @@ pub unsafe extern "C" fn vm_eq_any_gc(a: i64, b: i64) -> i64 {
 ///   for the duration of this call so the helper can re-enter
 ///   `vm_call_sync` with the caller's symbol table.
 ///
-/// Panics if the callee isn't a `Value::Procedure`, if `vm_call_sync`
-/// returns an error, or if `JIT_ACTIVE_SYMS` is null. Panics across
-/// `extern "C"` abort by default — matching the existing
-/// `vm_unbox_*_gc` convention. A future iter (deopt integration) may
-/// switch this to `extern "C-unwind"` and route errors through the
-/// JIT-frame catch_unwind path; for iter BU a panic is the
-/// starting point.
+/// Panics if the callee isn't a `Value::Procedure` or if
+/// `JIT_ACTIVE_SYMS` is null — both internal invariant violations,
+/// not user-triggerable. Panics across `extern "C"` abort by
+/// default — matching the existing `vm_unbox_*_gc` convention.
+///
+/// A `vm_call_sync` `Err` (an ordinary Scheme-level error raised by
+/// the callee) does NOT panic: it requests
+/// `DEOPT_REASON_CALLEE_ERROR` and returns a discarded placeholder
+/// instead (cs-4j3) — panicking here would unwind across this
+/// `extern "C"` frame and abort the process on an everyday user
+/// error. See `DEOPT_REASON_CALLEE_ERROR` for the retry contract.
 #[no_mangle]
 pub unsafe extern "C" fn vm_call_general(
     callee: i64,
@@ -9474,7 +9491,14 @@ pub unsafe extern "C" fn vm_call_general(
 
     match vm_call_sync(&callee_v, &args, syms) {
         Ok(v) => value_to_gc_i64(v),
-        Err(e) => panic!("vm_call_general: {}", e.message),
+        Err(_e) => {
+            // A genuine Scheme-level error from the callee, not a JIT
+            // type miss — see `DEOPT_REASON_CALLEE_ERROR`. Must not
+            // panic: this is `extern "C"`, and unwinding across a
+            // plain `extern "C"` frame aborts the process.
+            jit_request_deopt(DEOPT_REASON_CALLEE_ERROR);
+            0
+        }
     }
 }
 
@@ -9592,7 +9616,12 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
         return match vm_call_sync(&callee_v, &value_args, syms) {
             Ok(v) => value_to_gc_i64(v),
-            Err(e) => panic!("vm_ic_dispatch: {}", e.message),
+            Err(_e) => {
+                // See `vm_call_general`'s Err arm / `DEOPT_REASON_CALLEE_ERROR`:
+                // must not panic across this `extern "C"` frame.
+                jit_request_deopt(DEOPT_REASON_CALLEE_ERROR);
+                0
+            }
         };
     }
     let mut type_miss = false;
@@ -9691,7 +9720,12 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
         return match vm_call_sync(&callee_v, &value_args, syms) {
             Ok(v) => value_to_gc_i64(v),
-            Err(e) => panic!("vm_ic_dispatch: {}", e.message),
+            Err(_e) => {
+                // See `vm_call_general`'s Err arm / `DEOPT_REASON_CALLEE_ERROR`:
+                // must not panic across this `extern "C"` frame.
+                jit_request_deopt(DEOPT_REASON_CALLEE_ERROR);
+                0
+            }
         };
     }
     bump_jit_call_count();
@@ -9848,6 +9882,17 @@ pub unsafe extern "C" fn vm_ic_dispatch(
         }
         let syms: &mut SymbolTable = unsafe { &mut *syms_ptr };
         let nb = drive_jit_tailcalls(syms);
+        // A bounced callee inside the trampoline may have requested
+        // `DEOPT_REASON_CALLEE_ERROR` (or any other deopt) instead of
+        // returning normally — `nb` is then a discarded placeholder.
+        // Peek (don't consume): this dispatch has no bytecode retry
+        // of its own to fall back to, so leave the sentinel set for
+        // the enclosing JIT body's own dispatcher (`run_jit_body_once`
+        // for whichever closure invoked us) to observe and discard
+        // its whole call.
+        if jit_peek_deopt() != 0 {
+            return 0;
+        }
         return value_to_gc_i64(unsafe { nb.to_value() });
     }
     value_to_gc_i64(decode_jit_return(closure.jit_return_type(), raw))
@@ -10330,7 +10375,18 @@ fn try_dispatch_jit_nb(
 ) -> Option<NanboxValue> {
     let r = run_jit_body_once(closure, args, syms)?;
     if jit_tailcall_pending() {
-        Some(drive_jit_tailcalls(syms))
+        let result = drive_jit_tailcalls(syms);
+        // Mirrors the deopt check `run_jit_body_once` already does
+        // for the non-tailcall path: a bounced callee may have hit
+        // `DEOPT_REASON_CALLEE_ERROR` (or any other deopt) instead of
+        // returning normally, in which case `result` is a discarded
+        // placeholder. This IS the terminal dispatch point for
+        // `closure` — `None` here means our caller falls back to the
+        // bytecode interpreter, which re-raises the real error.
+        if jit_take_deopt() != 0 {
+            return None;
+        }
+        Some(result)
     } else {
         Some(decode_jit_return_nb(closure.jit_return_type(), r))
     }
@@ -10441,7 +10497,19 @@ fn apply_bounce_via_vm(
     }
     match vm_call_sync(callee_v, &args, syms) {
         Ok(v) => NanboxValue::from_value(v),
-        Err(e) => panic!("vm_jit tail-call: {}", e.message),
+        Err(_e) => {
+            // A genuine Scheme-level error from a tail-bounced callee.
+            // This runs nested inside `vm_call_general`'s `extern "C"`
+            // frame when the bounce chain started from a `CallGeneral`
+            // dispatch, so panicking here risks the same abort — set
+            // the deopt sentinel instead (see
+            // `DEOPT_REASON_CALLEE_ERROR`); the caller (`drive_jit_tailcalls`)
+            // returns this placeholder straight through to
+            // `try_dispatch_jit_nb` / `vm_ic_dispatch`, both of which
+            // check the sentinel before trusting the result.
+            jit_request_deopt(DEOPT_REASON_CALLEE_ERROR);
+            NanboxValue(0)
+        }
     }
 }
 

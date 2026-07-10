@@ -7163,12 +7163,58 @@ pub fn bytecode_to_rir_full(
     Ok(func)
 }
 
+/// Look up `arg`'s type, asserting the invariant this pass relies on:
+/// every `RirValue` that can appear as a `Jump`/`Branch` block-arg was
+/// inserted into `value_types` when it was created (function params at
+/// entry, fresh block params via `seed_block_entry`, and every
+/// instruction's dst at emission time). A miss here means some value
+/// escaped that bookkeeping; silently guessing `Fixnum` would risk
+/// reinterpreting a boxed/pointer payload as a raw i64 at decode time,
+/// so fail loudly in debug builds rather than guess wrong in release.
+fn arg_type(value_types: &HashMap<RirValue, Type>, arg: &RirValue) -> Type {
+    match value_types.get(arg).copied() {
+        Some(t) => t,
+        None => {
+            debug_assert!(
+                false,
+                "widen_joins_to_any: value {arg:?} used as a block-terminator arg has no recorded type in value_types"
+            );
+            Type::Fixnum
+        }
+    }
+}
+
+/// Insert `BoxTyped` on every arg in `args` whose target-block slot
+/// (`target_idx`) expects `Type::Any` but whose source value isn't
+/// already boxed. Shared by the `Jump` and `Branch` arms below.
+fn box_args_for_target(
+    func: &cs_rir::Function,
+    value_types: &mut HashMap<RirValue, Type>,
+    alloc: &mut dyn FnMut() -> RirValue,
+    target_idx: usize,
+    args: &mut [RirValue],
+) -> Vec<RirInst> {
+    let mut box_inserts: Vec<RirInst> = Vec::new();
+    for (i, arg) in args.iter_mut().enumerate() {
+        let exp_t = func.blocks[target_idx].params[i].1;
+        let arg_t = arg_type(value_types, arg);
+        if exp_t == Type::Any && arg_t != Type::Any {
+            let tag = type_to_jit_rt_tag(arg_t);
+            let fresh = alloc();
+            box_inserts.push(RirInst::BoxTyped(fresh, *arg, tag));
+            value_types.insert(fresh, Type::Any);
+            *arg = fresh;
+        }
+    }
+    box_inserts
+}
+
 /// Iterate to fixed point: for each block whose predecessors push
 /// disagreeing types into the same slot, widen that block's
 /// `params[i]` to `Type::Any` and insert `BoxTyped` on every
-/// predecessor's Jump that passes a non-Any value. Each widening
-/// can change a downstream block's argument type, so we re-loop
-/// until no changes happen.
+/// predecessor's Jump/Branch that passes a non-Any value. Each
+/// widening can change a downstream block's argument type, so we
+/// re-loop until no changes happen.
 fn widen_joins_to_any(
     func: &mut cs_rir::Function,
     value_types: &mut HashMap<RirValue, Type>,
@@ -7176,14 +7222,30 @@ fn widen_joins_to_any(
 ) {
     use std::collections::HashSet;
     loop {
-        // (target_block, slot) -> set of arg types observed.
+        // (target_block, slot) -> set of arg types observed. A
+        // `Term::Branch` passes the SAME `args` to both `then_target`
+        // and `else_target` (see `cs_rir::Term::Branch`'s doc — the
+        // uniform-NB lowering emits one `brif` arg list for both
+        // successors), so each Branch must contribute to both targets'
+        // slot sets, not just one, or a real type disagreement across
+        // predecessors goes undetected.
         let mut slot_types: HashMap<(BlockId, usize), HashSet<Type>> = HashMap::new();
         for block in &func.blocks {
-            if let Term::Jump(target, args) = &block.terminator {
-                for (i, arg) in args.iter().enumerate() {
-                    let t = value_types.get(arg).copied().unwrap_or(Type::Fixnum);
-                    slot_types.entry((*target, i)).or_default().insert(t);
+            match &block.terminator {
+                Term::Jump(target, args) => {
+                    for (i, arg) in args.iter().enumerate() {
+                        let t = arg_type(value_types, arg);
+                        slot_types.entry((*target, i)).or_default().insert(t);
+                    }
                 }
+                Term::Branch(_, then_target, else_target, args) => {
+                    for (i, arg) in args.iter().enumerate() {
+                        let t = arg_type(value_types, arg);
+                        slot_types.entry((*then_target, i)).or_default().insert(t);
+                        slot_types.entry((*else_target, i)).or_default().insert(t);
+                    }
+                }
+                Term::Return(_) => {}
             }
         }
 
@@ -7215,37 +7277,63 @@ fn widen_joins_to_any(
         }
     }
 
-    // Now insert BoxTyped on every Jump arg whose target slot is Any
-    // but whose source value isn't.
+    // Now insert BoxTyped on every terminator arg whose target slot is
+    // Any but whose source value isn't.
     for block_idx in 0..func.blocks.len() {
-        let (target_idx, mut new_args) = match &func.blocks[block_idx].terminator {
+        let terminator = func.blocks[block_idx].terminator.clone();
+        match terminator {
             Term::Jump(target, args) => {
-                let target_idx = match func.blocks.iter().position(|b| b.id == *target) {
+                let target_idx = match func.blocks.iter().position(|b| b.id == target) {
                     Some(i) => i,
                     None => continue,
                 };
-                (target_idx, args.clone())
+                let mut new_args = args;
+                let box_inserts =
+                    box_args_for_target(func, value_types, alloc, target_idx, &mut new_args);
+                if !box_inserts.is_empty() {
+                    func.blocks[block_idx].insts.extend(box_inserts);
+                    func.blocks[block_idx].terminator = Term::Jump(target, new_args);
+                }
             }
-            _ => continue,
-        };
-
-        let mut box_inserts: Vec<RirInst> = Vec::new();
-        for (i, arg) in new_args.iter_mut().enumerate() {
-            let exp_t = func.blocks[target_idx].params[i].1;
-            let arg_t = value_types.get(arg).copied().unwrap_or(Type::Fixnum);
-            if exp_t == Type::Any && arg_t != Type::Any {
-                let tag = type_to_jit_rt_tag(arg_t);
-                let fresh = alloc();
-                box_inserts.push(RirInst::BoxTyped(fresh, *arg, tag));
-                value_types.insert(fresh, Type::Any);
-                *arg = fresh;
+            Term::Branch(cond, then_target, else_target, args) => {
+                let then_idx = match func.blocks.iter().position(|b| b.id == then_target) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let else_idx = match func.blocks.iter().position(|b| b.id == else_target) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                // A single shared `args` list reaches both successors
+                // via one `brif` (see `lower_terminator_uniform_nb`), so
+                // if only one target's slot widened to Any above, force
+                // the other target's same slot to Any too before boxing
+                // — otherwise a boxed pointer would flow into a
+                // successor that still expects the raw payload, or vice
+                // versa.
+                for i in 0..args.len() {
+                    let then_any = func.blocks[then_idx].params[i].1 == Type::Any;
+                    let else_any = func.blocks[else_idx].params[i].1 == Type::Any;
+                    if then_any && !else_any {
+                        let pv = func.blocks[else_idx].params[i].0;
+                        func.blocks[else_idx].params[i].1 = Type::Any;
+                        value_types.insert(pv, Type::Any);
+                    } else if else_any && !then_any {
+                        let pv = func.blocks[then_idx].params[i].0;
+                        func.blocks[then_idx].params[i].1 = Type::Any;
+                        value_types.insert(pv, Type::Any);
+                    }
+                }
+                let mut new_args = args;
+                let box_inserts =
+                    box_args_for_target(func, value_types, alloc, then_idx, &mut new_args);
+                if !box_inserts.is_empty() {
+                    func.blocks[block_idx].insts.extend(box_inserts);
+                    func.blocks[block_idx].terminator =
+                        Term::Branch(cond, then_target, else_target, new_args);
+                }
             }
-        }
-        if !box_inserts.is_empty() {
-            func.blocks[block_idx].insts.extend(box_inserts);
-            if let Term::Jump(_, ref mut args) = func.blocks[block_idx].terminator {
-                *args = new_args;
-            }
+            Term::Return(_) => {}
         }
     }
 }
