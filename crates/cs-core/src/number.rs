@@ -157,13 +157,27 @@ impl Number {
 
     pub fn cmp(&self, other: &Number) -> std::cmp::Ordering {
         if !self.is_exact() || !other.is_exact() {
-            self.to_f64()
+            return self
+                .to_f64()
                 .partial_cmp(&other.to_f64())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        } else {
-            let a = to_rational(self);
-            let b = to_rational(other);
-            a.cmp(&b)
+                .unwrap_or(std::cmp::Ordering::Equal);
+        }
+        match (self, other) {
+            (Number::Fixnum(a), Number::Fixnum(b)) => a.cmp(b),
+            (Number::Big(a), Number::Big(b)) => a.as_ref().cmp(b.as_ref()),
+            (Number::Fixnum(a), Number::Big(b)) => match b.to_i64() {
+                Some(b) => a.cmp(&b),
+                None => BigInt::from(*a).cmp(b.as_ref()),
+            },
+            (Number::Big(a), Number::Fixnum(b)) => match a.to_i64() {
+                Some(a) => a.cmp(b),
+                None => a.as_ref().cmp(&BigInt::from(*b)),
+            },
+            _ => {
+                let a = to_rational(self);
+                let b = to_rational(other);
+                a.cmp(&b)
+            }
         }
     }
 
@@ -172,9 +186,21 @@ impl Number {
         if !self.is_exact() || !other.is_exact() {
             return self.to_f64() == other.to_f64();
         }
-        let a = to_rational(self);
-        let b = to_rational(other);
-        a == b
+        match (self, other) {
+            (Number::Fixnum(a), Number::Fixnum(b)) => a == b,
+            (Number::Big(a), Number::Big(b)) => a == b,
+            (Number::Fixnum(a), Number::Big(b)) | (Number::Big(b), Number::Fixnum(a)) => {
+                match b.to_i64() {
+                    Some(b) => *a == b,
+                    None => false,
+                }
+            }
+            _ => {
+                let a = to_rational(self);
+                let b = to_rational(other);
+                a == b
+            }
+        }
     }
 
     pub fn is_integer(&self) -> bool {
@@ -1016,6 +1042,179 @@ mod tests {
         assert_eq!(
             Number::Fixnum(0b1010).bit_set_p(&Number::Fixnum(0)),
             Some(false)
+        );
+    }
+
+    // --- cs-gl8: direct fixnum/bignum comparison fast paths ---
+
+    #[test]
+    fn cmp_fixnum_fixnum_all_orderings() {
+        assert_eq!(
+            Number::Fixnum(1).cmp(&Number::Fixnum(2)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            Number::Fixnum(2).cmp(&Number::Fixnum(2)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            Number::Fixnum(3).cmp(&Number::Fixnum(2)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            Number::Fixnum(-5).cmp(&Number::Fixnum(5)),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn eq_value_fixnum_fixnum() {
+        assert!(Number::Fixnum(7).eq_value(&Number::Fixnum(7)));
+        assert!(!Number::Fixnum(7).eq_value(&Number::Fixnum(8)));
+        assert!(Number::Fixnum(-3).eq_value(&Number::Fixnum(-3)));
+    }
+
+    #[test]
+    fn cmp_big_big() {
+        let a = Number::Big(Rc::new("99999999999999999999".parse::<BigInt>().unwrap()));
+        let b = Number::Big(Rc::new("100000000000000000000".parse::<BigInt>().unwrap()));
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Less);
+        assert_eq!(b.cmp(&a), std::cmp::Ordering::Greater);
+        assert_eq!(a.cmp(&a.clone()), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn eq_value_big_big() {
+        let a = Number::Big(Rc::new(
+            "123456789012345678901234567890".parse::<BigInt>().unwrap(),
+        ));
+        let b = Number::Big(Rc::new(
+            "123456789012345678901234567890".parse::<BigInt>().unwrap(),
+        ));
+        let c = Number::Big(Rc::new(
+            "123456789012345678901234567891".parse::<BigInt>().unwrap(),
+        ));
+        assert!(a.eq_value(&b));
+        assert!(!a.eq_value(&c));
+    }
+
+    #[test]
+    fn cmp_fixnum_vs_big_fitting_i64() {
+        // Big that fits in i64 range, compared against a fixnum.
+        let big_fits = Number::Big(Rc::new(BigInt::from(1000_i64)));
+        assert_eq!(Number::Fixnum(500).cmp(&big_fits), std::cmp::Ordering::Less);
+        assert_eq!(
+            big_fits.cmp(&Number::Fixnum(500)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            Number::Fixnum(1000).cmp(&big_fits),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn cmp_fixnum_vs_big_non_fitting_positive() {
+        // Big far larger than any i64, positive sign.
+        let huge = Number::Big(Rc::new(
+            "999999999999999999999999".parse::<BigInt>().unwrap(),
+        ));
+        assert_eq!(
+            Number::Fixnum(i64::MAX).cmp(&huge),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            huge.cmp(&Number::Fixnum(i64::MAX)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            Number::Fixnum(i64::MIN).cmp(&huge),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cmp_fixnum_vs_big_non_fitting_negative() {
+        // Big far smaller than any i64, negative sign.
+        let huge_neg = Number::Big(Rc::new(
+            "-999999999999999999999999".parse::<BigInt>().unwrap(),
+        ));
+        assert_eq!(
+            Number::Fixnum(i64::MIN).cmp(&huge_neg),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            huge_neg.cmp(&Number::Fixnum(i64::MIN)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            Number::Fixnum(0).cmp(&huge_neg),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn eq_value_fixnum_vs_big() {
+        let big_fits = Number::Big(Rc::new(BigInt::from(42_i64)));
+        assert!(Number::Fixnum(42).eq_value(&big_fits));
+        assert!(big_fits.eq_value(&Number::Fixnum(42)));
+        assert!(!Number::Fixnum(43).eq_value(&big_fits));
+
+        let huge = Number::Big(Rc::new(
+            "999999999999999999999999".parse::<BigInt>().unwrap(),
+        ));
+        assert!(!Number::Fixnum(42).eq_value(&huge));
+        assert!(!huge.eq_value(&Number::Fixnum(42)));
+    }
+
+    #[test]
+    fn cmp_i64_min_max_vs_bignums_just_outside_range() {
+        let just_above_max = Number::Big(Rc::new(BigInt::from(i64::MAX) + BigInt::one()));
+        let just_below_min = Number::Big(Rc::new(BigInt::from(i64::MIN) - BigInt::one()));
+
+        assert_eq!(
+            Number::Fixnum(i64::MAX).cmp(&just_above_max),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            Number::Fixnum(i64::MIN).cmp(&just_below_min),
+            std::cmp::Ordering::Greater
+        );
+
+        // Exact boundary values (fit i64) still compare correctly.
+        let exact_max = Number::Big(Rc::new(BigInt::from(i64::MAX)));
+        let exact_min = Number::Big(Rc::new(BigInt::from(i64::MIN)));
+        assert_eq!(
+            Number::Fixnum(i64::MAX).cmp(&exact_max),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            Number::Fixnum(i64::MIN).cmp(&exact_min),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn cmp_and_eq_mixed_exact_rational_unaffected() {
+        // Rational-involving exact pairs must still go through to_rational.
+        let half = Number::Rat(Rc::new(BigRational::new(BigInt::from(1), BigInt::from(2))));
+        assert_eq!(half.cmp(&Number::Fixnum(1)), std::cmp::Ordering::Less);
+        assert_eq!(Number::Fixnum(0).cmp(&half), std::cmp::Ordering::Less);
+        assert!(!half.eq_value(&Number::Fixnum(0)));
+        let one_as_rat = Number::Rat(Rc::new(BigRational::new(BigInt::from(2), BigInt::from(2))));
+        // 2/2 simplifies conceptually to 1, though stored as Rat variant here.
+        assert!(one_as_rat.eq_value(&Number::Fixnum(1)));
+    }
+
+    #[test]
+    fn eq_value_inexact_contagion_unchanged() {
+        // (= 2 2.0) must remain true via the inexact path, untouched by
+        // the new exact fast-path arms.
+        assert!(Number::Fixnum(2).eq_value(&Number::Flonum(2.0)));
+        assert!(!Number::Fixnum(2).eq_value(&Number::Flonum(2.5)));
+        assert_eq!(
+            Number::Fixnum(2).cmp(&Number::Flonum(2.0)),
+            std::cmp::Ordering::Equal
         );
     }
 }
