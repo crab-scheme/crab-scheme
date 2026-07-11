@@ -1276,17 +1276,55 @@ pub fn bytecode_to_rir_full(
                             }
                             let dst = alloc();
                             if aot_mode() {
-                                // AOT: route every builtin through generic
+                                // AOT: route most builtins through generic
                                 // by-name dispatch. The JIT-only dedicated
                                 // insts below (StrAppend, NumberToString, …)
                                 // have no AOT lowering; cs_runtime::
                                 // aot_call_builtin covers the whole stdlib.
-                                insts.push(RirInst::CallBuiltin(
-                                    dst,
-                                    name.to_string(),
-                                    args.clone(),
-                                ));
-                                value_types.insert(dst, Type::Any);
+                                //
+                                // cs-qrm — `not` is cheap enough (a one-bit
+                                // flip) to be worth a dedicated `NotBoolean`
+                                // inst even under AOT, where there's no
+                                // inline-cached `vm_ic_call` to soften the
+                                // cost of a full builtin-procedure dispatch
+                                // per call (see
+                                // docs/measurements/2026-07-10-jit-vs-aot-tak.md).
+                                // `cs-aot`'s Rust-source emitter already
+                                // lowers `NotBoolean` to `v ^ 1` (RC3 iter
+                                // 2.14); mirrors the JIT-side recognition
+                                // below.
+                                if name == "not" && args.len() == 1 {
+                                    match value_types.get(&args[0]).copied() {
+                                        Some(Type::Boolean) => {
+                                            insts.push(RirInst::NotBoolean(dst, args[0]));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        Some(Type::Any) => {
+                                            let truthy = alloc();
+                                            insts.push(RirInst::AnyTruthy(truthy, args[0]));
+                                            value_types.insert(truthy, Type::Boolean);
+                                            insts.push(RirInst::NotBoolean(dst, truthy));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                        // Fixnum, Character, Flonum, Symbol,
+                                        // Null: never #f, so (not x) is
+                                        // always #f.
+                                        _ => {
+                                            insts.push(RirInst::LoadConst(
+                                                dst,
+                                                Const::Boolean(false),
+                                            ));
+                                            value_types.insert(dst, Type::Boolean);
+                                        }
+                                    }
+                                } else {
+                                    insts.push(RirInst::CallBuiltin(
+                                        dst,
+                                        name.to_string(),
+                                        args.clone(),
+                                    ));
+                                    value_types.insert(dst, Type::Any);
+                                }
                                 sim_stack.push(StackEntry::Value(dst));
                             } else {
                                 // Single-Inst lowerings.

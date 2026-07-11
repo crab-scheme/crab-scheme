@@ -705,6 +705,49 @@ fn source_to_aot_not_boolean_lowering() {
 }
 
 #[test]
+fn source_to_aot_not_on_non_boolean_operands() {
+    // cs-qrm — (not x) for x that's never #f (Fixnum, Null, Pair)
+    // must always yield #f, exercising the `Any`/fallthrough arms
+    // of the AOT-mode `not` recognition (not just the Boolean arm
+    // that `source_to_aot_not_boolean_lowering` covers).
+    // Each `not` feeds an `if` (yielding a fixnum) both because the
+    // harness parses stdout as i64 and because not-into-branch is
+    // exactly the hot pattern the AOT recognition targets (tak).
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) \
+           (if (= n 0) (if (not 0) 1 0) \
+           (if (= n 1) (if (not '()) 1 0) \
+           (if (= n 2) (if (not (cons 1 2)) 1 0) \
+               (if (not #f) 1 0)))))",
+        "test",
+        "not_non_boolean",
+    );
+    assert_eq!(run_multi_with_args(&bin, "test", &[0]), 0); // (not 0) = #f
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 0); // (not '()) = #f
+    assert_eq!(run_multi_with_args(&bin, "test", &[2]), 0); // (not pair) = #f
+    assert_eq!(run_multi_with_args(&bin, "test", &[3]), 1); // (not #f) = #t
+}
+
+#[test]
+fn source_to_aot_shadowed_not_still_calls_user_binding() {
+    // cs-qrm — a top-level `(define (not x) ...)` shadows the
+    // builtin; the compiler's global-fold optimization must see the
+    // shadow and never fold the call to the builtin `not`
+    // sentinel, so it stays a generic call rather than the
+    // dedicated `NotBoolean` inst.
+    let bin = aot_compile_multi_and_run(
+        "(define (not x) (if x 111 222)) \
+         (define (test n) (not (= n 0)))",
+        "test",
+        "shadowed_not",
+    );
+    // test(0): (= 0 0) = #t → shadowed (not #t) = 111.
+    assert_eq!(run_multi_with_args(&bin, "test", &[0]), 111);
+    // test(5): (= 5 0) = #f → shadowed (not #f) = 222.
+    assert_eq!(run_multi_with_args(&bin, "test", &[5]), 222);
+}
+
+#[test]
 fn source_to_aot_nested_named_lets_independent() {
     // RC3 iter 2.11 — two nested named-lets where the inner one
     // doesn't call out to the outer. Pre-iter-2.11 this failed

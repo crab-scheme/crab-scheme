@@ -757,7 +757,19 @@ fn run_aot(
     };
     drop(expander);
 
-    let globals = HashMap::new();
+    // cs-qrm: populate globals from the runtime's builtins so the
+    // compiler folds (not p), (/ a b), (display x), etc. to
+    // Const(Procedure) — same as run_aot_multi's RC3 iter 2.14 fix.
+    // Without this every builtin ref compiles to LoadVar/EnvLookupAny
+    // + CallGeneral, paying full uncached procedure-dispatch cost per
+    // call even for a one-bit boolean flip like `not` (see
+    // docs/measurements/2026-07-10-jit-vs-aot-tak.md).
+    let rt_globals = cs_runtime::Runtime::new().builtin_procs_by_name();
+    let mut globals: HashMap<cs_core::Symbol, cs_core::Value> = HashMap::new();
+    for (name, val) in rt_globals {
+        let sym = syms.intern(&name);
+        globals.insert(sym, val);
+    }
     let primops = aot_primop_table(&mut syms);
     let bc = match compile_with_globals_and_primops(&core, &globals, &primops) {
         Ok(b) => b,
