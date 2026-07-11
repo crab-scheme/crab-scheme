@@ -504,7 +504,7 @@ pub enum WeakValue {
     Hashtable(cs_gc::Weak<Hashtable>),
     Port(cs_gc::Weak<Port>),
     Promise(cs_gc::Weak<Promise>),
-    Procedure(std::rc::Weak<dyn Procedure>),
+    Procedure(std::rc::Weak<Box<dyn Procedure>>),
 }
 
 impl WeakValue {
@@ -1031,9 +1031,9 @@ impl cs_gc::cycle::CycleVisit for Parameter {
 }
 
 pub fn make_parameter(initial: Value) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(Parameter {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(Parameter {
         cell: RefCell::new(initial),
-    });
+    }));
     Value::Procedure(p)
 }
 
@@ -1074,7 +1074,7 @@ pub enum Value {
     Pair(crate::Gc<Pair>),
     Vector(crate::Gc<RefCell<Vec<Value>>>),
     ByteVector(crate::Gc<RefCell<Vec<u8>>>),
-    Procedure(Rc<dyn Procedure>),
+    Procedure(Rc<Box<dyn Procedure>>),
     Hashtable(crate::Gc<Hashtable>),
     Port(crate::Gc<Port>),
     Promise(crate::Gc<Promise>),
@@ -1629,6 +1629,25 @@ mod pair_diet_tests {
         let addr = p.addr();
         let leaked = PAIR_CAR_TOMBSTONES.with(|t| t.borrow().contains_key(&addr));
         assert!(!leaked, "set_car! must clear the tombstone table entry");
+    }
+}
+
+#[cfg(test)]
+mod procedure_pointer_tests {
+    /// cs-7kg: `Rc<dyn Procedure>` is a 16B fat pointer (data + vtable),
+    /// which denies `Value::Procedure` a niche for its discriminant and
+    /// pins `Value` at 24B. `Box<dyn Procedure>` is `Sized`, so wrapping
+    /// it in `Rc<Box<dyn Procedure>>` moves the vtable into the `RcBox`
+    /// heap payload and leaves the pointer itself thin (8B). `Value`
+    /// stays 24B until the follow-up flattening (cs-7xg stage 2, deferred
+    /// until this pointer is thin).
+    #[test]
+    fn procedure_rc_is_thin() {
+        assert_eq!(
+            std::mem::size_of::<std::rc::Rc<Box<dyn super::Procedure>>>(),
+            8,
+            "Rc<Box<dyn Procedure>> must be a thin 8B pointer"
+        );
     }
 }
 
