@@ -107,15 +107,15 @@ impl Procedure for Continuation {
 }
 
 pub fn make_continuation(id: u64) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(Continuation { id });
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(Continuation { id }));
     Value::Procedure(p)
 }
 
 pub fn make_builtin_pure(name: &'static str, f: PureBuiltinFn) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(Builtin {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(Builtin {
         name,
         f: BuiltinFn::Pure(f),
-    });
+    }));
     Value::Procedure(p)
 }
 
@@ -165,18 +165,18 @@ pub fn make_host_builtin(
 }
 
 pub fn make_builtin_higher(name: &'static str, f: HoBuiltinFn) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(Builtin {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(Builtin {
         name,
         f: BuiltinFn::Higher(f),
-    });
+    }));
     Value::Procedure(p)
 }
 
 pub fn make_builtin_syms(name: &'static str, f: SymsBuiltinFn) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(Builtin {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(Builtin {
         name,
         f: BuiltinFn::Syms(f),
-    });
+    }));
     Value::Procedure(p)
 }
 
@@ -188,12 +188,12 @@ pub fn make_closure(
     syms: &SymbolTable,
 ) -> Value {
     let display_name = name.map(|s| syms.name(s).to_string());
-    let p: Rc<dyn Procedure> = Rc::new(Closure {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(Closure {
         params,
         body,
         env,
         name,
         display_name,
-    });
+    }));
     Value::Procedure(p)
 }
