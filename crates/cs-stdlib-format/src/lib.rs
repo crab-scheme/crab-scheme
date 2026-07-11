@@ -95,9 +95,7 @@ fn format_string(args: &[Value]) -> Result<Value, FfiError> {
         )));
     }
 
-    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
-        out,
-    ))))
+    Ok(Value::string(out))
 }
 
 fn render(directive: char, v: &Value, out: &mut String) -> Result<(), FfiError> {

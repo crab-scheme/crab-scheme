@@ -149,7 +149,8 @@ fn vector_promotion_descends_into_elements() {
 fn string_promotion_clones_payload() {
     let v = {
         let region = Region::new();
-        let s: Gc<RefCell<String>> = Gc::new_in(&region, RefCell::new("hello world".to_string()));
+        let s: Gc<RefCell<cs_core::CsStr>> =
+            Gc::new_in(&region, RefCell::new(cs_core::CsStr::new("hello world")));
         assert!(Gc::is_region(&s));
         let mut v = Value::String(s);
         v.promote_deep();

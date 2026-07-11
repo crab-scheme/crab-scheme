@@ -569,9 +569,7 @@ pub fn b_node_listen(args: &[Value], syms: &mut SymbolTable) -> Result<Value, St
     let node = name_of(&args[0], syms, "node-listen")?;
     let addr = name_of(&args[1], syms, "node-listen")?;
     let bound = primop_node_listen(&node, &addr)?;
-    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
-        bound,
-    ))))
+    Ok(Value::string(bound))
 }
 
 /// `(node-connect NODE PEER-ADDR)` — connect NODE to a peer over TCP.
@@ -593,9 +591,7 @@ pub fn b_node_listen_tls(args: &[Value], syms: &mut SymbolTable) -> Result<Value
     let node = name_of(&args[0], syms, "node-listen-tls")?;
     let addr = name_of(&args[1], syms, "node-listen-tls")?;
     let bound = primop_node_listen_tls(&node, &addr)?;
-    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
-        bound,
-    ))))
+    Ok(Value::string(bound))
 }
 
 /// `(node-connect-tls NODE PEER-ADDR)` — connect NODE to a peer with mutual TLS.
@@ -617,9 +613,7 @@ pub fn b_node_listen_quic(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     let node = name_of(&args[0], syms, "node-listen-quic")?;
     let addr = name_of(&args[1], syms, "node-listen-quic")?;
     let bound = primop_node_listen_quic(&node, &addr)?;
-    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
-        bound,
-    ))))
+    Ok(Value::string(bound))
 }
 
 /// `(node-connect-quic NODE PEER-ADDR)` — connect NODE to a QUIC peer (mTLS).
@@ -947,7 +941,9 @@ fn decode_value(c: &mut Dec, syms: &mut SymbolTable) -> Result<Value, String> {
                 cs_core::Number::parse_decimal_integer(&s).expect("bigint round-trip"),
             ))
         }
-        8 => Ok(Value::String(cs_core::Gc::new(RefCell::new(c.string()?)))),
+        8 => Ok(Value::String(cs_core::Gc::new(RefCell::new(
+            cs_core::CsStr::new(c.string()?),
+        )))),
         9 => Ok(Value::Symbol(syms.intern(&c.string()?))),
         10 => {
             let a = decode_value(c, syms)?;

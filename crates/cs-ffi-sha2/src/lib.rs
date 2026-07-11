@@ -87,9 +87,7 @@ fn sha256_impl(args: &[Value]) -> Result<Value, FfiError> {
     }
     let digest = hasher.finalize();
     let hex_str = hex::encode(digest);
-    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
-        hex_str,
-    ))))
+    Ok(Value::string(hex_str))
 }
 
 // ----------------------------------------------------------------------
@@ -251,7 +249,7 @@ mod tests {
     #[test]
     fn sha256_of_empty_string_is_known_value() {
         let proc = make_sha256_proc();
-        let empty = Value::String(cs_core::Gc::new(std::cell::RefCell::new(String::new())));
+        let empty = Value::string(String::new());
         let result = proc.call(&[empty]).unwrap();
         match result {
             Value::String(s) => assert_eq!(
@@ -265,9 +263,7 @@ mod tests {
     #[test]
     fn sha256_of_hello_matches_known() {
         let proc = make_sha256_proc();
-        let s = Value::String(cs_core::Gc::new(std::cell::RefCell::new(
-            "hello".to_string(),
-        )));
+        let s = Value::string("hello".to_string());
         let result = proc.call(&[s]).unwrap();
         match result {
             Value::String(s) => assert_eq!(

@@ -75,7 +75,7 @@ impl FromValue for char {
 impl FromValue for String {
     fn from_value(v: &Value) -> Result<Self, FfiError> {
         match v {
-            Value::String(s) => Ok(s.borrow().clone()),
+            Value::String(s) => Ok(s.borrow().to_string()),
             other => Err(FfiError::TypeMismatch {
                 expected: "string",
                 got: other.type_name().to_string(),

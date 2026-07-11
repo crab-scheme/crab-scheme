@@ -104,7 +104,8 @@ pub fn vector_in(lifetime: Lifetime, elems: Vec<Value>) -> Result<Value, String>
 /// `(make-string n fill)` lifetime-aware.
 pub fn make_string_in(lifetime: Lifetime, n: usize, fill: char) -> Result<Value, String> {
     let s: String = std::iter::repeat(fill).take(n).collect();
-    let g: Gc<RefCell<String>> = match lifetime {
+    let s = cs_core::CsStr::new(s);
+    let g: Gc<RefCell<cs_core::CsStr>> = match lifetime {
         Lifetime::Region(_) | Lifetime::Stack => {
             let region = current_region().ok_or_else(|| no_region_err("make-string"))?;
             Gc::new_in(&region, RefCell::new(s))
