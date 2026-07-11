@@ -200,75 +200,101 @@ pub fn apply_procedure(
 ) -> Result<Value, EvalError> {
     match proc_val {
         Value::Procedure(p) => {
-            let any = p.as_any();
-            if let Some(b) = any.downcast_ref::<Builtin>() {
-                return match b.f {
-                    BuiltinFn::Pure(f) => {
-                        f(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+            use cs_core::ProcKind;
+            match p.kind() {
+                ProcKind::Builtin => {
+                    let b = p
+                        .as_any()
+                        .downcast_ref::<Builtin>()
+                        .expect("kind()==Builtin");
+                    match b.f {
+                        BuiltinFn::Pure(f) => {
+                            f(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                        }
+                        BuiltinFn::Higher(f) => {
+                            f(args, ctx).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                        }
+                        BuiltinFn::Syms(f) => {
+                            f(args, ctx.syms).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                        }
                     }
-                    BuiltinFn::Higher(f) => {
-                        f(args, ctx).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                }
+                ProcKind::HostBuiltin => {
+                    let h = p
+                        .as_any()
+                        .downcast_ref::<crate::proc::HostBuiltin>()
+                        .expect("kind()==HostBuiltin");
+                    (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                }
+                // Closure-bearing builtins constructed via make_host_builtin
+                // ride cs-vm's VmHostBuiltin so they dispatch on both tiers.
+                // Walker downcast added in M9 iter 2.
+                ProcKind::VmHostBuiltin => {
+                    let h = p
+                        .as_any()
+                        .downcast_ref::<cs_vm::vm::VmHostBuiltin>()
+                        .expect("kind()==VmHostBuiltin");
+                    (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                }
+                ProcKind::Closure => {
+                    let c = p
+                        .as_any()
+                        .downcast_ref::<Closure>()
+                        .expect("kind()==Closure");
+                    if !c.params.accepts_arity(args.len()) {
+                        return Err(EvalError::new(
+                            format!(
+                                "{}: arity mismatch (expected {}{}, got {})",
+                                c.display_name.as_deref().unwrap_or("procedure"),
+                                c.params.fixed.len(),
+                                if c.params.rest.is_some() { "+" } else { "" },
+                                args.len(),
+                            ),
+                            Span::DUMMY,
+                        ));
                     }
-                    BuiltinFn::Syms(f) => {
-                        f(args, ctx.syms).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY))
+                    let new_env = Frame::child(c.env.clone());
+                    for (name, val) in c.params.fixed.iter().zip(args.iter()) {
+                        new_env.define(*name, val.clone());
                     }
-                };
-            }
-            if let Some(h) = any.downcast_ref::<crate::proc::HostBuiltin>() {
-                return (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY));
-            }
-            // Closure-bearing builtins constructed via make_host_builtin
-            // ride cs-vm's VmHostBuiltin so they dispatch on both tiers.
-            // Walker downcast added in M9 iter 2.
-            if let Some(h) = any.downcast_ref::<cs_vm::vm::VmHostBuiltin>() {
-                return (h.f)(args).map_err(|m| builtin_err_to_eval(ctx, m, Span::DUMMY));
-            }
-            if let Some(c) = any.downcast_ref::<Closure>() {
-                if !c.params.accepts_arity(args.len()) {
-                    return Err(EvalError::new(
-                        format!(
-                            "{}: arity mismatch (expected {}{}, got {})",
-                            c.display_name.as_deref().unwrap_or("procedure"),
-                            c.params.fixed.len(),
-                            if c.params.rest.is_some() { "+" } else { "" },
-                            args.len(),
-                        ),
-                        Span::DUMMY,
-                    ));
+                    if let Some(rest_name) = c.params.rest {
+                        let rest_args = &args[c.params.fixed.len()..];
+                        new_env.define(rest_name, Value::list(rest_args.iter().cloned()));
+                    }
+                    eval(&c.body, new_env, ctx)
                 }
-                let new_env = Frame::child(c.env.clone());
-                for (name, val) in c.params.fixed.iter().zip(args.iter()) {
-                    new_env.define(*name, val.clone());
+                ProcKind::Parameter => {
+                    let param = p
+                        .as_any()
+                        .downcast_ref::<Parameter>()
+                        .expect("kind()==Parameter");
+                    Ok(call_parameter(param, args))
                 }
-                if let Some(rest_name) = c.params.rest {
-                    let rest_args = &args[c.params.fixed.len()..];
-                    new_env.define(rest_name, Value::list(rest_args.iter().cloned()));
+                ProcKind::Continuation => {
+                    let k = p
+                        .as_any()
+                        .downcast_ref::<crate::proc::Continuation>()
+                        .expect("kind()==Continuation");
+                    let v = if args.is_empty() {
+                        Value::Unspecified
+                    } else {
+                        args[0].clone()
+                    };
+                    // Stash via side-channel so higher-order builtins that
+                    // collapse `EvalError -> String` (via .message()) still let
+                    // call/cc reconstruct the Escape via builtin_err_to_eval.
+                    ctx.pending_escape = Some((k.id, v));
+                    Err(EvalError::new("__escape__", Span::DUMMY))
                 }
-                return eval(&c.body, new_env, ctx);
+                // A `Value::Procedure` the walker doesn't recognize is a
+                // VM/JIT-tier procedure (VmClosure / VmBuiltin / …). Delegate
+                // to the VM's universal caller so higher-order *walker*
+                // builtins (take-while, …) bridged onto the VM tier can invoke
+                // a VM-closure predicate. On a pure walker run this arm is
+                // unreachable (every proc is a walker type handled above).
+                _ => cs_vm::vm::vm_call_sync(proc_val, args, ctx.syms)
+                    .map_err(|e| EvalError::new(e.message, Span::DUMMY)),
             }
-            if let Some(param) = any.downcast_ref::<Parameter>() {
-                return Ok(call_parameter(param, args));
-            }
-            if let Some(k) = any.downcast_ref::<crate::proc::Continuation>() {
-                let v = if args.is_empty() {
-                    Value::Unspecified
-                } else {
-                    args[0].clone()
-                };
-                // Stash via side-channel so higher-order builtins that
-                // collapse `EvalError -> String` (via .message()) still let
-                // call/cc reconstruct the Escape via builtin_err_to_eval.
-                ctx.pending_escape = Some((k.id, v));
-                return Err(EvalError::new("__escape__", Span::DUMMY));
-            }
-            // A `Value::Procedure` the walker doesn't recognize is a
-            // VM/JIT-tier procedure (VmClosure / VmBuiltin / …). Delegate
-            // to the VM's universal caller so higher-order *walker*
-            // builtins (take-while, …) bridged onto the VM tier can invoke
-            // a VM-closure predicate. On a pure walker run this arm is
-            // unreachable (every proc is a walker type handled above).
-            cs_vm::vm::vm_call_sync(proc_val, args, ctx.syms)
-                .map_err(|e| EvalError::new(e.message, Span::DUMMY))
         }
         v => Err(EvalError::new(
             format!("not a procedure: {}", v.type_name()),
@@ -441,68 +467,97 @@ fn eval_inner(expr: &CoreExpr, env: Rc<Frame>, ctx: &mut EvalCtx) -> Result<Valu
                 }
                 match &func_val {
                     Value::Procedure(p) => {
-                        let any = p.as_any();
-                        if let Some(b) = any.downcast_ref::<Builtin>() {
-                            let res = match b.f {
-                                BuiltinFn::Pure(f) => f(&arg_vals),
-                                BuiltinFn::Higher(f) => f(&arg_vals, ctx),
-                                BuiltinFn::Syms(f) => f(&arg_vals, ctx.syms),
-                            };
-                            return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
-                        }
-                        if let Some(h) = any.downcast_ref::<crate::proc::HostBuiltin>() {
-                            let res = (h.f)(&arg_vals);
-                            return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
-                        }
-                        if let Some(h) = any.downcast_ref::<cs_vm::vm::VmHostBuiltin>() {
-                            let res = (h.f)(&arg_vals);
-                            return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
-                        }
-                        if let Some(c) = any.downcast_ref::<Closure>() {
-                            if !c.params.accepts_arity(arg_vals.len()) {
-                                return Err(EvalError::new(
-                                    format!(
-                                        "{}: arity mismatch (expected {}{}, got {})",
-                                        c.display_name.as_deref().unwrap_or("procedure"),
-                                        c.params.fixed.len(),
-                                        if c.params.rest.is_some() { "+" } else { "" },
-                                        arg_vals.len(),
-                                    ),
-                                    span,
-                                ));
+                        use cs_core::ProcKind;
+                        match p.kind() {
+                            ProcKind::Builtin => {
+                                let b = p
+                                    .as_any()
+                                    .downcast_ref::<Builtin>()
+                                    .expect("kind()==Builtin");
+                                let res = match b.f {
+                                    BuiltinFn::Pure(f) => f(&arg_vals),
+                                    BuiltinFn::Higher(f) => f(&arg_vals, ctx),
+                                    BuiltinFn::Syms(f) => f(&arg_vals, ctx.syms),
+                                };
+                                return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                             }
-                            let new_env = Frame::child(c.env.clone());
-                            for (name, val) in c.params.fixed.iter().zip(arg_vals.iter()) {
-                                new_env.define(*name, val.clone());
+                            ProcKind::HostBuiltin => {
+                                let h = p
+                                    .as_any()
+                                    .downcast_ref::<crate::proc::HostBuiltin>()
+                                    .expect("kind()==HostBuiltin");
+                                let res = (h.f)(&arg_vals);
+                                return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                             }
-                            if let Some(rest_name) = c.params.rest {
-                                let rest_args = &arg_vals[c.params.fixed.len()..];
-                                new_env.define(rest_name, Value::list(rest_args.iter().cloned()));
+                            ProcKind::VmHostBuiltin => {
+                                let h = p
+                                    .as_any()
+                                    .downcast_ref::<cs_vm::vm::VmHostBuiltin>()
+                                    .expect("kind()==VmHostBuiltin");
+                                let res = (h.f)(&arg_vals);
+                                return res.map_err(|m| builtin_err_to_eval(ctx, m, span));
                             }
-                            cur_env = new_env;
-                            cur_expr = (*c.body).clone();
-                            // Tail-call back-edge: a hot tail loop pushes the same
-                            // call-site span every iteration and would leak forever
-                            // (cw-6m8). But resetting unconditionally also wipes a
-                            // genuine tail-call chain (outer->middle->...) the error
-                            // backtrace needs. ponytail: only reset once the chain
-                            // exceeds the cap — bounds the leak, keeps short chains
-                            // intact for backtraces. Ceiling: a legit tail chain
-                            // deeper than the cap loses its oldest frames on reset.
-                            if ctx.call_stack.len() - tail_snapshot > TAIL_SPAN_CAP {
-                                ctx.call_stack.truncate(tail_snapshot);
+                            ProcKind::Closure => {
+                                let c = p
+                                    .as_any()
+                                    .downcast_ref::<Closure>()
+                                    .expect("kind()==Closure");
+                                if !c.params.accepts_arity(arg_vals.len()) {
+                                    return Err(EvalError::new(
+                                        format!(
+                                            "{}: arity mismatch (expected {}{}, got {})",
+                                            c.display_name.as_deref().unwrap_or("procedure"),
+                                            c.params.fixed.len(),
+                                            if c.params.rest.is_some() { "+" } else { "" },
+                                            arg_vals.len(),
+                                        ),
+                                        span,
+                                    ));
+                                }
+                                let new_env = Frame::child(c.env.clone());
+                                for (name, val) in c.params.fixed.iter().zip(arg_vals.iter()) {
+                                    new_env.define(*name, val.clone());
+                                }
+                                if let Some(rest_name) = c.params.rest {
+                                    let rest_args = &arg_vals[c.params.fixed.len()..];
+                                    new_env
+                                        .define(rest_name, Value::list(rest_args.iter().cloned()));
+                                }
+                                cur_env = new_env;
+                                cur_expr = (*c.body).clone();
+                                // Tail-call back-edge: a hot tail loop pushes the same
+                                // call-site span every iteration and would leak forever
+                                // (cw-6m8). But resetting unconditionally also wipes a
+                                // genuine tail-call chain (outer->middle->...) the error
+                                // backtrace needs. ponytail: only reset once the chain
+                                // exceeds the cap — bounds the leak, keeps short chains
+                                // intact for backtraces. Ceiling: a legit tail chain
+                                // deeper than the cap loses its oldest frames on reset.
+                                if ctx.call_stack.len() - tail_snapshot > TAIL_SPAN_CAP {
+                                    ctx.call_stack.truncate(tail_snapshot);
+                                }
+                                continue;
                             }
-                            continue;
+                            ProcKind::Parameter => {
+                                let param = p
+                                    .as_any()
+                                    .downcast_ref::<Parameter>()
+                                    .expect("kind()==Parameter");
+                                return Ok(call_parameter(param, &arg_vals));
+                            }
+                            ProcKind::Continuation => {
+                                let k = p
+                                    .as_any()
+                                    .downcast_ref::<crate::proc::Continuation>()
+                                    .expect("kind()==Continuation");
+                                let v = arg_vals.first().cloned().unwrap_or(Value::Unspecified);
+                                ctx.pending_escape = Some((k.id, v));
+                                return Err(EvalError::new("__escape__", span));
+                            }
+                            _ => {
+                                return Err(EvalError::new("unknown procedure type", span));
+                            }
                         }
-                        if let Some(param) = any.downcast_ref::<Parameter>() {
-                            return Ok(call_parameter(param, &arg_vals));
-                        }
-                        if let Some(k) = any.downcast_ref::<crate::proc::Continuation>() {
-                            let v = arg_vals.first().cloned().unwrap_or(Value::Unspecified);
-                            ctx.pending_escape = Some((k.id, v));
-                            return Err(EvalError::new("__escape__", span));
-                        }
-                        return Err(EvalError::new("unknown procedure type", span));
                     }
                     other => {
                         return Err(EvalError::new(
