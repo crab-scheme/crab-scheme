@@ -173,6 +173,7 @@ fn hashtable_promotion_descends_into_items() {
             ]),
             eq_kind: HtEqKind::Eqv,
             custom: None,
+            index: RefCell::new(std::collections::HashMap::new()),
         };
         let h: Gc<Hashtable> = Gc::new_in(&region, ht);
         assert!(Gc::is_region(&h));

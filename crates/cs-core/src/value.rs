@@ -684,8 +684,7 @@ impl cs_gc::cycle::CycleVisit for Pair {
     }
 }
 
-/// Hashtable equality kind. Real hashing comes later; foundation uses
-/// linear search over a Vec — correctness first.
+/// Hashtable equality kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HtEqKind {
     /// `eq?` — pointer/identity equality.
@@ -710,12 +709,25 @@ pub struct CustomHashFns {
 }
 
 /// R6RS hashtable.
+///
+/// `items` is the source of truth (preserves insertion order, which
+/// existing iteration/keys/values/entries callers rely on). `index` is a
+/// bucket accelerator over it: hash value -> indices into `items` sharing
+/// that hash. It always mirrors `items` (`hash_of(items[i].0) == h` for
+/// every `i` in `index[h]`) except transiently mid-mutation inside
+/// cs-runtime's hashtable builtins, which keep the two in sync on every
+/// insert/delete. A stale index (e.g. from mutating a key in place after
+/// insertion, which no hashtable implementation defends against) can only
+/// cause a false probe miss resolved by falling back to the real
+/// eq/eqv/equal comparator — it can never cause a false hit.
 #[derive(Debug)]
 pub struct Hashtable {
     pub items: RefCell<Vec<(Value, Value)>>,
     pub eq_kind: HtEqKind,
     /// Populated only when `eq_kind == Custom`.
     pub custom: Option<CustomHashFns>,
+    /// Hash -> indices into `items`. See struct docs for the invariant.
+    pub index: RefCell<HashMap<u64, Vec<u32>>>,
 }
 
 impl Hashtable {
@@ -724,6 +736,7 @@ impl Hashtable {
             items: RefCell::new(Vec::new()),
             eq_kind,
             custom: None,
+            index: RefCell::new(HashMap::new()),
         })
     }
 
@@ -735,7 +748,28 @@ impl Hashtable {
             items: RefCell::new(Vec::new()),
             eq_kind: HtEqKind::Custom,
             custom: Some(CustomHashFns { hash, equiv }),
+            index: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Record that `items[item_idx]` hashes to `hash`.
+    pub fn index_insert(&self, hash: u64, item_idx: u32) {
+        self.index
+            .borrow_mut()
+            .entry(hash)
+            .or_default()
+            .push(item_idx);
+    }
+
+    /// Rebuild the bucket index from scratch via `hash_fn`. O(n); used
+    /// after bulk mutation (delete, copy, clear) where incremental
+    /// fixup isn't worth the bookkeeping.
+    pub fn rebuild_index<F: Fn(&Value) -> u64>(&self, hash_fn: F) {
+        let mut index = self.index.borrow_mut();
+        index.clear();
+        for (i, (k, _)) in self.items.borrow().iter().enumerate() {
+            index.entry(hash_fn(k)).or_default().push(i as u32);
+        }
     }
 }
 

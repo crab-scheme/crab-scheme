@@ -768,6 +768,11 @@ fn conformance_hashtable_custom() {
 }
 
 #[test]
+fn conformance_hashtable_hashing() {
+    run_conformance_file("hashtable_hashing.scm");
+}
+
+#[test]
 fn conformance_library_imports() {
     run_conformance_file("library_imports.scm");
 }
@@ -1130,6 +1135,7 @@ fn conformance_aggregate_count() {
                 "r7rs_division.scm",
                 "vec_list_extras.scm",
                 "hashtable_custom.scm",
+                "hashtable_hashing.scm",
                 "library_imports.scm",
                 "library_validate.scm",
                 "r7rs_define_library.scm",

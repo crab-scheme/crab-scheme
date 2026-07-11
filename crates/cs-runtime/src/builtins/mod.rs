@@ -6817,26 +6817,59 @@ fn ht_eq_ctx(
     Ok(r.is_truthy())
 }
 
-/// Index of an entry whose key matches `key`, if any. Custom-equiv tables
-/// apply the user's equiv procedure (via `ht_eq_ctx`); built-in kinds use
-/// the host comparator. Centralizes the Custom/built-in dispatch so callers
-/// (e.g. `hashtable-update!`) don't accidentally route a Custom table
-/// through `ht_eq`, which panics on the Custom kind.
-fn ht_find_index(h: &Hashtable, key: &Value, ctx: &mut EvalCtx) -> Result<Option<usize>, String> {
-    if h.eq_kind == HtEqKind::Custom {
-        let len = h.items.borrow().len();
-        for i in 0..len {
-            let k = h.items.borrow()[i].0.clone();
-            if ht_eq_ctx(h, &k, key, ctx)? {
-                return Ok(Some(i));
-            }
-        }
-        Ok(None)
-    } else {
-        let kind = h.eq_kind;
-        let items = h.items.borrow();
-        Ok(items.iter().position(|(k, _)| ht_eq(kind, k, key)))
+/// Hash a key consistently with `ht_eq_ctx`'s notion of equality for this
+/// table: built-in kinds hash via `cs_core::eq::hash_value`; Custom tables
+/// apply the user-supplied hash procedure. A hash proc that doesn't return
+/// a fixnum (or a table whose `custom` is unexpectedly absent) degrades to
+/// a single shared bucket — `ht_eq_ctx` still resolves collisions, so this
+/// can only cost performance, never correctness.
+fn ht_hash_ctx(h: &Hashtable, key: &Value, ctx: &mut EvalCtx) -> Result<u64, String> {
+    if h.eq_kind != HtEqKind::Custom {
+        return Ok(eq::hash_value(key, h.eq_kind));
     }
+    let hash_proc = match h.custom.as_ref() {
+        Some(c) => c.hash.clone(),
+        None => return Ok(0),
+    };
+    let r = apply_procedure(&hash_proc, &[key.clone()], ctx).map_err(|d| format!("{:?}", d))?;
+    Ok(match r {
+        Value::Number(Number::Fixnum(n)) => n as u64,
+        _ => 0,
+    })
+}
+
+/// Rebuild `h`'s bucket index from scratch. O(n) (or O(n) user-hash-proc
+/// calls for Custom tables). Used by the mutation paths where an
+/// incremental fixup isn't worth the bookkeeping (delete is rare).
+fn ht_reindex_all(h: &Hashtable, ctx: &mut EvalCtx) -> Result<(), String> {
+    let keys: Vec<Value> = h.items.borrow().iter().map(|(k, _)| k.clone()).collect();
+    let mut new_index: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        let hash = ht_hash_ctx(h, k, ctx)?;
+        new_index.entry(hash).or_default().push(i as u32);
+    }
+    *h.index.borrow_mut() = new_index;
+    Ok(())
+}
+
+/// Index of an entry whose key matches `key`, if any. O(1) average via the
+/// bucket index (falls back to per-bucket linear scan on hash collisions,
+/// resolved by the real comparator — `ht_eq_ctx`, which applies the user's
+/// equiv procedure for Custom tables and the host comparator otherwise).
+fn ht_find_index(h: &Hashtable, key: &Value, ctx: &mut EvalCtx) -> Result<Option<usize>, String> {
+    let hash = ht_hash_ctx(h, key, ctx)?;
+    // Clone the (small) bucket out from under the borrow before calling
+    // ht_eq_ctx, which for Custom tables invokes arbitrary user code that
+    // could re-enter this table (e.g. a pathological equiv proc) and
+    // panic on a re-borrow.
+    let bucket: Vec<u32> = h.index.borrow().get(&hash).cloned().unwrap_or_default();
+    for i in bucket {
+        let k = h.items.borrow()[i as usize].0.clone();
+        if ht_eq_ctx(h, &k, key, ctx)? {
+            return Ok(Some(i as usize));
+        }
+    }
+    Ok(None)
 }
 
 fn as_ht<'a>(name: &str, v: &'a Value) -> Result<&'a cs_core::Gc<Hashtable>, String> {
@@ -6859,49 +6892,17 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Err(arity_err("hashtable-set!", "3", args.len()));
     }
     let h = as_ht("hashtable-set!", &args[0])?.clone();
-    if h.eq_kind == HtEqKind::Custom {
-        // Linear search applying the user's equiv proc each step.
-        let len = h.items.borrow().len();
-        for i in 0..len {
-            let k = h.items.borrow()[i].0.clone();
-            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
-                h.items.borrow_mut()[i].1 = args[2].clone();
-                // Region-memory iter 5 (FR-8): see b_set_car.
-                #[cfg(feature = "regions")]
-                if cs_gc::Gc::is_region(&h) {
-                    return Ok(Value::Unspecified);
-                }
-                // cs-fsq: see b_set_car — leaf writes can't
-                // close a cycle, skip the DFS.
-                if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
-                    cs_gc::cycle::check_and_break(&h, |h| {
-                        crate::countable_memory_cycle::record_cycle_with_candidate(h);
-                    });
-                }
-                return Ok(Value::Unspecified);
-            }
+    match ht_find_index(&h, &args[1], ctx)? {
+        Some(i) => {
+            h.items.borrow_mut()[i].1 = args[2].clone();
         }
-        h.items
-            .borrow_mut()
-            .push((args[1].clone(), args[2].clone()));
-        #[cfg(feature = "regions")]
-        if cs_gc::Gc::is_region(&h) {
-            return Ok(Value::Unspecified);
-        }
-        if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
-            cs_gc::cycle::check_and_break(&h, |h| {
-                crate::countable_memory_cycle::record_cycle_with_candidate(h);
-            });
-        }
-        return Ok(Value::Unspecified);
-    }
-    let kind = h.eq_kind;
-    {
-        let mut items = h.items.borrow_mut();
-        if let Some(slot) = items.iter_mut().find(|(k, _)| ht_eq(kind, k, &args[1])) {
-            slot.1 = args[2].clone();
-        } else {
-            items.push((args[1].clone(), args[2].clone()));
+        None => {
+            let hash = ht_hash_ctx(&h, &args[1], ctx)?;
+            let idx = h.items.borrow().len() as u32;
+            h.items
+                .borrow_mut()
+                .push((args[1].clone(), args[2].clone()));
+            h.index_insert(hash, idx);
         }
     }
     // Region-memory iter 5 (FR-8): see b_set_car.
@@ -6924,22 +6925,9 @@ fn b_hashtable_ref(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Err(arity_err("hashtable-ref", "3", args.len()));
     }
     let h = as_ht("hashtable-ref", &args[0])?.clone();
-    if h.eq_kind == HtEqKind::Custom {
-        let len = h.items.borrow().len();
-        for i in 0..len {
-            let k = h.items.borrow()[i].0.clone();
-            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
-                return Ok(h.items.borrow()[i].1.clone());
-            }
-        }
-        return Ok(args[2].clone());
-    }
-    let kind = h.eq_kind;
-    let items = h.items.borrow();
-    if let Some((_, v)) = items.iter().find(|(k, _)| ht_eq(kind, k, &args[1])) {
-        Ok(v.clone())
-    } else {
-        Ok(args[2].clone())
+    match ht_find_index(&h, &args[1], ctx)? {
+        Some(i) => Ok(h.items.borrow()[i].1.clone()),
+        None => Ok(args[2].clone()),
     }
 }
 
@@ -6948,21 +6936,7 @@ fn b_hashtable_contains(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Stri
         return Err(arity_err("hashtable-contains?", "2", args.len()));
     }
     let h = as_ht("hashtable-contains?", &args[0])?.clone();
-    if h.eq_kind == HtEqKind::Custom {
-        let len = h.items.borrow().len();
-        for i in 0..len {
-            let k = h.items.borrow()[i].0.clone();
-            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
-                return Ok(Value::Boolean(true));
-            }
-        }
-        return Ok(Value::Boolean(false));
-    }
-    let kind = h.eq_kind;
-    let items = h.items.borrow();
-    Ok(Value::Boolean(
-        items.iter().any(|(k, _)| ht_eq(kind, k, &args[1])),
-    ))
+    Ok(Value::Boolean(ht_find_index(&h, &args[1], ctx)?.is_some()))
 }
 
 fn b_hashtable_delete(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
@@ -6970,21 +6944,11 @@ fn b_hashtable_delete(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String
         return Err(arity_err("hashtable-delete!", "2", args.len()));
     }
     let h = as_ht("hashtable-delete!", &args[0])?.clone();
-    if h.eq_kind == HtEqKind::Custom {
-        let len = h.items.borrow().len();
-        for i in 0..len {
-            let k = h.items.borrow()[i].0.clone();
-            if ht_eq_ctx(&h, &k, &args[1], ctx)? {
-                h.items.borrow_mut().swap_remove(i);
-                return Ok(Value::Unspecified);
-            }
-        }
-        return Ok(Value::Unspecified);
-    }
-    let kind = h.eq_kind;
-    let mut items = h.items.borrow_mut();
-    if let Some(idx) = items.iter().position(|(k, _)| ht_eq(kind, k, &args[1])) {
-        items.swap_remove(idx);
+    if let Some(idx) = ht_find_index(&h, &args[1], ctx)? {
+        h.items.borrow_mut().swap_remove(idx);
+        // Delete is rare; a full reindex is simpler and cheaper to keep
+        // correct than fixing up the swap_remove's moved element by hand.
+        ht_reindex_all(&h, ctx)?;
     }
     Ok(Value::Unspecified)
 }
@@ -7027,6 +6991,9 @@ fn b_hashtable_copy(args: &[Value]) -> Result<Value, String> {
         kind => Hashtable::new(kind),
     };
     *new_ht.items.borrow_mut() = items;
+    // items are copied at the same positions, so the bucket index
+    // (hash -> position) carries over verbatim — no rehash needed.
+    *new_ht.index.borrow_mut() = h.index.borrow().clone();
     Ok(Value::Hashtable(new_ht))
 }
 
@@ -7108,6 +7075,7 @@ fn b_hashtable_clear(args: &[Value]) -> Result<Value, String> {
     }
     let h = as_ht("hashtable-clear!", &args[0])?;
     h.items.borrow_mut().clear();
+    h.index.borrow_mut().clear();
     Ok(Value::Unspecified)
 }
 
@@ -7128,10 +7096,16 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     let new_val =
         apply_procedure(&args[2], &[current], ctx).map_err(|e| propagate_eval_err(e, ctx))?;
     // Re-locate after the update proc runs — it may have mutated the table.
-    if let Some(i) = ht_find_index(&h, &args[1], ctx)? {
-        h.items.borrow_mut()[i].1 = new_val;
-    } else {
-        h.items.borrow_mut().push((args[1].clone(), new_val));
+    match ht_find_index(&h, &args[1], ctx)? {
+        Some(i) => {
+            h.items.borrow_mut()[i].1 = new_val;
+        }
+        None => {
+            let hash = ht_hash_ctx(&h, &args[1], ctx)?;
+            let idx = h.items.borrow().len() as u32;
+            h.items.borrow_mut().push((args[1].clone(), new_val));
+            h.index_insert(hash, idx);
+        }
     }
     Ok(Value::Unspecified)
 }
@@ -12283,6 +12257,7 @@ fn b_alist_to_hashtable(args: &[Value]) -> Result<Value, String> {
             }
         }
     }
+    h.rebuild_index(|k| eq::hash_value(k, kind));
     Ok(Value::Hashtable(h))
 }
 

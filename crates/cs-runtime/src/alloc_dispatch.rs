@@ -133,6 +133,7 @@ pub fn make_hashtable_in(lifetime: Lifetime, eq_kind: HtEqKind) -> Result<Value,
         items: RefCell::new(Vec::new()),
         eq_kind,
         custom: None,
+        index: RefCell::new(std::collections::HashMap::new()),
     };
     let g: Gc<Hashtable> = match lifetime {
         Lifetime::Region(_) | Lifetime::Stack => {

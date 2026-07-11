@@ -670,6 +670,14 @@ fn vm_conformance_hashtable_custom() {
 }
 
 #[test]
+fn vm_conformance_hashtable_hashing() {
+    let walker = pass_count_walker("hashtable_hashing.scm");
+    let vm = pass_count_vm("hashtable_hashing.scm").expect("vm should run hashtable_hashing.scm");
+    println!("hashtable_hashing: walker={} vm={}", walker, vm);
+    assert_eq!(walker, vm);
+}
+
+#[test]
 fn vm_conformance_library_imports() {
     let walker = pass_count_walker("library_imports.scm");
     let vm = pass_count_vm("library_imports.scm").expect("vm should run library_imports.scm");
