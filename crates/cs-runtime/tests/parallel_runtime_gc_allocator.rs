@@ -63,7 +63,7 @@ fn leaf_values_report_leaf() {
 
 #[test]
 fn string_classification() {
-    let s = Gc::new(RefCell::new(String::from("hello")));
+    let s = Gc::new(RefCell::new(cs_core::CsStr::new("hello")));
     assert_eq!(allocator_tier(&Value::String(s)), "rc");
 }
 
@@ -71,6 +71,6 @@ fn string_classification() {
 #[test]
 fn region_string_reports_region() {
     let region = cs_gc::Region::new();
-    let s = Gc::new_in(&region, RefCell::new(String::from("regional")));
+    let s = Gc::new_in(&region, RefCell::new(cs_core::CsStr::new("regional")));
     assert_eq!(allocator_tier(&Value::String(s)), "region");
 }

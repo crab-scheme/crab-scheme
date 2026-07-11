@@ -107,7 +107,7 @@ fn expect_string_list(name: &str, args: &[Value], idx: usize) -> Result<Vec<Stri
 }
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 // ----- run -----

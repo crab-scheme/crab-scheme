@@ -158,7 +158,7 @@ fn log_current_level(args: &[Value]) -> Result<Value, FfiError> {
             got: args.len(),
         });
     }
-    Ok(Value::String(cs_core::Gc::new(std::cell::RefCell::new(
+    Ok(Value::string(
         level_name(LEVEL.load(Ordering::Relaxed)).to_string(),
-    ))))
+    ))
 }

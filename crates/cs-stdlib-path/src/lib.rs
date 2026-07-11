@@ -63,7 +63,7 @@ fn expect_string<'a>(name: &str, args: &'a [Value], idx: usize) -> Result<String
 }
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 // ----- procedures -----

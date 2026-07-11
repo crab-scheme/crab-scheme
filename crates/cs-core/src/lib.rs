@@ -19,8 +19,8 @@ pub use promote::Promote;
 pub use number::{NumError, Number};
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{
-    make_parameter, CustomHashFns, FileOutputState, Hashtable, HtEqKind, Pair, Parameter, Port,
-    ProcKind, Procedure, Promise, PromiseState, StringInputState, Value, WriteMode,
+    make_parameter, CsStr, CustomHashFns, FileOutputState, Hashtable, HtEqKind, Pair, Parameter,
+    Port, ProcKind, Procedure, Promise, PromiseState, StringInputState, Value, WriteMode,
 };
 
 /// Re-export `Gc<T>` from `cs-gc` so the rest of the workspace can refer

@@ -1524,7 +1524,7 @@ impl NanboxValue {
             }
             t if t == NB_TAG_STRING => {
                 let (ptr, is_region) = nb_decode_gc_ptr(payload);
-                let g: cs_gc::Gc<std::cell::RefCell<String>> =
+                let g: cs_gc::Gc<std::cell::RefCell<cs_core::CsStr>> =
                     decode_gc_handle(ptr, is_region);
                 Value::String(g)
             }
@@ -3433,7 +3433,7 @@ pub unsafe extern "C" fn vm_string_titlecase_gc(s: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
@@ -3456,7 +3456,9 @@ pub unsafe extern "C" fn vm_string_titlecase_gc(s: i64) -> i64 {
             prev_alphabetic = false;
         }
     }
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// 64-bit FNV-1a, truncated to a positive Fixnum (matches the
@@ -3793,7 +3795,9 @@ pub unsafe extern "C" fn vm_substring_gc(s: i64, start: i64, end: i64) -> i64 {
             }
             let sub: String = chars[start as usize..end as usize].iter().collect();
             drop(storage);
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(sub))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                sub.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
@@ -3911,16 +3915,18 @@ pub unsafe extern "C" fn vm_string_copy_from_gc(r: i64, start: i64) -> i64 {
             if start < 0 || (start as usize) > len {
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))));
             }
             let sub: String = chars[(start as usize)..].iter().collect();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(sub))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                sub.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -3939,7 +3945,9 @@ pub unsafe extern "C" fn vm_string_copy_gc(r: i64) -> i64 {
     match v {
         Value::String(sc) => {
             let copy = sc.borrow().clone();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(copy))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                copy.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
@@ -4060,7 +4068,7 @@ pub unsafe extern "C" fn vm_string_fill_gc(s: i64, ch: i64) -> i64 {
         Value::String(sc) => {
             let n = sc.borrow().chars().count();
             let new_storage: String = std::iter::repeat(new_ch).take(n).collect();
-            *sc.borrow_mut() = new_storage;
+            sc.borrow_mut().set_from(new_storage);
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -4101,7 +4109,7 @@ pub unsafe extern "C" fn vm_string_fill_from_gc(s: i64, ch: i64, start: i64) -> 
             for slot in chars[(start as usize)..].iter_mut() {
                 *slot = new_ch;
             }
-            *sc.borrow_mut() = chars.into_iter().collect();
+            sc.borrow_mut().set_from(chars.into_iter().collect());
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -4143,7 +4151,7 @@ pub unsafe extern "C" fn vm_string_fill_slice_gc(s: i64, ch: i64, start: i64, en
             for slot in chars[(start as usize)..(end as usize)].iter_mut() {
                 *slot = new_ch;
             }
-            *sc.borrow_mut() = chars.into_iter().collect();
+            sc.borrow_mut().set_from(chars.into_iter().collect());
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -4185,7 +4193,7 @@ pub unsafe extern "C" fn vm_string_set_gc(s: i64, k: i64, ch: i64) -> i64 {
                 return value_to_gc_i64(Value::Unspecified);
             }
             chars[k as usize] = new_ch;
-            *sc.borrow_mut() = chars.into_iter().collect();
+            sc.borrow_mut().set_from(chars.into_iter().collect());
             value_to_gc_i64(Value::Unspecified)
         }
         _ => {
@@ -4422,7 +4430,9 @@ pub unsafe extern "C" fn vm_symbol_to_string_gc(sym: i64) -> i64 {
         return value_to_gc_i64(Value::Null);
     }
     let s = syms.name(Symbol(id)).to_string();
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        s.into(),
+    ))))
 }
 
 /// `(string->symbol s)` — intern `s` into the symbol table and
@@ -4631,7 +4641,9 @@ pub unsafe extern "C" fn vm_list_to_string_gc(r: i64) -> i64 {
     loop {
         match cur {
             Value::Null => {
-                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))));
+                return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    s.into(),
+                ))));
             }
             Value::Pair(p) => {
                 let head = p.car();
@@ -4880,18 +4892,20 @@ pub unsafe extern "C" fn vm_utf8_to_string_gc(bv: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(bv) };
     match v {
         Value::ByteVector(b) => match String::from_utf8(b.borrow().clone()) {
-            Ok(s) => value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s)))),
+            Ok(s) => value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                s.into(),
+            )))),
             Err(_) => {
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))))
             }
         },
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -4979,12 +4993,14 @@ pub unsafe extern "C" fn vm_make_string_buf(buf: *const i64, n: usize) -> i64 {
             _ => {
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))));
             }
         }
     }
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        s.into(),
+    ))))
 }
 
 /// `(bytevector b ...)` — variadic bytevector constructor. `buf`
@@ -5049,7 +5065,7 @@ pub unsafe extern "C" fn vm_string_append_buf(buf: *const i64, n: usize) -> i64 
             _ => {
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))));
             }
         }
@@ -5058,7 +5074,9 @@ pub unsafe extern "C" fn vm_string_append_buf(buf: *const i64, n: usize) -> i64 
     for s in owned {
         out.push_str(&s);
     }
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(append list1 ... obj)` — variadic list concatenation. `buf`
@@ -6400,7 +6418,7 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
             drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<Value>>>(ptr, is_region) })
         }
         t if t == NB_TAG_STRING => {
-            drop(unsafe { decode_gc_handle::<std::cell::RefCell<String>>(ptr, is_region) })
+            drop(unsafe { decode_gc_handle::<std::cell::RefCell<cs_core::CsStr>>(ptr, is_region) })
         }
         t if t == NB_TAG_BYTEVECTOR => {
             drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<u8>>>(ptr, is_region) })
@@ -6856,7 +6874,9 @@ pub unsafe extern "C" fn vm_alloc_string_gc(n: i64, fill: i64) -> i64 {
     let len = if n < 0 { 0usize } else { n as usize };
     let ch = char::from_u32(fill as u32).unwrap_or('\u{FFFD}');
     let s: String = std::iter::repeat(ch).take(len).collect();
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        s.into(),
+    ))))
 }
 
 /// Inner (non-FFI) implementation of `vm_string_ref_gc`. Same
@@ -7167,12 +7187,14 @@ pub unsafe extern "C" fn vm_number_to_string_gc(n: i64) -> i64 {
     match v {
         Value::Number(num) => {
             let s = format!("{}", num);
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                s.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -7197,16 +7219,18 @@ pub unsafe extern "C" fn vm_number_to_string_radix_gc(n: i64, radix: i64) -> i64
                 _ => {
                     jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                     return value_to_gc_i64(Value::String(cs_gc::Gc::new(
-                        std::cell::RefCell::new(String::new()),
+                        std::cell::RefCell::new(String::new().into()),
                     )));
                 }
             };
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                s.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -7521,7 +7545,7 @@ pub unsafe extern "C" fn vm_string_copy_bang_slice_gc(
         for (i, c) in src_chars[start..end].iter().enumerate() {
             new_chars[at + i] = *c;
         }
-        *d = new_chars.into_iter().collect();
+        d.set_from(new_chars.into_iter().collect());
     }
     value_to_gc_i64(Value::Unspecified)
 }
@@ -7571,7 +7595,7 @@ pub unsafe extern "C" fn vm_string_copy_bang_from_gc(
         for (i, c) in src_chars[start..].iter().enumerate() {
             new_chars[at + i] = *c;
         }
-        *d = new_chars.into_iter().collect();
+        d.set_from(new_chars.into_iter().collect());
     }
     value_to_gc_i64(Value::Unspecified)
 }
@@ -7607,7 +7631,7 @@ pub unsafe extern "C" fn vm_string_copy_bang_gc(dest: i64, at: i64, src: i64) ->
         for (i, c) in src_chars.iter().enumerate() {
             new_chars[at + i] = *c;
         }
-        *d = new_chars.into_iter().collect();
+        d.set_from(new_chars.into_iter().collect());
     }
     value_to_gc_i64(Value::Unspecified)
 }
@@ -8204,14 +8228,14 @@ pub unsafe extern "C" fn vm_string_replace_first_gc(s: i64, from: i64, to: i64) 
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if f_str.is_empty() {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let out = match s_str.find(&f_str) {
@@ -8224,7 +8248,9 @@ pub unsafe extern "C" fn vm_string_replace_first_gc(s: i64, from: i64, to: i64) 
         }
         None => s_str,
     };
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-replace-all s from to)` — SRFI-13 variant: replaces every
@@ -8246,18 +8272,20 @@ pub unsafe extern "C" fn vm_string_replace_all_gc(s: i64, from: i64, to: i64) ->
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if f_str.is_empty() {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let out = s_str.replace(&f_str, &t_str);
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-trim s)` — SRFI-13. ADR 0012 D-2 (iter FH).
@@ -8271,12 +8299,14 @@ pub unsafe extern "C" fn vm_string_trim_gc(s: i64) -> i64 {
     match v {
         Value::String(sg) => {
             let out: String = sg.borrow().trim().to_string();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                out.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8294,12 +8324,14 @@ pub unsafe extern "C" fn vm_string_trim_left_gc(s: i64) -> i64 {
     match v {
         Value::String(sg) => {
             let out: String = sg.borrow().trim_start().to_string();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                out.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8317,12 +8349,14 @@ pub unsafe extern "C" fn vm_string_trim_right_gc(s: i64) -> i64 {
     match v {
         Value::String(sg) => {
             let out: String = sg.borrow().trim_end().to_string();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                out.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8336,14 +8370,14 @@ pub unsafe extern "C" fn vm_string_pad_gc(s: i64, width: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if width < 0 {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let total = s_str.chars().count();
@@ -8355,7 +8389,9 @@ pub unsafe extern "C" fn vm_string_pad_gc(s: i64, width: i64) -> i64 {
         let pad: String = std::iter::repeat(' ').take(width - total).collect();
         format!("{}{}", pad, s_str)
     };
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-pad-right s width)` — SRFI-13 2-arg form.
@@ -8372,14 +8408,14 @@ pub unsafe extern "C" fn vm_string_pad_right_gc(s: i64, width: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if width < 0 {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let total = s_str.chars().count();
@@ -8390,7 +8426,9 @@ pub unsafe extern "C" fn vm_string_pad_right_gc(s: i64, width: i64) -> i64 {
         let pad: String = std::iter::repeat(' ').take(width - total).collect();
         format!("{}{}", s_str, pad)
     };
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-take s n)` — SRFI-13. Take first `n` characters.
@@ -8407,18 +8445,20 @@ pub unsafe extern "C" fn vm_string_take_gc(s: i64, n: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if n < 0 {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let out: String = s_str.chars().take(n as usize).collect();
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-drop s n)` — SRFI-13. Drop the first `n` characters.
@@ -8435,18 +8475,20 @@ pub unsafe extern "C" fn vm_string_drop_gc(s: i64, n: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if n < 0 {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let out: String = s_str.chars().skip(n as usize).collect();
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-take-right s n)` — SRFI-13. Take the last `n` characters.
@@ -8463,20 +8505,22 @@ pub unsafe extern "C" fn vm_string_take_right_gc(s: i64, n: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if n < 0 {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let total: usize = s_str.chars().count();
     let n = (n as usize).min(total);
     let out: String = s_str.chars().skip(total - n).collect();
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 /// `(string-drop-right s n)` — SRFI-13. Drop the last `n` characters.
@@ -8493,20 +8537,22 @@ pub unsafe extern "C" fn vm_string_drop_right_gc(s: i64, n: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
     if n < 0 {
         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
         return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-            String::new(),
+            String::new().into(),
         ))));
     }
     let total: usize = s_str.chars().count();
     let keep = total.saturating_sub(n as usize);
     let out: String = s_str.chars().take(keep).collect();
-    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(out))))
+    value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+        out.into(),
+    ))))
 }
 
 #[no_mangle]
@@ -8531,12 +8577,20 @@ pub unsafe extern "C" fn vm_string_split_gc(s: i64, sep: i64) -> i64 {
     let parts: Vec<Value> = if sep_str.is_empty() {
         s_str
             .chars()
-            .map(|c| Value::String(cs_gc::Gc::new(std::cell::RefCell::new(c.to_string()))))
+            .map(|c| {
+                Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    c.to_string().into(),
+                )))
+            })
             .collect()
     } else {
         s_str
             .split(&sep_str)
-            .map(|p| Value::String(cs_gc::Gc::new(std::cell::RefCell::new(p.to_string()))))
+            .map(|p| {
+                Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                    p.to_string().into(),
+                )))
+            })
             .collect()
     };
     let mut acc = Value::Null;
@@ -8563,7 +8617,7 @@ pub unsafe extern "C" fn vm_string_join_gc(parts: i64, sep: i64) -> i64 {
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))));
         }
     };
@@ -8580,7 +8634,7 @@ pub unsafe extern "C" fn vm_string_join_gc(parts: i64, sep: i64) -> i64 {
                     _ => {
                         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                         return value_to_gc_i64(Value::String(cs_gc::Gc::new(
-                            std::cell::RefCell::new(String::new()),
+                            std::cell::RefCell::new(String::new().into()),
                         )));
                     }
                 }
@@ -8589,13 +8643,13 @@ pub unsafe extern "C" fn vm_string_join_gc(parts: i64, sep: i64) -> i64 {
             _ => {
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))));
             }
         }
     }
     value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-        strs.join(&sep_s),
+        strs.join(&sep_s).into(),
     ))))
 }
 
@@ -8611,7 +8665,7 @@ pub unsafe extern "C" fn vm_string_prefix_p_gc(prefix: i64, s: i64) -> i64 {
     let p_v = unsafe { gc_i64_to_value(prefix) };
     let s_v = unsafe { gc_i64_to_value(s) };
     match (p_v, s_v) {
-        (Value::String(p), Value::String(s)) => s.borrow().starts_with(&*p.borrow()) as i64,
+        (Value::String(p), Value::String(s)) => s.borrow().starts_with(&**p.borrow()) as i64,
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             0
@@ -8630,7 +8684,7 @@ pub unsafe extern "C" fn vm_string_suffix_p_gc(suffix: i64, s: i64) -> i64 {
     let p_v = unsafe { gc_i64_to_value(suffix) };
     let s_v = unsafe { gc_i64_to_value(s) };
     match (p_v, s_v) {
-        (Value::String(p), Value::String(s)) => s.borrow().ends_with(&*p.borrow()) as i64,
+        (Value::String(p), Value::String(s)) => s.borrow().ends_with(&**p.borrow()) as i64,
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             0
@@ -8767,12 +8821,14 @@ pub unsafe extern "C" fn vm_string_upcase_gc(s: i64) -> i64 {
     match v {
         Value::String(sg) => {
             let up = sg.borrow().to_uppercase();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(up))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                up.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8790,12 +8846,14 @@ pub unsafe extern "C" fn vm_string_downcase_gc(s: i64) -> i64 {
     match v {
         Value::String(sg) => {
             let down = sg.borrow().to_lowercase();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(down))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                down.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8815,12 +8873,14 @@ pub unsafe extern "C" fn vm_string_foldcase_gc(s: i64) -> i64 {
     match v {
         Value::String(sg) => {
             let fold: String = sg.borrow().chars().flat_map(|c| c.to_lowercase()).collect();
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(fold))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                fold.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8841,13 +8901,13 @@ pub unsafe extern "C" fn vm_string_reverse_gc(s: i64) -> i64 {
         Value::String(sg) => {
             let reversed: String = sg.borrow().chars().rev().collect();
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                reversed,
+                reversed.into(),
             ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -8904,17 +8964,19 @@ pub unsafe extern "C" fn vm_vector_to_string_gc(v: i64) -> i64 {
                     _ => {
                         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                         return value_to_gc_i64(Value::String(cs_gc::Gc::new(
-                            std::cell::RefCell::new(String::new()),
+                            std::cell::RefCell::new(String::new().into()),
                         )));
                     }
                 }
             }
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                s.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -9020,7 +9082,7 @@ pub unsafe extern "C" fn vm_vector_to_string_slice_from_gc(v: i64, start: i64) -
                 drop(storage);
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))));
             }
             let mut s = String::with_capacity(len - start as usize);
@@ -9031,18 +9093,20 @@ pub unsafe extern "C" fn vm_vector_to_string_slice_from_gc(v: i64, start: i64) -
                         drop(storage);
                         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                         return value_to_gc_i64(Value::String(cs_gc::Gc::new(
-                            std::cell::RefCell::new(String::new()),
+                            std::cell::RefCell::new(String::new().into()),
                         )));
                     }
                 }
             }
             drop(storage);
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                s.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -9068,7 +9132,7 @@ pub unsafe extern "C" fn vm_vector_to_string_slice_gc(v: i64, start: i64, end: i
                 drop(storage);
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                    String::new(),
+                    String::new().into(),
                 ))));
             }
             let mut s = String::with_capacity((end - start) as usize);
@@ -9079,18 +9143,20 @@ pub unsafe extern "C" fn vm_vector_to_string_slice_gc(v: i64, start: i64, end: i
                         drop(storage);
                         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                         return value_to_gc_i64(Value::String(cs_gc::Gc::new(
-                            std::cell::RefCell::new(String::new()),
+                            std::cell::RefCell::new(String::new().into()),
                         )));
                     }
                 }
             }
             drop(storage);
-            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s))))
+            value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
+                s.into(),
+            ))))
         }
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
-                String::new(),
+                String::new().into(),
             ))))
         }
     }
@@ -11551,7 +11617,7 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 }
                 t if t == NB_TAG_STRING => {
                     let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<std::cell::RefCell<String>>(ptr, is_region)
+                        decode_gc_handle::<std::cell::RefCell<cs_core::CsStr>>(ptr, is_region)
                     });
                     // String holds no Gc<...> children; register
                     // identity for cycle target check, then stop.

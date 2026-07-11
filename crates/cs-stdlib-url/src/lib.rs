@@ -58,7 +58,7 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
 }
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 fn opt_string_value(o: Option<String>) -> Value {

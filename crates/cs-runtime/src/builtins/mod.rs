@@ -3413,7 +3413,15 @@ fn b_string_length(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("string-length", "1", args.len()));
     }
     match &args[0] {
-        Value::String(s) => Ok(Value::fixnum(s.borrow().chars().count() as i64)),
+        Value::String(s) => {
+            let s = s.borrow();
+            let len = if s.is_ascii_cached() {
+                s.len()
+            } else {
+                s.chars().count()
+            };
+            Ok(Value::fixnum(len as i64))
+        }
         v => Err(type_err("string-length", "string", v)),
     }
 }
@@ -3543,6 +3551,13 @@ fn b_string_ref(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::String(s) => {
             let s = s.borrow();
+            if s.is_ascii_cached() {
+                return s
+                    .as_bytes()
+                    .get(i as usize)
+                    .map(|&b| Value::Character(b as char))
+                    .ok_or_else(|| "string-ref: index out of range".into());
+            }
             s.chars()
                 .nth(i as usize)
                 .map(Value::Character)
@@ -3568,12 +3583,27 @@ fn b_string_set_bang(args: &[Value]) -> Result<Value, String> {
     };
     match &args[0] {
         Value::String(s) => {
+            // Fast path: ASCII string + ASCII replacement char is a
+            // direct byte swap, no decode/rebuild needed.
+            if new_ch.is_ascii() && s.borrow().is_ascii_cached() {
+                let mut sref = s.borrow_mut();
+                if (i as usize) >= sref.len() {
+                    return Err("string-set!: index out of range".into());
+                }
+                // SAFETY: sref is all-ASCII and new_ch is ASCII, so writing
+                // its single byte in place keeps the buffer valid UTF-8
+                // and all-ASCII.
+                unsafe {
+                    sref.ascii_bytes_mut()[i as usize] = new_ch as u8;
+                }
+                return Ok(Value::Unspecified);
+            }
             let mut chars: Vec<char> = s.borrow().chars().collect();
             if (i as usize) >= chars.len() {
                 return Err("string-set!: index out of range".into());
             }
             chars[i as usize] = new_ch;
-            *s.borrow_mut() = chars.into_iter().collect();
+            s.borrow_mut().set_from(chars.into_iter().collect());
             Ok(Value::Unspecified)
         }
         v => Err(type_err("string-set!", "string", v)),
@@ -4221,6 +4251,12 @@ fn b_substring(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::String(s) => {
             let s = s.borrow();
+            if s.is_ascii_cached() {
+                if (end as usize) > s.len() {
+                    return Err("substring: end out of range".into());
+                }
+                return Ok(Value::string(&s[start as usize..end as usize]));
+            }
             let chars: Vec<char> = s.chars().collect();
             if (end as usize) > chars.len() {
                 return Err("substring: end out of range".into());
@@ -4238,10 +4274,34 @@ fn b_string_copy(args: &[Value]) -> Result<Value, String> {
     if args.is_empty() || args.len() > 3 {
         return Err(arity_err("string-copy", "1..3", args.len()));
     }
-    let chars: Vec<char> = match &args[0] {
-        Value::String(s) => s.borrow().chars().collect(),
+    let s = match &args[0] {
+        Value::String(s) => s.borrow(),
         v => return Err(type_err("string-copy", "string", v)),
     };
+    if s.is_ascii_cached() {
+        let len = s.len();
+        let start = if args.len() >= 2 {
+            let i = as_int_i64("string-copy", &args[1])?;
+            if i < 0 || (i as usize) > len {
+                return Err(format!("string-copy: start out of range: {}", i));
+            }
+            i as usize
+        } else {
+            0
+        };
+        let end = if args.len() == 3 {
+            let i = as_int_i64("string-copy", &args[2])?;
+            if i < 0 || (i as usize) > len || (i as usize) < start {
+                return Err(format!("string-copy: end out of range: {}", i));
+            }
+            i as usize
+        } else {
+            len
+        };
+        return Ok(Value::string(&s[start..end]));
+    }
+    let chars: Vec<char> = s.chars().collect();
+    drop(s);
     let len = chars.len();
     let start = if args.len() >= 2 {
         let i = as_int_i64("string-copy", &args[1])?;
@@ -13186,7 +13246,7 @@ fn b_string_fill(args: &[Value]) -> Result<Value, String> {
             for slot in &mut chars[start..end] {
                 *slot = fill;
             }
-            *s.borrow_mut() = chars.into_iter().collect();
+            s.borrow_mut().set_from(chars.into_iter().collect());
             Ok(Value::Unspecified)
         }
         v => Err(type_err("string-fill!", "string", v)),
@@ -13226,7 +13286,7 @@ fn b_string_copy_bang(args: &[Value]) -> Result<Value, String> {
             for i in 0..n {
                 d_chars[dest_at + i] = src_chars[src_start + i];
             }
-            *dest.borrow_mut() = d_chars.into_iter().collect();
+            dest.borrow_mut().set_from(d_chars.into_iter().collect());
         }
         other => return Err(type_err("string-copy!", "string (dest)", other)),
     }

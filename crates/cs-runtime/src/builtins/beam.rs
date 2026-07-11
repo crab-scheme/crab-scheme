@@ -148,9 +148,7 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
             // num_to_sendable from a valid bigint.
             Value::Number(Number::parse_decimal_integer(d).expect("bigint round-trip"))
         }
-        SendableValue::String(s) => {
-            Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.clone())))
-        }
+        SendableValue::String(s) => Value::string(s.clone()),
         SendableValue::Symbol(name) => Value::Symbol(syms.intern(name)),
         SendableValue::Pair(car, cdr) => {
             let car_v = from_sendable(car, syms);
@@ -3121,7 +3119,7 @@ mod tests {
     #[test]
     fn round_trip_string() {
         let mut syms = SymbolTable::new();
-        let v = Value::String(cs_core::Gc::new(std::cell::RefCell::new("hello".into())));
+        let v = Value::string("hello");
         let s = to_sendable_in(&v, &syms).expect("encode");
         assert_eq!(s, SendableValue::String("hello".into()));
         let back = from_sendable(&s, &mut syms);

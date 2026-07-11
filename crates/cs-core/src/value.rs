@@ -485,6 +485,12 @@ impl cs_gc::cycle::BreakCycle for Hashtable {
 /// type. Tracked as a known limitation in the gap-closure
 /// follow-on.
 impl cs_gc::cycle::BreakCycle for Port {}
+
+/// `CsStr` is a leaf for cycle-tracing purposes, same as the bare
+/// `String` it wraps (it holds no `Gc` children).
+impl cs_gc::cycle::CycleVisit for CsStr {
+    fn visit_children(&self, _ctx: &mut cs_gc::cycle::CycleVisitor) {}
+}
 impl cs_gc::cycle::BreakCycle for Promise {}
 
 /// Weak counterpart of [`Value`]'s heap-bearing variants, used by
@@ -497,7 +503,7 @@ impl cs_gc::cycle::BreakCycle for Promise {}
 /// cycles via slot-zeroing rather than weak-pointer storage.
 #[derive(Debug, Clone)]
 pub enum WeakValue {
-    String(cs_gc::Weak<RefCell<String>>),
+    String(cs_gc::Weak<RefCell<CsStr>>),
     Pair(cs_gc::Weak<Pair>),
     Vector(cs_gc::Weak<RefCell<Vec<Value>>>),
     ByteVector(cs_gc::Weak<RefCell<Vec<u8>>>),
@@ -1037,6 +1043,146 @@ pub fn make_parameter(initial: Value) -> Value {
     Value::Procedure(p)
 }
 
+/// Scheme string payload: a `String` plus a cached "is this string
+/// all-ASCII" flag, recomputed only on construction and on mutation
+/// (`set_from`). This lets the hot char-indexed primitives
+/// (`string-length`, `string-ref`, ...) take an O(1)/byte-indexed
+/// fast path for the dominant all-ASCII case instead of walking the
+/// UTF-8 decode on every call (cs-byy).
+///
+/// Deref's to `String` so read-only call sites (`.chars()`, `.len()`,
+/// `.as_bytes()`, ...) keep compiling unchanged. There is deliberately
+/// no `DerefMut`: an in-place mutation through a generic `String`
+/// method would silently invalidate `ascii` without recomputing it.
+/// All mutation must go through [`CsStr::set_from`].
+///
+/// Deliberately NOT `Clone`: this lets the hundreds of pre-existing
+/// `s.borrow().clone()` call sites across the workspace keep resolving
+/// through `Deref` to `String::clone`, so they keep compiling and
+/// keep returning a plain `String` (which is what nearly all of them
+/// actually want) without being touched. Code that specifically wants
+/// a full `CsStr` copy (cached flag included) calls [`CsStr::duplicate`].
+#[derive(Debug, Default)]
+pub struct CsStr {
+    s: String,
+    ascii: bool,
+}
+
+impl CsStr {
+    pub fn new(s: impl Into<String>) -> Self {
+        let s = s.into();
+        let ascii = s.is_ascii();
+        CsStr { s, ascii }
+    }
+
+    /// Explicit full copy (string content + cached ASCII flag), for the
+    /// handful of call sites that need a `CsStr` rather than a `String`.
+    pub fn duplicate(&self) -> Self {
+        CsStr {
+            s: self.s.clone(),
+            ascii: self.ascii,
+        }
+    }
+
+    /// True if the string is entirely ASCII, letting callers use a
+    /// byte-indexed fast path instead of a `chars()` walk.
+    #[inline]
+    pub fn is_ascii_cached(&self) -> bool {
+        self.ascii
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.s
+    }
+
+    /// Replace the string content, recomputing the ASCII cache.
+    /// This is the only sanctioned way to mutate a `CsStr` in place.
+    pub fn set_from(&mut self, new: String) {
+        self.ascii = new.is_ascii();
+        self.s = new;
+    }
+
+    /// Mutable byte access for in-place ASCII-preserving edits (e.g. a
+    /// single-byte swap for `string-set!`). Caller must uphold the
+    /// invariant that the buffer stays valid UTF-8 and all-ASCII, since
+    /// the cached `ascii` flag is NOT recomputed here.
+    ///
+    /// # Safety
+    /// Same contract as `String::as_bytes_mut`: writes must preserve
+    /// valid UTF-8. Additionally the caller must only write ASCII
+    /// bytes (0..=0x7f), since `ascii` is not recomputed.
+    #[inline]
+    pub unsafe fn ascii_bytes_mut(&mut self) -> &mut [u8] {
+        debug_assert!(self.ascii, "ascii_bytes_mut called on non-ASCII CsStr");
+        self.s.as_bytes_mut()
+    }
+}
+
+impl std::ops::Deref for CsStr {
+    type Target = String;
+    #[inline]
+    fn deref(&self) -> &String {
+        &self.s
+    }
+}
+
+impl std::fmt::Display for CsStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.s, f)
+    }
+}
+
+impl PartialEq for CsStr {
+    fn eq(&self, other: &Self) -> bool {
+        self.s == other.s
+    }
+}
+impl Eq for CsStr {}
+
+impl PartialOrd for CsStr {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.s.cmp(&other.s))
+    }
+}
+impl Ord for CsStr {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.s.cmp(&other.s)
+    }
+}
+
+impl PartialEq<str> for CsStr {
+    fn eq(&self, other: &str) -> bool {
+        self.s == other
+    }
+}
+impl PartialEq<String> for CsStr {
+    fn eq(&self, other: &String) -> bool {
+        &self.s == other
+    }
+}
+impl PartialEq<CsStr> for String {
+    fn eq(&self, other: &CsStr) -> bool {
+        self == &other.s
+    }
+}
+impl PartialEq<&str> for CsStr {
+    fn eq(&self, other: &&str) -> bool {
+        self.s == *other
+    }
+}
+
+impl From<String> for CsStr {
+    fn from(s: String) -> Self {
+        CsStr::new(s)
+    }
+}
+impl From<&str> for CsStr {
+    fn from(s: &str) -> Self {
+        CsStr::new(s)
+    }
+}
+
 /// The universal Scheme value.
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -1046,7 +1192,7 @@ pub enum Value {
     Boolean(bool),
     Character(char),
     Number(Number),
-    String(crate::Gc<RefCell<String>>),
+    String(crate::Gc<RefCell<CsStr>>),
     Symbol(Symbol),
     /// Hygienic identifier: a name plus a per-macro-call mark.
     /// Distinct from `Symbol` in R6RS terms (an identifier is a
@@ -1212,7 +1358,7 @@ impl Value {
     }
 
     pub fn string(s: impl Into<String>) -> Self {
-        Value::String(crate::Gc::new(RefCell::new(s.into())))
+        Value::String(crate::Gc::new(RefCell::new(CsStr::new(s.into()))))
     }
 
     pub fn list(items: impl IntoIterator<Item = Value>) -> Self {

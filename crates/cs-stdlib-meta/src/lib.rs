@@ -32,7 +32,7 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
 // ----- manifest assembly -----
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 /// `(name, list-of-procedure-names)` for every compiled-in module.

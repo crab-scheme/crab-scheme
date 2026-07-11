@@ -115,7 +115,7 @@ fn expect_number(name: &str, args: &[Value], idx: usize) -> Result<f64, FfiError
 }
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 fn locked() -> Result<std::sync::MutexGuard<'static, HashMap<String, Metric>>, FfiError> {

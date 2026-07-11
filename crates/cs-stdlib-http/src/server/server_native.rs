@@ -119,7 +119,7 @@ fn expect_bv(name: &str, args: &[Value], idx: usize) -> Result<Vec<u8>, FfiError
 }
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 fn bv_value(b: Vec<u8>) -> Value {

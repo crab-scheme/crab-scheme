@@ -101,7 +101,7 @@ fn expect_bytevector(name: &str, args: &[Value], idx: usize) -> Result<Vec<u8>, 
 }
 
 fn string_value(s: impl Into<String>) -> Value {
-    Value::String(cs_core::Gc::new(std::cell::RefCell::new(s.into())))
+    Value::string(s)
 }
 
 fn bytevector_value(b: Vec<u8>) -> Value {

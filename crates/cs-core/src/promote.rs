@@ -68,7 +68,7 @@ pub fn to_rc_deep(v: &Value) -> Value {
             Value::Vector(cs_gc::Gc::new(RefCell::new(cloned)))
         }
         Value::String(g) => {
-            let cloned: String = g.borrow().clone();
+            let cloned: crate::CsStr = g.borrow().duplicate();
             Value::String(cs_gc::Gc::new(RefCell::new(cloned)))
         }
         Value::ByteVector(g) => {
@@ -178,7 +178,7 @@ impl Promote for Value {
             }
             Value::String(s) => {
                 if cs_gc::Gc::is_region(s) {
-                    let cloned: String = s.borrow().clone();
+                    let cloned: crate::CsStr = s.borrow().duplicate();
                     *s = cs_gc::Gc::new(RefCell::new(cloned));
                 }
                 // String contents are leaf — no descent needed.
