@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use cs_core::{Procedure, Symbol, SymbolTable, Value};
 use cs_diag::Span;
+use cs_gc::cycle::CycleVisit as _;
 
 use crate::opcode::{Bytecode, CompiledLambda, Inst};
 
@@ -11417,6 +11418,17 @@ impl Procedure for VmClosure {
     fn kind(&self) -> cs_core::ProcKind {
         cs_core::ProcKind::VmClosure
     }
+    fn visit_closure_children(&self, ctx: &mut cs_gc::cycle::CycleVisitor) {
+        // Mirrors cs-runtime's tree-walker `Closure::visit_closure_children`:
+        // dedup on this closure's own Rc identity, then descend into the
+        // captured env (which itself dedups on Env identity, so a deep or
+        // self-referential env chain visits each frame at most once).
+        let addr = self as *const Self as usize;
+        if !ctx.visit_addr(addr) {
+            return;
+        }
+        self.env.visit_children(ctx);
+    }
 }
 
 impl cs_gc::cycle::CycleVisit for VmClosure {
@@ -11624,14 +11636,11 @@ impl cs_gc::cycle::CycleVisit for Env {
 // `Bindings::visit_children` above. Exercises `Bindings` directly
 // (rather than through the Scheme-level `Value::Procedure ->
 // Procedure::visit_closure_children -> VmClosure -> Env -> Bindings`
-// chain) because `VmClosure`'s `Procedure` impl does not currently
-// override `visit_closure_children` — it inherits the trait's empty
-// default — so the synchronous cycle detector never actually reaches
-// a VM closure's captured env today. That's a separate, pre-existing
-// gap (see cs-f0k); it doesn't change that `Bindings::visit_children`
-// must decode region pointers correctly for whenever that gap closes,
-// or for any other caller (present or future) that visits a
-// `Bindings` directly.
+// chain) so the region-pointer decoding is covered in isolation from
+// the full closure-cycle walk. `VmClosure::visit_closure_children`
+// (cs-f0k) now overrides the trait default and forwards into this
+// same `Bindings::visit_children`, so the end-to-end path is covered
+// by `crates/cs-runtime/tests/bindings_cycle_visit_region.rs`.
 #[cfg(all(test, feature = "regions"))]
 mod bindings_cycle_visit_region_tests {
     use super::*;
