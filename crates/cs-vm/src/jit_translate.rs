@@ -1317,6 +1317,101 @@ pub fn bytecode_to_rir_full(
                                             value_types.insert(dst, Type::Boolean);
                                         }
                                     }
+                                } else if (name == "cons" || name == "cons-in-region")
+                                    && args.len() == 2
+                                {
+                                    // cs-gih — mirrors the JIT-mode ("cons", 2)
+                                    // arm (see below): cs-aot already emits
+                                    // Cons/ConsRegion via vm_alloc_pair_gc /
+                                    // vm_alloc_pair_region_gc, so open-code
+                                    // here too instead of paying for a
+                                    // by-name walker dispatch per allocation.
+                                    promote_envlookup_to_any(&mut insts, &mut value_types, args[0]);
+                                    promote_envlookup_to_any(&mut insts, &mut value_types, args[1]);
+                                    let car_t =
+                                        value_types.get(&args[0]).copied().unwrap_or(Type::Fixnum);
+                                    let cdr_t =
+                                        value_types.get(&args[1]).copied().unwrap_or(Type::Fixnum);
+                                    let car_tag = type_to_jit_rt_tag(car_t);
+                                    let cdr_tag = type_to_jit_rt_tag(cdr_t);
+                                    if name == "cons-in-region" {
+                                        insts.push(RirInst::ConsRegion(
+                                            dst, args[0], car_tag, args[1], cdr_tag,
+                                        ));
+                                    } else {
+                                        insts.push(RirInst::Cons(
+                                            dst, args[0], car_tag, args[1], cdr_tag,
+                                        ));
+                                    }
+                                    value_types.insert(dst, Type::Any);
+                                } else if name == "car" && args.len() == 1 {
+                                    // cs-gih — mirrors JIT-mode ("car", 1).
+                                    // car/cdr's cs-vm helpers require an
+                                    // Any-typed (Gc-handle) operand; where
+                                    // the JIT arm would return Unsupported
+                                    // for a non-Any operand (falling back to
+                                    // the VM tier), the AOT arm instead
+                                    // falls through to the generic
+                                    // CallBuiltin dispatch so compilation
+                                    // still succeeds.
+                                    promote_envlookup_to_any(&mut insts, &mut value_types, args[0]);
+                                    if value_types.get(&args[0]).copied() == Some(Type::Any) {
+                                        insts.push(RirInst::Car(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    } else {
+                                        insts.push(RirInst::CallBuiltin(
+                                            dst,
+                                            name.to_string(),
+                                            args.clone(),
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                } else if name == "cdr" && args.len() == 1 {
+                                    // cs-gih — mirrors JIT-mode ("cdr", 1).
+                                    promote_envlookup_to_any(&mut insts, &mut value_types, args[0]);
+                                    if value_types.get(&args[0]).copied() == Some(Type::Any) {
+                                        insts.push(RirInst::Cdr(dst, args[0]));
+                                        value_types.insert(dst, Type::Any);
+                                    } else {
+                                        insts.push(RirInst::CallBuiltin(
+                                            dst,
+                                            name.to_string(),
+                                            args.clone(),
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                } else if name == "pair?" && args.len() == 1 {
+                                    // cs-gih — mirrors JIT-mode ("pair?", 1);
+                                    // only fires when the operand is already
+                                    // Any (matching the JIT guard), else
+                                    // falls through to CallBuiltin (the JIT
+                                    // side instead has an always-false
+                                    // fixnum-tier fallback that doesn't apply
+                                    // to AOT's generic Any-first bodies).
+                                    if value_types.get(&args[0]).copied() == Some(Type::Any) {
+                                        insts.push(RirInst::PairP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    } else {
+                                        insts.push(RirInst::CallBuiltin(
+                                            dst,
+                                            name.to_string(),
+                                            args.clone(),
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
+                                } else if name == "null?" && args.len() == 1 {
+                                    // cs-gih — mirrors JIT-mode ("null?", 1).
+                                    if value_types.get(&args[0]).copied() == Some(Type::Any) {
+                                        insts.push(RirInst::NullP(dst, args[0]));
+                                        value_types.insert(dst, Type::Boolean);
+                                    } else {
+                                        insts.push(RirInst::CallBuiltin(
+                                            dst,
+                                            name.to_string(),
+                                            args.clone(),
+                                        ));
+                                        value_types.insert(dst, Type::Any);
+                                    }
                                 } else {
                                     insts.push(RirInst::CallBuiltin(
                                         dst,

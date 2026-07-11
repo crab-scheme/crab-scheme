@@ -879,6 +879,125 @@ fn source_to_aot_capturing_closure_inline_call() {
 }
 
 #[test]
+fn source_to_aot_open_coded_car_cdr_cons_chain() {
+    // cs-gih — car/cdr/cons open-coded under aot_mode() (previously
+    // routed every builtin, including these hot pair primitives,
+    // through by-name walker dispatch via CallBuiltin). Build a
+    // 2-element list and pull both elements back out through a
+    // car/cdr chain, proving Cons/Car/Cdr round-trip correctly when
+    // compiled to native code.
+    let bin = aot_compile_multi_and_run(
+        "(define (test x y) \
+           (let ((p (cons x (cons y '())))) \
+             (+ (car p) (car (cdr p)))))",
+        "test",
+        "car_cdr_cons_chain",
+    );
+    assert_eq!(run_multi_with_args(&bin, "test", &[3, 4]), 7);
+    assert_eq!(run_multi_with_args(&bin, "test", &[0, 0]), 0);
+    assert_eq!(run_multi_with_args(&bin, "test", &[-5, 10]), 5);
+}
+
+#[test]
+fn source_to_aot_open_coded_pair_and_null_predicates() {
+    // cs-gih — pair?/null? open-coded under aot_mode(). Exercises
+    // both predicates on a pair, on '(), and on a non-pair fixnum
+    // (which falls to the fixnum-typed CallBuiltin fallback since
+    // the open-coded arm only fires on a statically Any-typed
+    // operand). Wrapped in an if so the harness's i64-stdout parse
+    // still works.
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) \
+           (if (= n 0) (if (pair? (cons 1 2)) 1 0) \
+           (if (= n 1) (if (pair? '()) 1 0) \
+           (if (= n 2) (if (null? '()) 1 0) \
+               (if (null? (cons 1 2)) 1 0)))))",
+        "test",
+        "pair_null_predicates",
+    );
+    assert_eq!(run_multi_with_args(&bin, "test", &[0]), 1); // (pair? (cons 1 2)) = #t
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 0); // (pair? '()) = #f
+    assert_eq!(run_multi_with_args(&bin, "test", &[2]), 1); // (null? '()) = #t
+    assert_eq!(run_multi_with_args(&bin, "test", &[3]), 0); // (null? (cons 1 2)) = #f
+}
+
+#[test]
+fn source_to_aot_shadowed_car_still_calls_user_binding() {
+    // cs-gih — mirrors source_to_aot_shadowed_not_still_calls_user_binding
+    // (cs-qrm): a top-level `(define (car x) ...)` shadows the
+    // builtin. The compiler's global-fold optimization must see the
+    // shadow and never fold the call to the builtin `car` sentinel,
+    // so StackEntry::BuiltinRef never fires and the open-coded arm
+    // is never reached for this call site.
+    let bin = aot_compile_multi_and_run(
+        "(define (car x) (if x 111 222)) \
+         (define (test n) (car (= n 0)))",
+        "test",
+        "shadowed_car",
+    );
+    // test(0): (= 0 0) = #t → shadowed (car #t) = 111.
+    assert_eq!(run_multi_with_args(&bin, "test", &[0]), 111);
+    // test(5): (= 5 0) = #f → shadowed (car #f) = 222.
+    assert_eq!(run_multi_with_args(&bin, "test", &[5]), 222);
+}
+
+#[test]
+fn source_to_aot_car_on_non_pair_errors_gracefully() {
+    // cs-gih — (car 5) under AOT: the literal `5` is statically
+    // Fixnum-typed (a LoadConst), never Any, so the open-coded Car
+    // arm's `value_types.get(&args[0]) == Some(Type::Any)` guard
+    // never fires and the call falls through to the generic
+    // CallBuiltin dispatch (cs_runtime::aot_call_builtin) — same
+    // walker-tier error path as every other unrecognized builtin
+    // call, rather than hitting vm_pair_car_gc's JIT-only deopt
+    // sentinel (which has no interpreter tier to fall back to in an
+    // AOT binary).
+    //
+    // Turns out this IS the pre-existing "graceful" contract for
+    // `aot_call_builtin`: `aot_dispatch_builtin_with`
+    // (crates/cs-runtime/src/lib.rs) already catches the real
+    // walker `car`'s type Err, prints it to stderr, and returns NB
+    // Unspecified rather than aborting the process — by design, so
+    // one bad builtin call doesn't crash an otherwise-working AOT
+    // binary. So the observable contract isn't a non-zero exit; it's
+    // "no bogus value on stdout, and the error surfaces on stderr".
+    // This test proves the type-guard fallback preserves exactly
+    // that existing behavior rather than the open-coded arm hitting
+    // vm_pair_car_gc's silent deopt-return-Unspecified path (which
+    // has no stderr message at all — the observable difference this
+    // test actually guards against).
+    let bin = aot_compile_multi_and_run(
+        "(define (test n) (if (= n 0) (car 5) 42))",
+        "test",
+        "car_non_pair_error",
+    );
+    // n=1 never touches (car 5); confirms the binary at least runs.
+    assert_eq!(run_multi_with_args(&bin, "test", &[1]), 42);
+    // n=0 triggers (car 5): process still exits 0 (matches the
+    // documented aot_call_builtin contract), stdout is the
+    // Unspecified sentinel (not a bogus fixnum), and stderr carries
+    // the real walker error message.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("test").arg("0");
+    let out = cmd.output().expect("binary executes");
+    assert!(
+        out.status.success(),
+        "expected the AOT binary to exit 0 per aot_call_builtin's non-aborting error contract, got stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().parse::<i64>().is_err(),
+        "expected (car 5) to NOT produce a valid fixnum on stdout, got `{stdout}`"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("car"),
+        "expected the walker's car type-error to surface on stderr, got `{stderr}`"
+    );
+}
+
+#[test]
 fn compile_source_diagnostics_list_available_entries_on_typo() {
     // Negative-path coverage: if --entry NAME doesn't match any
     // top-level define, the helper panics with the available names
