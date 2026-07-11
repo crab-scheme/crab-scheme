@@ -564,6 +564,7 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("symbol=?", b_symbol_eq),
         ("bytevector-copy!", b_bytevector_copy_bang),
         ("string-copy!", b_string_copy_bang),
+        ("bytevector-nul-unescape", b_bytevector_nul_unescape),
         // bytevectors
         ("make-bytevector", b_make_bytevector),
         ("bytevector", b_bytevector),
@@ -10451,6 +10452,54 @@ fn b_bytevector_copy(args: &[Value]) -> Result<Value, String> {
     };
     Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(bytes[start..end].to_vec()),
+    )))
+}
+
+/// `(bytevector-nul-unescape bv start)` — cw-71k. Fuses the "find the
+/// 0x00 0x00 terminator, then un-escape 0x00 0xFF runs back to 0x00" scan
+/// used by order-preserving key schemas (each literal 0x00 byte encoded as
+/// 0x00 0xFF, the whole run terminated by 0x00 0x00) into ONE native pass
+/// instead of two interpreted Scheme byte loops plus an intermediate slice.
+/// Scans `bv` from `start` until a 0x00 byte immediately followed by
+/// another 0x00 (the terminator, not consumed/returned); every other 0x00
+/// byte is assumed followed by 0xFF (an escaped literal 0x00) and collapses
+/// to a single 0x00 in the result. Returns a freshly allocated bytevector
+/// of the un-escaped bytes.
+fn b_bytevector_nul_unescape(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(arity_err("bytevector-nul-unescape", "2", args.len()));
+    }
+    let bytes = match &args[0] {
+        Value::ByteVector(bv) => bv.borrow().clone(),
+        v => return Err(type_err("bytevector-nul-unescape", "bytevector", v)),
+    };
+    let start = as_int_i64("bytevector-nul-unescape", &args[1])? as usize;
+    if start > bytes.len() {
+        return Err(format!(
+            "bytevector-nul-unescape: start out of range: {}",
+            start
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() - start);
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0 {
+            if i + 1 >= bytes.len() {
+                return Err("bytevector-nul-unescape: unterminated escape run".into());
+            }
+            if bytes[i + 1] == 0 {
+                break; // terminator 0x00 0x00
+            }
+            out.push(0);
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    Ok(Value::ByteVector(cs_core::Gc::new(
+        std::cell::RefCell::new(out),
     )))
 }
 
