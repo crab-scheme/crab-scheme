@@ -116,6 +116,7 @@ fn hashtable_walks_keys_values_and_custom_fns() {
             hash: Value::Pair(hash_proc.clone()),
             equiv: Value::Pair(equiv_proc.clone()),
         }),
+        index: RefCell::new(std::collections::HashMap::new()),
     };
 
     let got = collected_addrs(&ht);
@@ -139,6 +140,7 @@ fn hashtable_no_custom_emits_only_kv() {
         items: RefCell::new(vec![(Value::Pair(kp.clone()), Value::Pair(vp.clone()))]),
         eq_kind: HtEqKind::Eq,
         custom: None,
+        index: RefCell::new(std::collections::HashMap::new()),
     };
     let got = collected_addrs(&ht);
     let mut expected = vec![Gc::as_addr(&kp), Gc::as_addr(&vp)];

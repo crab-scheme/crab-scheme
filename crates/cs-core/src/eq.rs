@@ -2,11 +2,14 @@
 //!
 //! `equal?` handles cyclic structures via a visited-set fallback.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 #[cfg_attr(not(test), allow(unused_imports))]
-use crate::value::{Pair, Value};
+use crate::value::{HtEqKind, Pair, Value};
+use crate::Number;
 
 /// R6RS `eq?`: identity for heap values, value equality for immediates.
 pub fn eq(a: &Value, b: &Value) -> bool {
@@ -89,6 +92,133 @@ fn equal_rec(a: &Value, b: &Value, visited: &mut HashSet<(usize, usize)>, fuel: 
     }
 }
 
+/// Hash a value consistently with the given equivalence kind: two values
+/// that compare equal under `kind` (via [`eq`]/[`eqv`]/[`equal`]) MUST
+/// hash to the same bucket. Hash collisions are always resolved by the
+/// real comparator, so this only needs to be a good-enough distributor,
+/// never perfectly injective. `HtEqKind::Custom` has no fixed hash here —
+/// callers with a user-supplied hash procedure and an invocation context
+/// compute it themselves and never reach this function.
+pub fn hash_value(v: &Value, kind: HtEqKind) -> u64 {
+    match kind {
+        HtEqKind::Eq => hash_eq(v),
+        HtEqKind::Eqv => hash_eqv(v),
+        HtEqKind::Equal => hash_equal(v, 16),
+        HtEqKind::Custom => unreachable!("custom hashing routes through the user hash proc"),
+    }
+}
+
+fn hash_eq(v: &Value) -> u64 {
+    match v {
+        Value::Null => 0x1,
+        Value::Unspecified => 0x2,
+        Value::Eof => 0x3,
+        Value::Boolean(b) => {
+            if *b {
+                0x11
+            } else {
+                0x10
+            }
+        }
+        Value::Character(c) => 0x100u64.wrapping_add(*c as u64),
+        Value::Symbol(s) => 0x200u64.wrapping_add(s.0 as u64),
+        // Two identifiers are only `eq?` when both name and mark match
+        // (see `eq` above), so both must feed the hash.
+        Value::Identifier { name, mark } => 0x300u64
+            .wrapping_add(name.0 as u64)
+            .wrapping_add(mark.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        // `eq` only ever returns true for two Fixnums; every other number
+        // shape is `eq?`-false against everything (see `eq` above), so any
+        // fixed bucket for them is safe — they'll never match in-bucket.
+        Value::Number(Number::Fixnum(n)) => 0x400u64.wrapping_add(*n as u64),
+        Value::Number(_) => 0x4FF,
+        Value::String(g) => 0x500u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+        Value::Pair(g) => 0x600u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+        Value::Vector(g) => 0x700u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+        Value::ByteVector(g) => 0x800u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+        Value::Procedure(p) => 0x900u64.wrapping_add(Rc::as_ptr(p) as *const () as usize as u64),
+        Value::Hashtable(g) => 0xA00u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+        Value::Port(g) => 0xB00u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+        Value::Promise(g) => 0xC00u64.wrapping_add(crate::Gc::as_addr(g) as u64),
+    }
+}
+
+fn hash_eqv(v: &Value) -> u64 {
+    match v {
+        Value::Number(n) => hash_number(n),
+        _ => hash_eq(v),
+    }
+}
+
+/// Hashes a number respecting exactness: an exact and inexact value that
+/// happen to denote the same magnitude (e.g. `2` vs `2.0`) are NOT
+/// `eqv?`-equal, so they're tagged into separate hash spaces.
+fn hash_number(n: &Number) -> u64 {
+    let mut h = DefaultHasher::new();
+    match n {
+        Number::Fixnum(i) => {
+            0u8.hash(&mut h);
+            i.hash(&mut h);
+        }
+        Number::Flonum(f) => {
+            1u8.hash(&mut h);
+            f.to_bits().hash(&mut h);
+        }
+        // Big/Rat are kept in canonical (reduced) form by their
+        // libraries, so their Display output is a stable digest.
+        Number::Big(b) => {
+            2u8.hash(&mut h);
+            b.to_string().hash(&mut h);
+        }
+        Number::Rat(r) => {
+            3u8.hash(&mut h);
+            r.to_string().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Structural hash mirroring `equal_rec`, with a depth cap so deep or
+/// cyclic structures degrade to bucket collisions (resolved by the real
+/// `equal?` comparator) instead of looping or blowing the stack.
+fn hash_equal(v: &Value, depth: u32) -> u64 {
+    if depth == 0 {
+        return 0xD; // depth-exhausted: collapse into one shared bucket.
+    }
+    match v {
+        Value::String(s) => {
+            let mut h = DefaultHasher::new();
+            10u8.hash(&mut h);
+            s.borrow().hash(&mut h);
+            h.finish()
+        }
+        Value::Pair(p) => {
+            let mut h = DefaultHasher::new();
+            11u8.hash(&mut h);
+            hash_equal(&p.car(), depth - 1).hash(&mut h);
+            hash_equal(&p.cdr(), depth - 1).hash(&mut h);
+            h.finish()
+        }
+        Value::Vector(vec) => {
+            let b = vec.borrow();
+            let mut h = DefaultHasher::new();
+            12u8.hash(&mut h);
+            b.len().hash(&mut h);
+            for item in b.iter() {
+                hash_equal(item, depth - 1).hash(&mut h);
+            }
+            h.finish()
+        }
+        Value::ByteVector(bv) => {
+            let mut h = DefaultHasher::new();
+            13u8.hash(&mut h);
+            bv.borrow().hash(&mut h);
+            h.finish()
+        }
+        _ => hash_eqv(v),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +273,72 @@ mod tests {
         let va = Value::Pair(a);
         let vb = Value::Pair(b);
         assert!(equal(&va, &vb));
+    }
+
+    #[test]
+    fn hash_agrees_with_eq_for_fixnums() {
+        let a = Value::fixnum(42);
+        let b = Value::fixnum(42);
+        assert!(eq(&a, &b));
+        assert_eq!(hash_value(&a, HtEqKind::Eq), hash_value(&b, HtEqKind::Eq));
+    }
+
+    #[test]
+    fn hash_agrees_with_equal_for_nested_lists() {
+        let a = Value::list([
+            Value::fixnum(1),
+            Value::list([Value::fixnum(2), Value::fixnum(3)]),
+        ]);
+        let b = Value::list([
+            Value::fixnum(1),
+            Value::list([Value::fixnum(2), Value::fixnum(3)]),
+        ]);
+        assert!(equal(&a, &b));
+        assert_eq!(
+            hash_value(&a, HtEqKind::Equal),
+            hash_value(&b, HtEqKind::Equal)
+        );
+    }
+
+    #[test]
+    fn hash_exactness_respected_for_eqv() {
+        // 2 and 2.0 are not `eqv?`-equal (exactness differs); their hashes
+        // aren't required to differ, but the common case should, and
+        // correctness never depends on it (eqv? still resolves collisions).
+        let exact = Value::fixnum(2);
+        let inexact = Value::Number(Number::Flonum(2.0));
+        assert!(!eqv(&exact, &inexact));
+        assert_ne!(
+            hash_value(&exact, HtEqKind::Eqv),
+            hash_value(&inexact, HtEqKind::Eqv)
+        );
+    }
+
+    #[test]
+    fn hash_equal_depth_cap_terminates_on_self_cycle() {
+        // A self-cyclic pair must not loop or stack-overflow when hashed
+        // under equal-kind; the depth cap collapses it into a constant.
+        let x = Pair::new(Value::fixnum(1), Value::fixnum(2));
+        x.set_cdr(Value::Pair(x.clone()));
+        let v = Value::Pair(x);
+        let _ = hash_value(&v, HtEqKind::Equal); // must terminate
+    }
+
+    #[test]
+    fn hash_equal_vectors_and_bytevectors() {
+        let a = Value::Vector(crate::Gc::new(std::cell::RefCell::new(vec![
+            Value::fixnum(1),
+            Value::fixnum(2),
+        ])));
+        let b = Value::Vector(crate::Gc::new(std::cell::RefCell::new(vec![
+            Value::fixnum(1),
+            Value::fixnum(2),
+        ])));
+        assert!(equal(&a, &b));
+        assert_eq!(
+            hash_value(&a, HtEqKind::Equal),
+            hash_value(&b, HtEqKind::Equal)
+        );
     }
 }
 
