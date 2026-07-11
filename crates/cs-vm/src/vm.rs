@@ -1165,7 +1165,7 @@ mod proc_table {
 
     struct ProcSlot {
         // Some when the slot is live; None when freed and on the free list.
-        proc: Option<Rc<dyn cs_core::Procedure>>,
+        proc: Option<Rc<Box<dyn cs_core::Procedure>>>,
         // Live NB carriers pointing at this slot. Slot freed at 0.
         refcount: u32,
         // Free-list link (u32::MAX = tail).
@@ -1187,7 +1187,7 @@ mod proc_table {
             }
         }
 
-        pub(super) fn alloc(&mut self, p: Rc<dyn cs_core::Procedure>) -> u32 {
+        pub(super) fn alloc(&mut self, p: Rc<Box<dyn cs_core::Procedure>>) -> u32 {
             if self.free_head != Self::NIL {
                 let idx = self.free_head;
                 let slot = &mut self.slots[idx as usize];
@@ -1227,7 +1227,7 @@ mod proc_table {
         /// caller must drop the returned value only after releasing the
         /// borrow.
         #[must_use]
-        pub(super) fn decref(&mut self, idx: u32) -> Option<Rc<dyn cs_core::Procedure>> {
+        pub(super) fn decref(&mut self, idx: u32) -> Option<Rc<Box<dyn cs_core::Procedure>>> {
             let slot = &mut self.slots[idx as usize];
             debug_assert!(slot.proc.is_some(), "decref on freed slot");
             slot.refcount -= 1;
@@ -1242,7 +1242,7 @@ mod proc_table {
 
         /// Borrow without consuming. The returned Rc is a fresh clone;
         /// the slot's refcount is unchanged.
-        pub(super) fn peek(&self, idx: u32) -> Rc<dyn cs_core::Procedure> {
+        pub(super) fn peek(&self, idx: u32) -> Rc<Box<dyn cs_core::Procedure>> {
             self.slots[idx as usize]
                 .proc
                 .as_ref()
@@ -1256,7 +1256,7 @@ mod proc_table {
     }
 
     /// Register `p` and return the new slot index (refcount = 1).
-    pub(super) fn alloc(p: Rc<dyn cs_core::Procedure>) -> u32 {
+    pub(super) fn alloc(p: Rc<Box<dyn cs_core::Procedure>>) -> u32 {
         PROC_TABLE.with(|t| t.borrow_mut().alloc(p))
     }
 
@@ -1283,13 +1283,13 @@ mod proc_table {
         drop(freed);
     }
 
-    pub(super) fn peek(idx: u32) -> Rc<dyn cs_core::Procedure> {
+    pub(super) fn peek(idx: u32) -> Rc<Box<dyn cs_core::Procedure>> {
         PROC_TABLE.with(|t| t.borrow().peek(idx))
     }
 
     /// Consume the NB encoding: clone the Rc out + decrement refcount
     /// (freeing the slot when it was the last NB owner).
-    pub(super) fn take(idx: u32) -> Rc<dyn cs_core::Procedure> {
+    pub(super) fn take(idx: u32) -> Rc<Box<dyn cs_core::Procedure>> {
         // Deferred drop (see `ProcTable::decref`): `freed` must be
         // dropped only after the borrow below is released.
         let (p, freed) = PROC_TABLE.with(|t| {
@@ -10084,14 +10084,16 @@ pub unsafe extern "C" fn vm_make_closure(lambda_idx: i64) -> i64 {
     // instance of this lambda — cloning is a cheap `Rc` refcount
     // bump. (Post-M8 JIT plan, Stage 0.)
     let profile = bc_rc.lambdas[lambda_idx].profile.clone();
-    let p: Rc<dyn Procedure> = Rc::new_cyclic(|w| VmClosure {
-        lambda_idx,
-        env: env_rc,
-        bc: bc_rc,
-        profile,
-        self_name: Cell::new(None),
-        self_weak: w.clone(),
-        closure_id: alloc_closure_id(),
+    let p: Rc<Box<dyn Procedure>> = Rc::new_cyclic(|w| {
+        Box::new(VmClosure {
+            lambda_idx,
+            env: env_rc,
+            bc: bc_rc,
+            profile,
+            self_name: Cell::new(None),
+            self_weak: w.clone(),
+            closure_id: alloc_closure_id(),
+        }) as Box<dyn Procedure>
     });
     value_to_gc_i64(Value::Procedure(p))
 }
@@ -11112,7 +11114,7 @@ pub struct VmClosure {
     /// `Value::Procedure` for the `self_bind` binding without threading
     /// the strong `Rc` through every signature. Weak, so it does not
     /// keep the closure alive (no cycle).
-    self_weak: std::rc::Weak<VmClosure>,
+    self_weak: std::rc::Weak<Box<dyn cs_core::Procedure>>,
     /// Stable, process-wide unique identity. Stamped once at
     /// construction (the `Inst::MakeClosure` site in `run_dispatch`)
     /// from [`NEXT_CLOSURE_ID`] and never mutated thereafter — the
@@ -11233,9 +11235,7 @@ impl VmClosure {
     /// builders to install the `self_bind` binding when only a
     /// `&VmClosure` is in scope. `None` only if the closure is mid-drop.
     fn self_value(&self) -> Option<Value> {
-        self.self_weak
-            .upgrade()
-            .map(|rc| Value::Procedure(rc as Rc<dyn cs_core::Procedure>))
+        self.self_weak.upgrade().map(Value::Procedure)
     }
 
     // The JIT accessors below all forward to the shared
@@ -12288,7 +12288,7 @@ fn run_dispatch(
                 // For non-pointer-typed slots (or pointer tags other than
                 // GC_VALUE), it cannot be a Procedure, so we fail fast with
                 // an informative error.
-                let func_proc: Rc<dyn cs_core::Procedure> = {
+                let func_proc: Rc<Box<dyn cs_core::Procedure>> = {
                     let nb = stack.at_nb(func_idx);
                     let bits = nb.into_raw() as u64;
                     if !nb_is_tagged(bits) {
@@ -13276,7 +13276,7 @@ fn run_dispatch(
                         continue;
                     }
                     // Vector / string / hashtable / sort / unfold HO ops.
-                    if is_pure_ho_marker(p.as_ref()) {
+                    if is_pure_ho_marker(&***p) {
                         let r = ho_apply(&func, &args, syms)?;
                         stack.push(r);
                         if is_tail {
@@ -13696,7 +13696,12 @@ fn run_dispatch(
                         // below). Clear in_flight so any later
                         // re-invocation takes the snapshot-restore
                         // path rather than the escape path.
-                        k_handle.in_flight.set(false);
+                        k_handle
+                            .as_any()
+                            .downcast_ref::<VmContinuation>()
+                            .expect("k_handle is always a VmContinuation")
+                            .in_flight
+                            .set(false);
                         let v = match res {
                             Ok(v) => v,
                             Err(e) => {
@@ -13804,7 +13809,7 @@ fn run_dispatch(
                                 || any2.downcast_ref::<VmReduce>().is_some()
                                 || any2.downcast_ref::<VmCount>().is_some()
                                 || any2.downcast_ref::<VmPartition>().is_some()
-                                || is_pure_ho_marker(p2.as_ref())
+                                || is_pure_ho_marker(&***p2)
                             {
                                 let r = ho_apply(&func, &args, syms)?;
                                 stack.push(r);
@@ -14020,16 +14025,18 @@ fn run_dispatch(
                 // The IC uses this as its cache key; assigning at
                 // the (single) construction site keeps the id
                 // immutable for the closure's lifetime.
-                let p: Rc<dyn Procedure> = Rc::new_cyclic(|w| VmClosure {
-                    lambda_idx: *idx,
-                    env: frame.env.clone(),
-                    bc: frame.bc.clone(),
-                    // Share the per-lambda JIT profile across every
-                    // instance of this lambda. (Post-M8 plan, Stage 0.)
-                    profile: frame.bc.lambdas[*idx].profile.clone(),
-                    self_name: Cell::new(None),
-                    self_weak: w.clone(),
-                    closure_id: alloc_closure_id(),
+                let p: Rc<Box<dyn Procedure>> = Rc::new_cyclic(|w| {
+                    Box::new(VmClosure {
+                        lambda_idx: *idx,
+                        env: frame.env.clone(),
+                        bc: frame.bc.clone(),
+                        // Share the per-lambda JIT profile across every
+                        // instance of this lambda. (Post-M8 plan, Stage 0.)
+                        profile: frame.bc.lambdas[*idx].profile.clone(),
+                        self_name: Cell::new(None),
+                        self_weak: w.clone(),
+                        closure_id: alloc_closure_id(),
+                    }) as Box<dyn Procedure>
                 });
                 stack.push(Value::Procedure(p));
             }
@@ -14795,11 +14802,11 @@ impl Procedure for VmBuiltinSyms {
 }
 
 pub fn make_vm_builtin(name: &'static str, f: VmBuiltinFn) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(VmBuiltin {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(VmBuiltin {
         name,
         f,
         fast: None,
-    });
+    }));
     Value::Procedure(p)
 }
 
@@ -14811,16 +14818,16 @@ pub fn make_vm_builtin(name: &'static str, f: VmBuiltinFn) -> Value {
 /// calling it directly on any arity mismatch or type miss, so error
 /// text is always byte-for-byte what the generic path would produce.
 pub fn make_vm_builtin_fast(name: &'static str, f: VmBuiltinFn, fast: DataPrimOp) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(VmBuiltin {
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(VmBuiltin {
         name,
         f,
         fast: Some(fast),
-    });
+    }));
     Value::Procedure(p)
 }
 
 pub fn make_vm_builtin_syms(name: &'static str, f: VmBuiltinSymsFn) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(VmBuiltinSyms { name, f });
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(VmBuiltinSyms { name, f }));
     Value::Procedure(p)
 }
 
@@ -14856,7 +14863,7 @@ pub fn make_vm_host_builtin(
     name: &'static str,
     f: std::sync::Arc<dyn Fn(&[Value]) -> Result<Value, String> + Send + Sync>,
 ) -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(VmHostBuiltin { name, f });
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(VmHostBuiltin { name, f }));
     Value::Procedure(p)
 }
 
@@ -14878,7 +14885,7 @@ impl Procedure for VmApply {
 }
 
 pub fn make_vm_apply() -> Value {
-    let p: Rc<dyn Procedure> = Rc::new(VmApply);
+    let p: Rc<Box<dyn Procedure>> = Rc::new(Box::new(VmApply));
     Value::Procedure(p)
 }
 
@@ -14964,22 +14971,22 @@ impl Procedure for VmEvery {
 }
 
 pub fn make_vm_map() -> Value {
-    Value::Procedure(Rc::new(VmMap) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmMap) as Box<dyn Procedure>))
 }
 pub fn make_vm_for_each() -> Value {
-    Value::Procedure(Rc::new(VmForEach) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmForEach) as Box<dyn Procedure>))
 }
 pub fn make_vm_filter() -> Value {
-    Value::Procedure(Rc::new(VmFilter) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmFilter) as Box<dyn Procedure>))
 }
 pub fn make_vm_find() -> Value {
-    Value::Procedure(Rc::new(VmFind) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmFind) as Box<dyn Procedure>))
 }
 pub fn make_vm_any() -> Value {
-    Value::Procedure(Rc::new(VmAny) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmAny) as Box<dyn Procedure>))
 }
 pub fn make_vm_every() -> Value {
-    Value::Procedure(Rc::new(VmEvery) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmEvery) as Box<dyn Procedure>))
 }
 
 /// Additional native HO marker types.
@@ -15077,25 +15084,25 @@ impl Procedure for VmCallWithValues {
 }
 
 pub fn make_vm_fold_left() -> Value {
-    Value::Procedure(Rc::new(VmFoldLeft) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmFoldLeft) as Box<dyn Procedure>))
 }
 pub fn make_vm_fold_right() -> Value {
-    Value::Procedure(Rc::new(VmFoldRight) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmFoldRight) as Box<dyn Procedure>))
 }
 pub fn make_vm_reduce() -> Value {
-    Value::Procedure(Rc::new(VmReduce) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmReduce) as Box<dyn Procedure>))
 }
 pub fn make_vm_count() -> Value {
-    Value::Procedure(Rc::new(VmCount) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmCount) as Box<dyn Procedure>))
 }
 pub fn make_vm_partition() -> Value {
-    Value::Procedure(Rc::new(VmPartition) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmPartition) as Box<dyn Procedure>))
 }
 pub fn make_vm_values() -> Value {
-    Value::Procedure(Rc::new(VmValues) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmValues) as Box<dyn Procedure>))
 }
 pub fn make_vm_call_with_values() -> Value {
-    Value::Procedure(Rc::new(VmCallWithValues) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmCallWithValues) as Box<dyn Procedure>))
 }
 
 /// Vector / string / hashtable HO markers.
@@ -15168,13 +15175,13 @@ impl_proc_named!(VmTabulate, "tabulate");
 impl_proc_named!(VmRemove, "remove");
 impl_proc_named!(VmForce, "force");
 pub fn make_vm_tabulate() -> Value {
-    Value::Procedure(Rc::new(VmTabulate) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmTabulate) as Box<dyn Procedure>))
 }
 pub fn make_vm_remove() -> Value {
-    Value::Procedure(Rc::new(VmRemove) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmRemove) as Box<dyn Procedure>))
 }
 pub fn make_vm_force() -> Value {
-    Value::Procedure(Rc::new(VmForce) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmForce) as Box<dyn Procedure>))
 }
 
 /// `eval` marker: dispatches to the installed VmEvalHook.
@@ -15182,7 +15189,7 @@ pub fn make_vm_force() -> Value {
 pub struct VmEval;
 impl_proc_named!(VmEval, "eval");
 pub fn make_vm_eval() -> Value {
-    Value::Procedure(Rc::new(VmEval) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmEval) as Box<dyn Procedure>))
 }
 
 /// I/O port-state markers.
@@ -15214,31 +15221,33 @@ impl_proc_named!(VmWithInputFromFile, "with-input-from-file");
 impl_proc_named!(VmCurrentInputPort, "current-input-port");
 impl_proc_named!(VmCurrentOutputPort, "current-output-port");
 pub fn make_vm_display() -> Value {
-    Value::Procedure(Rc::new(VmDisplay) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmDisplay) as Box<dyn Procedure>))
 }
 pub fn make_vm_write() -> Value {
-    Value::Procedure(Rc::new(VmWrite) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmWrite) as Box<dyn Procedure>))
 }
 pub fn make_vm_newline() -> Value {
-    Value::Procedure(Rc::new(VmNewline) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmNewline) as Box<dyn Procedure>))
 }
 pub fn make_vm_with_output_to_string() -> Value {
-    Value::Procedure(Rc::new(VmWithOutputToString) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmWithOutputToString) as Box<dyn Procedure>))
 }
 pub fn make_vm_with_output_to_file() -> Value {
-    Value::Procedure(Rc::new(VmWithOutputToFile) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmWithOutputToFile) as Box<dyn Procedure>))
 }
 pub fn make_vm_with_input_from_file() -> Value {
-    Value::Procedure(Rc::new(VmWithInputFromFile) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmWithInputFromFile) as Box<dyn Procedure>))
 }
 pub fn make_vm_with_input_from_string() -> Value {
-    Value::Procedure(Rc::new(VmWithInputFromString) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(
+        Box::new(VmWithInputFromString) as Box<dyn Procedure>
+    ))
 }
 pub fn make_vm_current_input_port() -> Value {
-    Value::Procedure(Rc::new(VmCurrentInputPort) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmCurrentInputPort) as Box<dyn Procedure>))
 }
 pub fn make_vm_current_output_port() -> Value {
-    Value::Procedure(Rc::new(VmCurrentOutputPort) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmCurrentOutputPort) as Box<dyn Procedure>))
 }
 
 fn write_to_current_output(s: &str, explicit_port: Option<Value>) -> Result<Value, VmError> {
@@ -15271,46 +15280,46 @@ fn write_to_current_output(s: &str, explicit_port: Option<Value>) -> Result<Valu
 }
 
 pub fn make_vm_vector_map() -> Value {
-    Value::Procedure(Rc::new(VmVectorMap) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmVectorMap) as Box<dyn Procedure>))
 }
 pub fn make_vm_vector_for_each() -> Value {
-    Value::Procedure(Rc::new(VmVectorForEach) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmVectorForEach) as Box<dyn Procedure>))
 }
 pub fn make_vm_vector_fold() -> Value {
-    Value::Procedure(Rc::new(VmVectorFold) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmVectorFold) as Box<dyn Procedure>))
 }
 pub fn make_vm_vector_filter() -> Value {
-    Value::Procedure(Rc::new(VmVectorFilter) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmVectorFilter) as Box<dyn Procedure>))
 }
 pub fn make_vm_string_map() -> Value {
-    Value::Procedure(Rc::new(VmStringMap) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmStringMap) as Box<dyn Procedure>))
 }
 pub fn make_vm_string_for_each() -> Value {
-    Value::Procedure(Rc::new(VmStringForEach) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmStringForEach) as Box<dyn Procedure>))
 }
 pub fn make_vm_hashtable_walk() -> Value {
-    Value::Procedure(Rc::new(VmHashtableWalk) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmHashtableWalk) as Box<dyn Procedure>))
 }
 pub fn make_vm_hashtable_for_each() -> Value {
-    Value::Procedure(Rc::new(VmHashtableForEach) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmHashtableForEach) as Box<dyn Procedure>))
 }
 pub fn make_vm_hashtable_fold() -> Value {
-    Value::Procedure(Rc::new(VmHashtableFold) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmHashtableFold) as Box<dyn Procedure>))
 }
 pub fn make_vm_hashtable_update() -> Value {
-    Value::Procedure(Rc::new(VmHashtableUpdate) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmHashtableUpdate) as Box<dyn Procedure>))
 }
 pub fn make_vm_unfold() -> Value {
-    Value::Procedure(Rc::new(VmUnfold) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmUnfold) as Box<dyn Procedure>))
 }
 pub fn make_vm_list_sort() -> Value {
-    Value::Procedure(Rc::new(VmListSort) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmListSort) as Box<dyn Procedure>))
 }
 pub fn make_vm_vector_sort() -> Value {
-    Value::Procedure(Rc::new(VmVectorSort) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmVectorSort) as Box<dyn Procedure>))
 }
 pub fn make_vm_vector_sort_bang() -> Value {
-    Value::Procedure(Rc::new(VmVectorSortBang) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmVectorSortBang) as Box<dyn Procedure>))
 }
 
 /// Exception support markers.
@@ -15366,25 +15375,29 @@ impl_proc_named!(VmCurrentContinuationMarks, "current-continuation-marks");
 impl_proc_named!(VmContinuation, "continuation");
 
 pub fn make_vm_raise() -> Value {
-    Value::Procedure(Rc::new(VmRaise) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmRaise) as Box<dyn Procedure>))
 }
 pub fn make_vm_error_fn() -> Value {
-    Value::Procedure(Rc::new(VmErrorFn) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmErrorFn) as Box<dyn Procedure>))
 }
 pub fn make_vm_assertion_violation() -> Value {
-    Value::Procedure(Rc::new(VmAssertionViolation) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmAssertionViolation) as Box<dyn Procedure>))
 }
 pub fn make_vm_with_exception_handler() -> Value {
-    Value::Procedure(Rc::new(VmWithExceptionHandler) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(
+        Box::new(VmWithExceptionHandler) as Box<dyn Procedure>
+    ))
 }
 pub fn make_vm_dynamic_wind() -> Value {
-    Value::Procedure(Rc::new(VmDynamicWind) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmDynamicWind) as Box<dyn Procedure>))
 }
 pub fn make_vm_call_cc() -> Value {
-    Value::Procedure(Rc::new(VmCallCc) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(Box::new(VmCallCc) as Box<dyn Procedure>))
 }
 pub fn make_vm_current_continuation_marks() -> Value {
-    Value::Procedure(Rc::new(VmCurrentContinuationMarks) as Rc<dyn Procedure>)
+    Value::Procedure(Rc::new(
+        Box::new(VmCurrentContinuationMarks) as Box<dyn Procedure>
+    ))
 }
 
 /// Build the result of `current-continuation-marks` by walking the
@@ -15416,11 +15429,11 @@ fn build_continuation_marks(frames: &[Frame], key: Option<&Value>) -> Value {
     out
 }
 pub fn make_vm_continuation(id: u64) -> Value {
-    Value::Procedure(Rc::new(VmContinuation {
+    Value::Procedure(Rc::new(Box::new(VmContinuation {
         id,
         snapshot: None,
         in_flight: Cell::new(true),
-    }) as Rc<dyn Procedure>)
+    }) as Box<dyn Procedure>))
 }
 
 /// Construct a continuation with a captured snapshot (M8 iter 3+).
@@ -15429,18 +15442,21 @@ pub fn make_vm_continuation(id: u64) -> Value {
 /// the snapshot-restore path.
 ///
 /// Returns the `Value::Procedure` wrapping the continuation along
-/// with the `Rc<VmContinuation>` for the call site to clear
-/// in_flight on completion.
+/// with a second `Rc` clone of the same `Rc<Box<dyn Procedure>>`
+/// allocation, downcast-able back to `VmContinuation`, for the call
+/// site to clear `in_flight` on completion. Must stay the identical
+/// allocation as the `Value`'s handle — the `in_flight` `Cell` is
+/// only observed correctly if both handles alias the same object.
 pub fn make_vm_continuation_with_snapshot(
     id: u64,
     snapshot: Rc<VmContSnapshot>,
-) -> (Value, Rc<VmContinuation>) {
-    let k = Rc::new(VmContinuation {
+) -> (Value, Rc<Box<dyn Procedure>>) {
+    let k: Rc<Box<dyn Procedure>> = Rc::new(Box::new(VmContinuation {
         id,
         snapshot: Some(snapshot),
         in_flight: Cell::new(true),
-    });
-    let v = Value::Procedure(k.clone() as Rc<dyn Procedure>);
+    }));
+    let v = Value::Procedure(k.clone());
     (v, k)
 }
 
@@ -16637,7 +16653,7 @@ pub unsafe extern "C" fn vm_alloc_aot_procedure(disp_fn: usize, arity: u32) -> i
         name: None,
         captures: Vec::new(),
     };
-    let proc_rc: std::rc::Rc<dyn cs_core::Procedure> = std::rc::Rc::new(closure);
+    let proc_rc: std::rc::Rc<Box<dyn cs_core::Procedure>> = std::rc::Rc::new(Box::new(closure));
     let idx = proc_table::alloc(proc_rc);
     nb_make(NB_TAG_PROCEDURE, idx as u64) as i64
 }
@@ -16670,7 +16686,7 @@ pub unsafe extern "C" fn vm_alloc_aot_procedure_with_captures(
         name: None,
         captures,
     };
-    let proc_rc: std::rc::Rc<dyn cs_core::Procedure> = std::rc::Rc::new(closure);
+    let proc_rc: std::rc::Rc<Box<dyn cs_core::Procedure>> = std::rc::Rc::new(Box::new(closure));
     let idx = proc_table::alloc(proc_rc);
     nb_make(NB_TAG_PROCEDURE, idx as u64) as i64
 }
@@ -18302,14 +18318,14 @@ mod yield_hook_tests {
 
     #[test]
     fn proc_table_decref_reentrant_drop_does_not_panic() {
-        let inner: Rc<dyn cs_core::Procedure> = Rc::new(ReentrantDropProc {
+        let inner: Rc<Box<dyn cs_core::Procedure>> = Rc::new(Box::new(ReentrantDropProc {
             inner_idx: std::cell::Cell::new(None),
-        });
+        }));
         let inner_idx = proc_table::alloc(inner);
 
-        let outer: Rc<dyn cs_core::Procedure> = Rc::new(ReentrantDropProc {
+        let outer: Rc<Box<dyn cs_core::Procedure>> = Rc::new(Box::new(ReentrantDropProc {
             inner_idx: std::cell::Cell::new(Some(inner_idx)),
-        });
+        }));
         let outer_idx = proc_table::alloc(outer);
 
         // Dropping the outer slot's last reference runs `ReentrantDropProc`'s
