@@ -10469,11 +10469,12 @@ fn b_bytevector_nul_unescape(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(arity_err("bytevector-nul-unescape", "2", args.len()));
     }
-    let bytes = match &args[0] {
-        Value::ByteVector(bv) => bv.borrow().clone(),
+    let bv = match &args[0] {
+        Value::ByteVector(bv) => bv,
         v => return Err(type_err("bytevector-nul-unescape", "bytevector", v)),
     };
     let start = as_int_i64("bytevector-nul-unescape", &args[1])? as usize;
+    let bytes = bv.borrow();
     if start > bytes.len() {
         return Err(format!(
             "bytevector-nul-unescape: start out of range: {}",
@@ -10498,6 +10499,7 @@ fn b_bytevector_nul_unescape(args: &[Value]) -> Result<Value, String> {
             i += 1;
         }
     }
+    drop(bytes);
     Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(out),
     )))
