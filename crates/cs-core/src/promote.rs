@@ -277,7 +277,10 @@ impl Promote for Value {
                         Port::ByteVectorOutput(b) => {
                             Port::ByteVectorOutput(RefCell::new(b.borrow().clone()))
                         }
-                        Port::FileOutput(f) => Port::FileOutput(RefCell::new(f.borrow().clone())),
+                        Port::FileOutput(f) => {
+                            Port::FileOutput(RefCell::new(f.borrow_mut().duplicate()))
+                        }
+                        Port::Stdout => Port::Stdout,
                     };
                     *p = cs_gc::Gc::new(new_port);
                 }

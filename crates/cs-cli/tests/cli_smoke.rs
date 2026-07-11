@@ -329,6 +329,55 @@ fn write_after_close_raises_catchable_condition() {
 }
 
 #[test]
+fn flush_output_port_twice_does_not_duplicate_content() {
+    // cs-wm1: flush-output-port used to rewrite the whole file on every
+    // call from an in-memory buffer that was never cleared, so repeated
+    // flushes duplicated content instead of just syncing it. With the
+    // BufWriter-backed port, flushing twice must be idempotent.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "crabscheme-test-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path_s = path.to_string_lossy().replace('\\', "\\\\");
+    let prog = format!(
+        r#"
+(define p (open-output-file "{}"))
+(display "hello" p)
+(flush-output-port p)
+(flush-output-port p)
+(display ", world" p)
+(flush-output-port p)
+(close-port p)"#,
+        path_s
+    );
+    let (_, err, code) = run_eval(&prog);
+    assert_eq!(code, 0, "stderr: {:?}", err);
+    let written = std::fs::read_to_string(&path).expect("file should exist");
+    assert_eq!(written, "hello, world");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn write_char_and_write_string_target_stdout_port() {
+    // cs-wm1: (current-output-port) used to return #<unspecified> when no
+    // port had been installed, so 2-arg write-char/write-string couldn't
+    // target stdout at all. It must now return a real stdout port.
+    let prog = r#"
+(write-char #\A (current-output-port))
+(write-string "BC" (current-output-port))
+(newline (current-output-port))
+(display (output-port? (current-output-port)))"#;
+    let (out, err, code) = run_eval(prog);
+    assert_eq!(code, 0, "stderr: {:?}", err);
+    assert_eq!(out, "ABC\n#t");
+}
+
+#[test]
 fn assertion_violation_renders_friendly() {
     // assertion-violation's renderer uses the "assertion-violation" prefix
     // (not "error") since R6RS distinguishes the two.
