@@ -6,31 +6,59 @@
 //! `Bindings`/`NanboxValue`/`decode_gc_handle` are crate-private and
 //! only reachable directly from within `cs-vm`.
 //!
-//! **Investigation note (why this file doesn't itself exercise
-//! `Bindings::visit_children`):** the natural way to reach a VM
-//! closure's captured `Env`/`Bindings` from Scheme is through
-//! `cs_core::Procedure::visit_closure_children` — `Value::Procedure`'s
-//! `CycleVisit` impl forwards to it, and the layer-2 synchronous
-//! detector (`set-cdr!` / `set-car!` / `vector-set!` /
-//! `hashtable-set!`) walks through `Value` unconditionally. However,
-//! `cs-vm`'s `impl Procedure for VmClosure` does not override
-//! `visit_closure_children` (it inherits the trait's empty default —
-//! contrast with `cs-runtime`'s tree-walker `Closure`, which does
-//! override it). So today, no Scheme-level mutation actually reaches
-//! `VmClosure::visit_children` -> `Env::visit_children` ->
-//! `Bindings::visit_children`; that path is unreachable until
-//! `VmClosure` grows its own override. That gap is separate from
-//! cs-4wk's scope (tracked as a follow-up) but was discovered while
-//! building this test.
+//! **cs-f0k**: `cs-vm`'s `impl Procedure for VmClosure` now overrides
+//! `visit_closure_children` (mirroring `cs-runtime`'s tree-walker
+//! `Closure`), so `Value::Procedure`'s `CycleVisit` forward and the
+//! layer-2 synchronous detector (`set-cdr!` / `set-car!` /
+//! `vector-set!` / `hashtable-set!`) now do reach a VM closure's
+//! captured `Env`/`Bindings` -> `VmClosure::visit_children` ->
+//! `Env::visit_children` -> `Bindings::visit_children`. The
+//! `cycle_detector_reaches_captured_env_through_vm_closure` test
+//! below is the true end-to-end regression coverage for that: a
+//! Scheme-level cycle closed *through* a VM closure's capture (not
+//! just through the pair's own `car`/`cdr`) is now observed by the
+//! detector, mirroring `cs-runtime/tests/closure_cycle.rs`'s
+//! walker-tier `cycle_detector_observes_pair_holding_self_referential_closure`.
 //!
-//! These two tests are kept anyway as general smoke coverage: a
+//! The two tests below it are kept as general smoke coverage: a
 //! self-cycle on an Rc-backed pair whose car is a VM closure
 //! capturing a `cons-in-region` value, closed via `set-cdr!`, must
 //! not panic and must compute the right answer.
 #![cfg(feature = "regions")]
 
 use cs_core::WriteMode;
+use cs_runtime::countable_memory_cycle::{cycle_detection_count, reset_cycle_detection_count};
 use cs_runtime::Runtime;
+
+/// True end-to-end regression for cs-f0k: builds a pair `p` and a VM
+/// closure `g` that captures `p` as a free variable, then
+/// `set-cdr!`s `p`'s cdr to `g`. The cycle is `p -> (cdr p) = g ->
+/// g's captured env -> binding for p -> p`, i.e. only reachable via
+/// `VmClosure::visit_closure_children`, not via `p`'s own car/cdr
+/// directly. Before the fix this mutation would never re-observe
+/// `p`'s address (the walk into `g` was a no-op), so the detector
+/// count would not advance; after the fix it does.
+#[test]
+fn cycle_detector_reaches_captured_env_through_vm_closure() {
+    let mut rt = Runtime::new();
+    reset_cycle_detection_count();
+    let before = cycle_detection_count();
+    rt.eval_str_via_vm(
+        "<t>",
+        r"
+        (define p (cons 'box #f))
+        (define (g) p)
+        (set-cdr! p g)
+    ",
+    )
+    .expect("eval ok");
+    let after = cycle_detection_count();
+    assert!(
+        after > before,
+        "expected detector to observe the cycle closed through g's captured env \
+         (count: {before} -> {after})"
+    );
+}
 
 fn disp(rt: &Runtime, v: &cs_core::Value) -> String {
     rt.format_value(v, WriteMode::Display)
