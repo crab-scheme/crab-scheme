@@ -4,6 +4,8 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::File;
+use std::io::{self, BufWriter, Seek, Write};
 use std::rc::Rc;
 
 use crate::number::Number;
@@ -764,28 +766,95 @@ impl cs_gc::cycle::CycleVisit for Hashtable {
     }
 }
 
-/// A port: foundation supports string-, bytevector-, and file-backed
-/// ports. File output ports buffer in memory and flush on `close-port`.
-/// File input is currently slurped as a string-input-port at open time
-/// (see `b_open_input_file` in cs-runtime); a streaming file-input
-/// variant lands in a later milestone.
+/// A port: foundation supports string-, bytevector-, file-, and
+/// stdout-backed ports. File output ports write through a `BufWriter`
+/// opened at `open-output-file` time; `flush-output-port` flushes the
+/// writer and `close-port` flushes and drops it — neither rewrites the
+/// whole file. File input is currently slurped as a string-input-port
+/// at open time (see `b_open_input_file` in cs-runtime); a streaming
+/// file-input variant lands in a later milestone.
 #[derive(Debug)]
 pub enum Port {
     StringInput(RefCell<StringInputState>),
     StringOutput(RefCell<String>),
     ByteVectorInput(RefCell<ByteVectorInputState>),
     ByteVectorOutput(RefCell<Vec<u8>>),
-    /// File output port. `buf` accumulates writes; `close-port` writes
-    /// the buffer to `path`. `closed` flips true on close so subsequent
+    /// File output port, incrementally written via a `BufWriter<File>`.
+    /// `writer` is `None` once the port has been closed; subsequent
     /// writes are rejected.
     FileOutput(RefCell<FileOutputState>),
+    /// The process's standard output stream. Stateless: writes go
+    /// straight to `io::stdout()`, matching the historical no-port
+    /// fallback so ordering relative to other stdout writers is
+    /// unchanged.
+    Stdout,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FileOutputState {
     pub path: String,
-    pub buf: Vec<u8>,
-    pub closed: bool,
+    writer: Option<BufWriter<File>>,
+}
+
+impl FileOutputState {
+    fn open(path: String) -> io::Result<Self> {
+        let file = File::create(&path)?;
+        Ok(FileOutputState {
+            path,
+            writer: Some(BufWriter::new(file)),
+        })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.writer.is_none()
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match &mut self.writer {
+            Some(w) => w.write_all(bytes),
+            None => Err(io::Error::new(io::ErrorKind::Other, "port is closed")),
+        }
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        match &mut self.writer {
+            Some(w) => w.flush(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn close(&mut self) -> io::Result<()> {
+        if let Some(mut w) = self.writer.take() {
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Bytes written so far (buffered + flushed), used for `port-position`.
+    pub fn position(&mut self) -> u64 {
+        self.writer
+            .as_mut()
+            .and_then(|w| w.stream_position().ok())
+            .unwrap_or(0)
+    }
+
+    /// Best-effort duplicate used by GC region-promotion, where the
+    /// enclosing `Port` is re-allocated as a fresh `Gc`. `File` isn't
+    /// `Clone`, so this flushes any buffered data and hands the new
+    /// state a `try_clone`d fd (shares the OS file offset, so writes
+    /// through either handle keep landing at the right place). On any
+    /// I/O failure the duplicate comes back closed rather than losing
+    /// data silently mid-write.
+    pub fn duplicate(&mut self) -> FileOutputState {
+        let writer = self.writer.as_mut().and_then(|w| {
+            w.flush().ok()?;
+            w.get_ref().try_clone().ok().map(BufWriter::new)
+        });
+        FileOutputState {
+            path: self.path.clone(),
+            writer,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -823,12 +892,14 @@ impl Port {
         cs_gc::Gc::new(Port::ByteVectorOutput(RefCell::new(Vec::new())))
     }
 
-    pub fn file_output(path: String) -> cs_gc::Gc<Self> {
-        cs_gc::Gc::new(Port::FileOutput(RefCell::new(FileOutputState {
-            path,
-            buf: Vec::new(),
-            closed: false,
-        })))
+    pub fn file_output(path: String) -> io::Result<cs_gc::Gc<Self>> {
+        Ok(cs_gc::Gc::new(Port::FileOutput(RefCell::new(
+            FileOutputState::open(path)?,
+        ))))
+    }
+
+    pub fn stdout() -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Port::Stdout)
     }
 
     pub fn is_input(&self) -> bool {
@@ -838,7 +909,7 @@ impl Port {
     pub fn is_output(&self) -> bool {
         matches!(
             self,
-            Port::StringOutput(_) | Port::ByteVectorOutput(_) | Port::FileOutput(_)
+            Port::StringOutput(_) | Port::ByteVectorOutput(_) | Port::FileOutput(_) | Port::Stdout
         )
     }
 
@@ -848,7 +919,7 @@ impl Port {
         // file ports would be a separate variant.
         matches!(
             self,
-            Port::StringInput(_) | Port::StringOutput(_) | Port::FileOutput(_)
+            Port::StringInput(_) | Port::StringOutput(_) | Port::FileOutput(_) | Port::Stdout
         )
     }
 
@@ -1397,6 +1468,7 @@ impl Value {
                 Port::FileOutput(s) => {
                     write!(out, "#<file-output-port {:?}>", s.borrow().path)
                 }
+                Port::Stdout => write!(out, "#<stdout-port>"),
             },
             Value::Promise(_) => write!(out, "#<promise>"),
         }
@@ -1536,6 +1608,7 @@ impl fmt::Display for Value {
                 Port::FileOutput(s) => {
                     write!(f, "#<file-output-port {:?}>", s.borrow().path)
                 }
+                Port::Stdout => write!(f, "#<stdout-port>"),
             },
             Value::Promise(_) => write!(f, "#<promise>"),
         }

@@ -2189,7 +2189,8 @@ pub unsafe extern "C" fn vm_port_position_gc(r: i64) -> i64 {
             cs_core::Port::ByteVectorInput(state) => state.borrow().pos as i64,
             cs_core::Port::StringOutput(buf) => buf.borrow().chars().count() as i64,
             cs_core::Port::ByteVectorOutput(buf) => buf.borrow().len() as i64,
-            cs_core::Port::FileOutput(state) => state.borrow().buf.len() as i64,
+            cs_core::Port::FileOutput(state) => state.borrow_mut().position() as i64,
+            cs_core::Port::Stdout => 0,
         },
         _ => {
             jit_request_deopt(DEOPT_REASON_PAIR_MISS);
@@ -2264,7 +2265,7 @@ pub unsafe extern "C" fn vm_output_port_open_p_gc(r: i64) -> i64 {
                 return 0;
             }
             match &*p {
-                cs_core::Port::FileOutput(state) => (!state.borrow().closed) as i64,
+                cs_core::Port::FileOutput(state) => (!state.borrow().is_closed()) as i64,
                 _ => 1,
             }
         }
@@ -13495,7 +13496,10 @@ fn run_dispatch(
                         if !args.is_empty() {
                             return Err(VmError::new("current-output-port: 0 args"));
                         }
-                        stack.push(current_output_port().unwrap_or(Value::Unspecified));
+                        stack.push(
+                            current_output_port()
+                                .unwrap_or_else(|| Value::Port(cs_core::Port::stdout())),
+                        );
                         if is_tail {
                             frames.pop();
                             if frames.is_empty() {
@@ -13575,34 +13579,27 @@ fn run_dispatch(
                                 )));
                             }
                         };
-                        // Eager creation surfaces I/O errors before the
-                        // thunk runs.
-                        std::fs::write(&path, "").map_err(|e| {
+                        // Opening truncates/creates and surfaces I/O
+                        // errors before the thunk runs.
+                        let port = cs_core::Port::file_output(path.clone()).map_err(|e| {
                             VmError::new(format!(
                                 "with-output-to-file: cannot create {}: {}",
                                 path, e
                             ))
                         })?;
                         let thunk = args.remove(1);
-                        let port = cs_core::Port::file_output(path.clone());
                         let port_val = Value::Port(port.clone());
                         let prev = swap_output_port(Some(port_val));
                         let res = vm_call_sync(&thunk, &[], syms);
                         swap_output_port(prev);
-                        // Always flush, even on error.
+                        // Always flush+close, even on error.
                         if let cs_core::Port::FileOutput(state) = &*port {
-                            let mut s = state.borrow_mut();
-                            if !s.closed {
-                                let buf = std::mem::take(&mut s.buf);
-                                s.closed = true;
-                                drop(s);
-                                std::fs::write(&path, &buf).map_err(|e| {
-                                    VmError::new(format!(
-                                        "with-output-to-file: write {} failed: {}",
-                                        path, e
-                                    ))
-                                })?;
-                            }
+                            state.borrow_mut().close().map_err(|e| {
+                                VmError::new(format!(
+                                    "with-output-to-file: write {} failed: {}",
+                                    path, e
+                                ))
+                            })?;
                         }
                         let v = res?;
                         stack.push(v);
@@ -15260,10 +15257,12 @@ fn write_to_current_output(s: &str, explicit_port: Option<Value>) -> Result<Valu
             }
             cs_core::Port::FileOutput(state) => {
                 let mut st = state.borrow_mut();
-                if st.closed {
-                    return Err(VmError::new("write/display: port is closed"));
-                }
-                st.buf.extend_from_slice(s.as_bytes());
+                st.write_bytes(s.as_bytes())
+                    .map_err(|_| VmError::new("write/display: port is closed"))?;
+                Ok(Value::Unspecified)
+            }
+            cs_core::Port::Stdout => {
+                print!("{}", s);
                 Ok(Value::Unspecified)
             }
             _ => Err(VmError::new("write/display: not an output port")),

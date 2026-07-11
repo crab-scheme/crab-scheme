@@ -4171,10 +4171,12 @@ fn write_output(s: &str, explicit_port: Option<Value>, ctx: &mut EvalCtx) -> Res
             }
             Port::FileOutput(state) => {
                 let mut st = state.borrow_mut();
-                if st.closed {
-                    return Err("write/display: port is closed".into());
-                }
-                st.buf.extend_from_slice(s.as_bytes());
+                st.write_bytes(s.as_bytes())
+                    .map_err(|_| "write/display: port is closed".to_string())?;
+                Ok(Value::Unspecified)
+            }
+            Port::Stdout => {
+                print!("{}", s);
                 Ok(Value::Unspecified)
             }
             _ => Err("write/display: not an output port".into()),
@@ -8241,12 +8243,14 @@ fn b_put_char(args: &[Value]) -> Result<Value, String> {
             }
             Port::FileOutput(state) => {
                 let mut st = state.borrow_mut();
-                if st.closed {
-                    return Err("put-char: port is closed".into());
-                }
                 let mut tmp = [0u8; 4];
                 let s = c.encode_utf8(&mut tmp);
-                st.buf.extend_from_slice(s.as_bytes());
+                st.write_bytes(s.as_bytes())
+                    .map_err(|_| "put-char: port is closed".to_string())?;
+                Ok(Value::Unspecified)
+            }
+            Port::Stdout => {
+                print!("{}", c);
                 Ok(Value::Unspecified)
             }
             _ => Err("put-char: not a textual output port".into()),
@@ -8298,10 +8302,12 @@ fn b_put_string(args: &[Value]) -> Result<Value, String> {
             }
             Port::FileOutput(state) => {
                 let mut st = state.borrow_mut();
-                if st.closed {
-                    return Err("put-string: port is closed".into());
-                }
-                st.buf.extend_from_slice(slice.as_bytes());
+                st.write_bytes(slice.as_bytes())
+                    .map_err(|_| "put-string: port is closed".to_string())?;
+                Ok(Value::Unspecified)
+            }
+            Port::Stdout => {
+                print!("{}", slice);
                 Ok(Value::Unspecified)
             }
             _ => Err("put-string: not a textual output port".into()),
@@ -9146,12 +9152,14 @@ fn b_write_char(args: &[Value]) -> Result<Value, String> {
             }
             Port::FileOutput(state) => {
                 let mut st = state.borrow_mut();
-                if st.closed {
-                    return Err("write-char: port is closed".into());
-                }
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
-                st.buf.extend_from_slice(s.as_bytes());
+                st.write_bytes(s.as_bytes())
+                    .map_err(|_| "write-char: port is closed".to_string())?;
+                Ok(Value::Unspecified)
+            }
+            Port::Stdout => {
+                print!("{}", c);
                 Ok(Value::Unspecified)
             }
             _ => Err("write-char: not an output port".into()),
@@ -9202,10 +9210,12 @@ fn b_write_string(args: &[Value]) -> Result<Value, String> {
             }
             Port::FileOutput(state) => {
                 let mut st = state.borrow_mut();
-                if st.closed {
-                    return Err("write-string: port is closed".into());
-                }
-                st.buf.extend_from_slice(slice.as_bytes());
+                st.write_bytes(slice.as_bytes())
+                    .map_err(|_| "write-string: port is closed".to_string())?;
+                Ok(Value::Unspecified)
+            }
+            Port::Stdout => {
+                print!("{}", slice);
                 Ok(Value::Unspecified)
             }
             _ => Err("write-string: not an output port".into()),
@@ -9520,10 +9530,10 @@ fn b_with_output_to_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("with-output-to-file", "string", v)),
     };
-    // Eager check: surface I/O errors before running the thunk.
-    std::fs::write(&path, "")
+    // Opening truncates/creates and surfaces I/O errors before the
+    // thunk runs.
+    let port = Port::file_output(path.clone())
         .map_err(|e| format!("with-output-to-file: cannot create {}: {}", path, e))?;
-    let port = Port::file_output(path.clone());
     let port_val = Value::Port(port.clone());
     let prev = ctx.current_output_port.take();
     ctx.current_output_port = Some(port_val);
@@ -9533,14 +9543,10 @@ fn b_with_output_to_file(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     // that catch the condition can rely on partial output landing on
     // disk before the propagation continues.
     if let Port::FileOutput(state) = &*port {
-        let mut s = state.borrow_mut();
-        if !s.closed {
-            let buf = std::mem::take(&mut s.buf);
-            s.closed = true;
-            drop(s);
-            std::fs::write(&path, &buf)
-                .map_err(|e| format!("with-output-to-file: write {} failed: {}", path, e))?;
-        }
+        state
+            .borrow_mut()
+            .close()
+            .map_err(|e| format!("with-output-to-file: write {} failed: {}", path, e))?;
     }
     result.map_err(|e| propagate_eval_err(e, ctx))
 }
@@ -10547,7 +10553,7 @@ fn b_current_output_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     Ok(ctx
         .current_output_port
         .clone()
-        .unwrap_or(Value::Unspecified))
+        .unwrap_or_else(|| Value::Port(Port::stdout())))
 }
 
 /// R7RS `(current-error-port)` — returns a port for error output.
@@ -10584,7 +10590,7 @@ fn b_standard_output_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, St
     Ok(ctx
         .current_output_port
         .clone()
-        .unwrap_or(Value::Unspecified))
+        .unwrap_or_else(|| Value::Port(Port::stdout())))
 }
 
 fn b_standard_error_port(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
@@ -12693,11 +12699,11 @@ fn b_open_output_file(args: &[Value]) -> Result<Value, String> {
         Value::String(s) => s.borrow().clone(),
         v => return Err(type_err("open-output-file", "string", v)),
     };
-    std::fs::write(&path, "").map_err(|e| {
+    let port = Port::file_output(path.clone()).map_err(|e| {
         cs_core::stash_builtin_err_extra_tag(TAG_FILE_ERROR);
         format!("open-output-file: cannot create {}: {}", path, e)
     })?;
-    Ok(Value::Port(Port::file_output(path)))
+    Ok(Value::Port(port))
 }
 
 // ---- R6RS §8.2.6 — port positions ----------------------------------
@@ -12716,7 +12722,8 @@ fn b_port_position(args: &[Value]) -> Result<Value, String> {
             Port::ByteVectorInput(state) => Ok(Value::fixnum(state.borrow().pos as i64)),
             Port::StringOutput(buf) => Ok(Value::fixnum(buf.borrow().chars().count() as i64)),
             Port::ByteVectorOutput(buf) => Ok(Value::fixnum(buf.borrow().len() as i64)),
-            Port::FileOutput(state) => Ok(Value::fixnum(state.borrow().buf.len() as i64)),
+            Port::FileOutput(state) => Ok(Value::fixnum(state.borrow_mut().position() as i64)),
+            Port::Stdout => Ok(Value::fixnum(0)),
         },
         v => Err(type_err("port-position", "port", v)),
     }
@@ -12753,7 +12760,10 @@ fn b_set_port_position(args: &[Value]) -> Result<Value, String> {
                 s.pos = pos;
                 Ok(Value::Unspecified)
             }
-            Port::StringOutput(_) | Port::ByteVectorOutput(_) | Port::FileOutput(_) => {
+            Port::StringOutput(_)
+            | Port::ByteVectorOutput(_)
+            | Port::FileOutput(_)
+            | Port::Stdout => {
                 Err("set-port-position!: output ports do not support repositioning".into())
             }
         },
@@ -12792,18 +12802,13 @@ fn b_close_port(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Port(p) => match &**p {
-            // File output ports flush their buffer to disk on close. The
-            // `closed` flag prevents subsequent writes.
+            // File output ports flush + drop their writer on close, which
+            // rejects any subsequent writes.
             Port::FileOutput(state) => {
                 let mut s = state.borrow_mut();
-                if !s.closed {
-                    let path = s.path.clone();
-                    let buf = std::mem::take(&mut s.buf);
-                    s.closed = true;
-                    drop(s);
-                    std::fs::write(&path, &buf)
-                        .map_err(|e| format!("close-port: write {} failed: {}", path, e))?;
-                }
+                let path = s.path.clone();
+                s.close()
+                    .map_err(|e| format!("close-port: write {} failed: {}", path, e))?;
                 Ok(Value::Unspecified)
             }
             // Other port kinds are no-op on close at this milestone — they
@@ -12863,18 +12868,21 @@ fn b_flush_output_port(args: &[Value]) -> Result<Value, String> {
     match &port {
         Value::Port(p) => match &**p {
             Port::FileOutput(state) => {
-                let s = state.borrow();
-                if !s.closed {
-                    let path = s.path.clone();
-                    let buf = s.buf.clone();
-                    drop(s);
-                    std::fs::write(&path, &buf)
-                        .map_err(|e| format!("flush-output-port: write {} failed: {}", path, e))?;
-                }
+                let mut s = state.borrow_mut();
+                let path = s.path.clone();
+                s.flush()
+                    .map_err(|e| format!("flush-output-port: write {} failed: {}", path, e))?;
                 Ok(Value::Unspecified)
             }
             // Other output ports hold no buffered OS state — no-op.
             Port::StringOutput(_) | Port::ByteVectorOutput(_) => Ok(Value::Unspecified),
+            Port::Stdout => {
+                use std::io::Write;
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| format!("flush-output-port: {}", e))?;
+                Ok(Value::Unspecified)
+            }
             _ => Err("flush-output-port: not an output port".into()),
         },
         v => Err(type_err("flush-output-port", "output-port", v)),
@@ -12913,7 +12921,7 @@ fn b_output_port_open_p(args: &[Value]) -> Result<Value, String> {
             }
             // FileOutput tracks closed; other output ports are always open.
             let open = match &**p {
-                Port::FileOutput(state) => !state.borrow().closed,
+                Port::FileOutput(state) => !state.borrow().is_closed(),
                 _ => true,
             };
             Ok(Value::Boolean(open))

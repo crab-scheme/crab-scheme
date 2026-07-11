@@ -628,11 +628,7 @@ impl Runtime {
                 // Best-effort close (only matters for file ports).
                 if let Value::Port(p) = &port {
                     if let cs_core::Port::FileOutput(state) = &**p {
-                        let mut st = state.borrow_mut();
-                        if !st.closed {
-                            let _ = std::fs::write(&st.path, &st.buf);
-                            st.closed = true;
-                        }
+                        let _ = state.borrow_mut().close();
                     }
                 }
                 res
@@ -742,7 +738,8 @@ impl Runtime {
                 if !args.is_empty() {
                     return Err("standard-output-port: 0 args".into());
                 }
-                Ok(cs_vm::vm::vm_current_output_port_value().unwrap_or(Value::Unspecified))
+                Ok(cs_vm::vm::vm_current_output_port_value()
+                    .unwrap_or_else(|| Value::Port(cs_core::Port::stdout())))
             }),
         );
         let sep_sym = syms.intern("standard-error-port");
@@ -1522,7 +1519,7 @@ impl Runtime {
                 };
                 let port = if args.len() == 1 {
                     cs_vm::vm::vm_current_output_port_value()
-                        .ok_or_else(|| "write-char: no current output port".to_string())?
+                        .unwrap_or_else(|| Value::Port(cs_core::Port::stdout()))
                 } else {
                     args[1].clone()
                 };
@@ -1536,11 +1533,13 @@ impl Runtime {
                         // display/write already do via write_to_current_output).
                         cs_core::Port::FileOutput(state) => {
                             let mut st = state.borrow_mut();
-                            if st.closed {
-                                return Err("write-char: port is closed".into());
-                            }
                             let mut b = [0u8; 4];
-                            st.buf.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+                            st.write_bytes(c.encode_utf8(&mut b).as_bytes())
+                                .map_err(|_| "write-char: port is closed".to_string())?;
+                            Ok(Value::Unspecified)
+                        }
+                        cs_core::Port::Stdout => {
+                            print!("{}", c);
                             Ok(Value::Unspecified)
                         }
                         _ => Err("write-char: not an output port".into()),
@@ -1572,7 +1571,7 @@ impl Runtime {
                 let len = chars.len();
                 let port = if args.len() == 1 {
                     cs_vm::vm::vm_current_output_port_value()
-                        .ok_or_else(|| "write-string: no current output port".to_string())?
+                        .unwrap_or_else(|| Value::Port(cs_core::Port::stdout()))
                 } else {
                     args[1].clone()
                 };
@@ -1611,10 +1610,12 @@ impl Runtime {
                         // display/write already do via write_to_current_output).
                         cs_core::Port::FileOutput(state) => {
                             let mut st = state.borrow_mut();
-                            if st.closed {
-                                return Err("write-string: port is closed".into());
-                            }
-                            st.buf.extend_from_slice(slice.as_bytes());
+                            st.write_bytes(slice.as_bytes())
+                                .map_err(|_| "write-string: port is closed".to_string())?;
+                            Ok(Value::Unspecified)
+                        }
+                        cs_core::Port::Stdout => {
+                            print!("{}", slice);
                             Ok(Value::Unspecified)
                         }
                         _ => Err("write-string: not an output port".into()),
