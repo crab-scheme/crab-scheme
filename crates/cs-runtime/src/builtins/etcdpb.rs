@@ -70,7 +70,7 @@ fn expect_bv(v: &Value, who: &str) -> Result<Vec<u8>, String> {
 
 fn expect_i64(v: &Value, who: &str) -> Result<i64, String> {
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => Ok(*n),
+        Value::Fixnum(n) => Ok(*n),
         other => Err(format!(
             "{}: expected fixnum, got {}",
             who,
@@ -430,10 +430,7 @@ mod tests {
         let out = b_decode_put(&[bv(&m)], &mut syms()).unwrap();
         assert_eq!(as_bytes(&nth(&out, 0)), b"k");
         assert_eq!(as_bytes(&nth(&out, 1)), b"vv");
-        assert!(matches!(
-            nth(&out, 2),
-            Value::Number(cs_core::Number::Fixnum(300))
-        ));
+        assert!(matches!(nth(&out, 2), Value::Fixnum(300)));
         assert!(matches!(nth(&out, 3), Value::Boolean(true)));
         assert!(matches!(nth(&out, 4), Value::Boolean(false)));
     }
@@ -463,14 +460,8 @@ mod tests {
         let out = b_decode_range(&[bv(&m)], &mut syms()).unwrap();
         assert_eq!(as_bytes(&nth(&out, 0)), b"a");
         assert_eq!(as_bytes(&nth(&out, 1)), b"b");
-        assert!(matches!(
-            nth(&out, 2),
-            Value::Number(cs_core::Number::Fixnum(10))
-        ));
-        assert!(matches!(
-            nth(&out, 3),
-            Value::Number(cs_core::Number::Fixnum(42))
-        ));
+        assert!(matches!(nth(&out, 2), Value::Fixnum(10)));
+        assert!(matches!(nth(&out, 3), Value::Fixnum(42)));
         assert!(matches!(nth(&out, 8), Value::Boolean(true)));
         assert!(matches!(nth(&out, 6), Value::Boolean(false)));
     }
@@ -547,9 +538,6 @@ mod tests {
         put_int(&mut m, 3, -1);
         assert_eq!(m.len(), 1 + 10); // tag + 10-byte varint
         let out = b_decode_put(&[bv(&m)], &mut syms()).unwrap();
-        assert!(matches!(
-            nth(&out, 2),
-            Value::Number(cs_core::Number::Fixnum(-1))
-        ));
+        assert!(matches!(nth(&out, 2), Value::Fixnum(-1)));
     }
 }

@@ -29,7 +29,7 @@ fn call2(ptr: *const u8, a: i64, b: i64) -> cs_core::Value {
 
 fn as_fixnum(v: cs_core::Value, ctx: &str) -> i64 {
     match v {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => n,
+        cs_core::Value::Fixnum(n) => n,
         other => panic!("{ctx}: expected Fixnum, got {other:?}"),
     }
 }

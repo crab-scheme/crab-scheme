@@ -72,7 +72,13 @@ fn render(args: &[Value]) -> String {
         }
         match a {
             Value::String(s) => out.push_str(&s.borrow()),
-            Value::Number(n) => out.push_str(&format!("{}", n.to_f64())),
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => {
+                let n = nv.as_number().unwrap();
+                out.push_str(&format!("{}", n.to_f64()))
+            }
             Value::Boolean(true) => out.push_str("#t"),
             Value::Boolean(false) => out.push_str("#f"),
             Value::Null => out.push_str("()"),

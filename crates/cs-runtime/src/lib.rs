@@ -1162,7 +1162,13 @@ impl Runtime {
                     return Err("null-environment: 1 arg".into());
                 }
                 let v = match &args[0] {
-                    Value::Number(n) => n.to_f64() as i64,
+                    nv @ (Value::Fixnum(_)
+                    | Value::Flonum(_)
+                    | Value::BigNumber(_)
+                    | Value::Rational(_)) => {
+                        let n = nv.as_number().unwrap();
+                        n.to_f64() as i64
+                    }
                     _ => return Err("null-environment: version must be integer".into()),
                 };
                 if v != 5 {
@@ -1179,7 +1185,13 @@ impl Runtime {
                     return Err("scheme-report-environment: 1 arg".into());
                 }
                 let v = match &args[0] {
-                    Value::Number(n) => n.to_f64() as i64,
+                    nv @ (Value::Fixnum(_)
+                    | Value::Flonum(_)
+                    | Value::BigNumber(_)
+                    | Value::Rational(_)) => {
+                        let n = nv.as_number().unwrap();
+                        n.to_f64() as i64
+                    }
                     _ => return Err("scheme-report-environment: version must be integer".into()),
                 };
                 if v != 5 && v != 7 {
@@ -1461,7 +1473,10 @@ impl Runtime {
                     return Err("read-string: 1 or 2 args".into());
                 }
                 let k = match &args[0] {
-                    Value::Number(n) => match n.to_f64() as i64 {
+                    nv @ (Value::Fixnum(_)
+                    | Value::Flonum(_)
+                    | Value::BigNumber(_)
+                    | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                         i if i >= 0 => i as usize,
                         _ => return Err("read-string: negative count".into()),
                     },
@@ -1577,7 +1592,10 @@ impl Runtime {
                 };
                 let start = if args.len() >= 3 {
                     match &args[2] {
-                        Value::Number(n) => match n.to_f64() as i64 {
+                        nv @ (Value::Fixnum(_)
+                        | Value::Flonum(_)
+                        | Value::BigNumber(_)
+                        | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                             i if i >= 0 && (i as usize) <= len => i as usize,
                             _ => return Err(format!("write-string: start out of range")),
                         },
@@ -1588,7 +1606,10 @@ impl Runtime {
                 };
                 let end = if args.len() == 4 {
                     match &args[3] {
-                        Value::Number(n) => match n.to_f64() as i64 {
+                        nv @ (Value::Fixnum(_)
+                        | Value::Flonum(_)
+                        | Value::BigNumber(_)
+                        | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                             i if i >= 0 && (i as usize) <= len && (i as usize) >= start => {
                                 i as usize
                             }
@@ -1740,7 +1761,10 @@ impl Runtime {
                     return Err("read-bytevector: 1 or 2 args".into());
                 }
                 let k = match &args[0] {
-                    Value::Number(n) => match n.to_f64() as i64 {
+                    nv @ (Value::Fixnum(_)
+                    | Value::Flonum(_)
+                    | Value::BigNumber(_)
+                    | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                         i if i >= 0 => i as usize,
                         _ => return Err("read-bytevector: negative count".into()),
                     },
@@ -1780,7 +1804,10 @@ impl Runtime {
                     return Err("write-u8: 1 or 2 args".into());
                 }
                 let byte = match &args[0] {
-                    Value::Number(n) => match n.to_f64() as i64 {
+                    nv @ (Value::Fixnum(_)
+                    | Value::Flonum(_)
+                    | Value::BigNumber(_)
+                    | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                         i if (0..=255).contains(&i) => i as u8,
                         _ => return Err("write-u8: byte out of range".into()),
                     },
@@ -1824,7 +1851,10 @@ impl Runtime {
                 let bv_len = bv.borrow().len();
                 let start = if args.len() >= 3 {
                     match &args[2] {
-                        Value::Number(n) => match n.to_f64() as i64 {
+                        nv @ (Value::Fixnum(_)
+                        | Value::Flonum(_)
+                        | Value::BigNumber(_)
+                        | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                             i if i >= 0 && (i as usize) <= bv_len => i as usize,
                             _ => return Err("read-bytevector!: start out of range".into()),
                         },
@@ -1835,7 +1865,10 @@ impl Runtime {
                 };
                 let end = if args.len() == 4 {
                     match &args[3] {
-                        Value::Number(n) => match n.to_f64() as i64 {
+                        nv @ (Value::Fixnum(_)
+                        | Value::Flonum(_)
+                        | Value::BigNumber(_)
+                        | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                             i if i >= 0 && (i as usize) <= bv_len && (i as usize) >= start => {
                                 i as usize
                             }
@@ -1890,7 +1923,10 @@ impl Runtime {
                 };
                 let start = if args.len() >= 3 {
                     match &args[2] {
-                        Value::Number(n) => match n.to_f64() as i64 {
+                        nv @ (Value::Fixnum(_)
+                        | Value::Flonum(_)
+                        | Value::BigNumber(_)
+                        | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                             i if i >= 0 && (i as usize) <= len => i as usize,
                             _ => return Err("write-bytevector: start out of range".into()),
                         },
@@ -1901,7 +1937,10 @@ impl Runtime {
                 };
                 let end = if args.len() == 4 {
                     match &args[3] {
-                        Value::Number(n) => match n.to_f64() as i64 {
+                        nv @ (Value::Fixnum(_)
+                        | Value::Flonum(_)
+                        | Value::BigNumber(_)
+                        | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                             i if i >= 0 && (i as usize) <= len && (i as usize) >= start => {
                                 i as usize
                             }
@@ -3926,7 +3965,7 @@ mod tests {
         // string-length of an NB string literal → fixnum 5.
         let s = cs_vm::vm::vm_string_const_nb("hello");
         match cs_vm::vm::vm_nb_borrow_to_value(aot_call_builtin("string-length", &[s])) {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 5),
+            Value::Fixnum(n) => assert_eq!(n, 5),
             other => panic!("string-length: {other:?}"),
         }
         // string-append "ab" "cd" → "abcd" (multi-arg).
@@ -3939,7 +3978,7 @@ mod tests {
         // The original arg carriers are still valid (borrow-decode, not
         // consume): re-use `a` in another call.
         match cs_vm::vm::vm_nb_borrow_to_value(aot_call_builtin("string-length", &[a])) {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 2),
+            Value::Fixnum(n) => assert_eq!(n, 2),
             other => panic!("string-length reuse: {other:?}"),
         }
         // Unbound name → no panic, returns Unspecified.

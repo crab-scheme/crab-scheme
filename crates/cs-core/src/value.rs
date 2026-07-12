@@ -578,7 +578,10 @@ impl WeakValue {
             | Value::Character(_)
             | Value::Symbol(_)
             | Value::Identifier { .. }
-            | Value::Number(_) => None,
+            | Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_) => None,
         }
     }
 
@@ -1296,7 +1299,18 @@ pub enum Value {
     Eof,
     Boolean(bool),
     Character(char),
-    Number(Number),
+    /// Exact integer that fits in a machine word. Hot arm of the
+    /// numeric tower, flattened directly into `Value` (cs-3wa) so
+    /// the whole enum stays 16 bytes: an inline `Number` would cost
+    /// a second discriminant word. Use [`Value::as_number`] to bridge
+    /// to the `Number` tower for arithmetic.
+    Fixnum(i64),
+    /// IEEE-754 double (inexact real). See [`Value::Fixnum`].
+    Flonum(f64),
+    /// Exact integer outside `i64` range (cold arm, boxed).
+    BigNumber(Rc<num_bigint::BigInt>),
+    /// Exact non-integer ratio (cold arm, boxed).
+    Rational(Rc<num_rational::BigRational>),
     String(crate::Gc<RefCell<CsStr>>),
     Symbol(Symbol),
     /// Hygienic identifier: a name plus a per-macro-call mark.
@@ -1415,7 +1429,10 @@ impl cs_gc::cycle::CycleVisit for Value {
             | Value::Character(_)
             | Value::Symbol(_)
             | Value::Identifier { .. }
-            | Value::Number(_) => {}
+            | Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_) => {}
         }
     }
 }
@@ -1444,7 +1461,10 @@ pub fn value_is_acyclic_leaf(v: &Value) -> bool {
             | Value::Eof
             | Value::Boolean(_)
             | Value::Character(_)
-            | Value::Number(_)
+            | Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)
             | Value::Symbol(_)
             | Value::Identifier { .. }
             | Value::String(_)
@@ -1455,11 +1475,43 @@ pub fn value_is_acyclic_leaf(v: &Value) -> bool {
 
 impl Value {
     pub fn fixnum(v: i64) -> Self {
-        Value::Number(Number::Fixnum(v))
+        Value::Fixnum(v)
     }
 
     pub fn flonum(v: f64) -> Self {
-        Value::Number(Number::Flonum(v))
+        Value::Flonum(v)
+    }
+
+    /// Bridge a numeric-tower [`Number`] into a `Value`. Cheap:
+    /// Fixnum/Flonum copy, Big/Rat move the existing `Rc`.
+    pub fn from_number(n: Number) -> Self {
+        match n {
+            Number::Fixnum(i) => Value::Fixnum(i),
+            Number::Flonum(f) => Value::Flonum(f),
+            Number::Big(b) => Value::BigNumber(b),
+            Number::Rat(r) => Value::Rational(r),
+        }
+    }
+
+    /// Bridge a numeric `Value` back into the [`Number`] tower for
+    /// arithmetic, or `None` for non-numbers. Cheap: Fixnum/Flonum
+    /// copy, Big/Rat bump the `Rc`.
+    pub fn as_number(&self) -> Option<Number> {
+        match self {
+            Value::Fixnum(i) => Some(Number::Fixnum(*i)),
+            Value::Flonum(f) => Some(Number::Flonum(*f)),
+            Value::BigNumber(b) => Some(Number::Big(b.clone())),
+            Value::Rational(r) => Some(Number::Rat(r.clone())),
+            _ => None,
+        }
+    }
+
+    /// `true` if this value is any arm of the numeric tower.
+    pub fn is_number(&self) -> bool {
+        matches!(
+            self,
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+        )
     }
 
     pub fn string(s: impl Into<String>) -> Self {
@@ -1507,7 +1559,10 @@ impl Value {
             | Value::Character(_)
             | Value::Symbol(_)
             | Value::Identifier { .. }
-            | Value::Number(_) => None,
+            | Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_) => None,
         }
     }
 
@@ -1532,7 +1587,10 @@ impl Value {
             | Value::Character(_)
             | Value::Symbol(_)
             | Value::Identifier { .. }
-            | Value::Number(_) => None,
+            | Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_) => None,
         }
     }
 
@@ -1543,7 +1601,9 @@ impl Value {
             Value::Eof => "eof",
             Value::Boolean(_) => "boolean",
             Value::Character(_) => "character",
-            Value::Number(_) => "number",
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_) => {
+                "number"
+            }
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::Identifier { .. } => "identifier",
@@ -1593,7 +1653,9 @@ impl Value {
                 },
                 WriteMode::Display => write!(out, "{}", c),
             },
-            Value::Number(n) => write!(out, "{}", n),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_) => {
+                write!(out, "{}", self.as_number().unwrap())
+            }
             Value::String(s) => match mode {
                 WriteMode::Write => write!(out, "\"{}\"", escape_string(&s.borrow())),
                 WriteMode::Display => write!(out, "{}", s.borrow()),
@@ -1742,7 +1804,9 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Character(c) => write!(f, "#\\{}", c),
-            Value::Number(n) => write!(f, "{}", n),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_) => {
+                write!(f, "{}", self.as_number().unwrap())
+            }
             Value::String(s) => write!(f, "\"{}\"", s.borrow()),
             Value::Symbol(s) => write!(f, "#<symbol#{}>", s.0),
             // Debug-style Display for Identifier surfaces the
@@ -1814,8 +1878,8 @@ mod pair_diet_tests {
         let before = 144usize;
         let after = std::mem::size_of::<Pair>();
         assert_eq!(
-            after, 72,
-            "Pair size changed: {after}B (was {before}B before cs-5te, cs-5te landed it at 72B)"
+            after, 56,
+            "Pair size changed: {after}B (was {before}B before cs-5te; cs-5te landed it at 72B, cs-3wa's 16B Value shrank it to 56B)"
         );
         assert!(
             after <= 80,
@@ -1825,7 +1889,7 @@ mod pair_diet_tests {
 
     #[test]
     fn plain_cons_has_no_span_or_tombstone() {
-        let p = Pair::new(Value::Number(Number::Fixnum(1)), Value::Null);
+        let p = Pair::new(Value::Fixnum(1), Value::Null);
         assert_eq!(p.source_span(), None);
         assert_eq!(p.flags.get(), 0);
     }
@@ -1900,6 +1964,19 @@ mod procedure_pointer_tests {
             std::mem::size_of::<std::rc::Rc<Box<dyn super::Procedure>>>(),
             8,
             "Rc<Box<dyn Procedure>> must be a thin 8B pointer"
+        );
+    }
+
+    /// cs-3wa: the numeric tower is flattened directly into `Value`
+    /// (`Fixnum(i64)`/`Flonum(f64)`/`BigNumber`/`Rational`) instead of
+    /// an inline 16B `Number`, so the whole enum is a single
+    /// discriminant word plus an 8B payload. This locks that in.
+    #[test]
+    fn value_is_two_words() {
+        assert_eq!(
+            std::mem::size_of::<super::Value>(),
+            16,
+            "Value must be 16 bytes: 8B discriminant/niche + 8B payload"
         );
     }
 }

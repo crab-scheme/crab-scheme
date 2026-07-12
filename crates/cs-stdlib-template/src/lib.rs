@@ -227,8 +227,11 @@ fn list_items(v: &Value) -> Vec<Value> {
 fn render_value(v: &Value, raw: bool, out: &mut String) {
     let s = match v {
         Value::String(s) => s.borrow().clone(),
-        Value::Number(cs_core::Number::Fixnum(i)) => i.to_string(),
-        Value::Number(n) => format!("{}", n.to_f64()),
+        Value::Fixnum(i) => i.to_string(),
+        nv @ (Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            format!("{}", n.to_f64())
+        }
         Value::Boolean(true) => "true".to_string(),
         _ => String::new(), // #f, null, lists, alists render empty
     };

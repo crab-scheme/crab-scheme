@@ -450,7 +450,8 @@ fn render_default(v: &Value) -> Option<String> {
         Value::Boolean(false) => None,
         Value::Boolean(true) => Some("#t".to_string()),
         Value::String(s) => Some(s.borrow().clone()),
-        Value::Number(n) => {
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
             let f = n.to_f64();
             if f.fract() == 0.0 && f.abs() < 1e15 {
                 Some(format!("{}", f as i64))

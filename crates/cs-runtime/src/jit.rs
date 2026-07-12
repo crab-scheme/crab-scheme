@@ -31,7 +31,7 @@ use cs_vm::jit_translate::bytecode_to_rir_full;
 use cs_vm::vm::{install_tier_up_hook, VmClosure};
 use cs_vm::RirType;
 
-use cs_core::{Number, Value};
+use cs_core::Value;
 
 use crate::Runtime;
 
@@ -132,8 +132,8 @@ fn jit_tier_up_hook(closure: &VmClosure, args: &[Value]) {
             // (heap-pointer Values) hint as Any.
             args.iter()
                 .map(|v| match v {
-                    Value::Number(Number::Fixnum(_)) => RirType::Fixnum,
-                    Value::Number(Number::Flonum(_)) => RirType::Flonum,
+                    Value::Fixnum(_) => RirType::Fixnum,
+                    Value::Flonum(_) => RirType::Flonum,
                     Value::Boolean(_) => RirType::Boolean,
                     Value::Character(_) => RirType::Character,
                     // Heap-pointer Values hint as Any so the

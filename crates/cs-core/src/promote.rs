@@ -120,7 +120,10 @@ pub fn to_rc_deep(v: &Value) -> Value {
         | Value::Character(_)
         | Value::Symbol(_)
         | Value::Identifier { .. }
-        | Value::Number(_)
+        | Value::Fixnum(_)
+        | Value::Flonum(_)
+        | Value::BigNumber(_)
+        | Value::Rational(_)
         | Value::Procedure(_) => v.clone(),
     }
 }
@@ -295,7 +298,7 @@ impl Promote for Value {
             | Value::Character(_)
             | Value::Symbol(_)
             | Value::Identifier { .. }
-            | Value::Number(_)
+            | Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
             // Procedure is Rc<dyn>; already global heap.
             | Value::Procedure(_) => {}
         }

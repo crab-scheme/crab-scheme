@@ -1320,7 +1320,13 @@ fn type_err(name: &str, expected: &str, got: &Value) -> String {
     // internal handle via Display, which is unhelpful — leave them out.
     // Cap the rendered length so giant values don't blow up the message.
     let extra = match got {
-        Value::String(_) | Value::Number(_) | Value::Boolean(_) | Value::Character(_) => {
+        Value::String(_)
+        | Value::Fixnum(_)
+        | Value::Flonum(_)
+        | Value::BigNumber(_)
+        | Value::Rational(_)
+        | Value::Boolean(_)
+        | Value::Character(_) => {
             let display = format!("{}", got);
             let cap = 60;
             let trimmed: String = if display.chars().count() > cap {
@@ -1348,7 +1354,10 @@ fn type_err(name: &str, expected: &str, got: &Value) -> String {
 
 fn as_num(name: &str, v: &Value) -> Result<Number, String> {
     match v {
-        Value::Number(n) => Ok(n.clone()),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            Ok(n.clone())
+        }
         _ => Err(type_err(name, "number", v)),
     }
 }
@@ -1359,8 +1368,8 @@ pub fn as_int_i64_pub(name: &str, v: &Value) -> Result<i64, String> {
 
 fn as_int_i64(name: &str, v: &Value) -> Result<i64, String> {
     match v {
-        Value::Number(Number::Fixnum(n)) => Ok(*n),
-        Value::Number(Number::Big(b)) => b
+        Value::Fixnum(n) => Ok(*n),
+        Value::BigNumber(b) => b
             .to_i64()
             .ok_or_else(|| format!("{}: integer out of range for i64", name)),
         _ => Err(type_err(name, "integer", v)),
@@ -1372,7 +1381,7 @@ fn b_add(args: &[Value]) -> Result<Value, String> {
     for a in args {
         acc = acc.add(&as_num("+", a)?);
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_sub(args: &[Value]) -> Result<Value, String> {
@@ -1381,13 +1390,13 @@ fn b_sub(args: &[Value]) -> Result<Value, String> {
     }
     if args.len() == 1 {
         let n = as_num("-", &args[0])?;
-        return Ok(Value::Number(n.neg()));
+        return Ok(Value::from_number(n.neg()));
     }
     let mut acc = as_num("-", &args[0])?;
     for a in &args[1..] {
         acc = acc.sub(&as_num("-", a)?);
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_mul(args: &[Value]) -> Result<Value, String> {
@@ -1395,7 +1404,7 @@ fn b_mul(args: &[Value]) -> Result<Value, String> {
     for a in args {
         acc = acc.mul(&as_num("*", a)?);
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_div(args: &[Value]) -> Result<Value, String> {
@@ -1407,7 +1416,7 @@ fn b_div(args: &[Value]) -> Result<Value, String> {
         let n = as_num("/", &args[0])?;
         return one
             .div(&n)
-            .map(Value::Number)
+            .map(Value::from_number)
             .map_err(|_| "division by zero".into());
     }
     let mut acc = as_num("/", &args[0])?;
@@ -1415,7 +1424,7 @@ fn b_div(args: &[Value]) -> Result<Value, String> {
         let n = as_num("/", a)?;
         acc = acc.div(&n).map_err(|_| "division by zero".to_string())?;
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_num_eq(args: &[Value]) -> Result<Value, String> {
@@ -1497,7 +1506,7 @@ fn b_abs(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("abs", "1", args.len()));
     }
-    Ok(Value::Number(as_num("abs", &args[0])?.abs()))
+    Ok(Value::from_number(as_num("abs", &args[0])?.abs()))
 }
 
 fn b_min(args: &[Value]) -> Result<Value, String> {
@@ -1511,7 +1520,7 @@ fn b_min(args: &[Value]) -> Result<Value, String> {
             acc = cur;
         }
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_max(args: &[Value]) -> Result<Value, String> {
@@ -1525,13 +1534,19 @@ fn b_max(args: &[Value]) -> Result<Value, String> {
             acc = cur;
         }
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn as_integer_num(name: &str, v: &Value) -> Result<Number, String> {
     match v {
-        Value::Number(n) if n.is_integer() => Ok(n.clone()),
-        Value::Number(_) => Err(format!("{}: expected integer, got non-integer", name)),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_))
+            if nv.as_number().unwrap().is_integer() =>
+        {
+            Ok(nv.as_number().unwrap())
+        }
+        Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_) => {
+            Err(format!("{}: expected integer, got non-integer", name))
+        }
         other => Err(type_err(name, "integer", other)),
     }
 }
@@ -1543,7 +1558,7 @@ fn b_quotient(args: &[Value]) -> Result<Value, String> {
     let a = as_integer_num("quotient", &args[0])?;
     let b = as_integer_num("quotient", &args[1])?;
     a.quotient(&b)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "quotient: division by zero".into())
 }
 
@@ -1554,7 +1569,7 @@ fn b_remainder(args: &[Value]) -> Result<Value, String> {
     let a = as_integer_num("remainder", &args[0])?;
     let b = as_integer_num("remainder", &args[1])?;
     a.remainder(&b)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "remainder: division by zero".into())
 }
 
@@ -1565,7 +1580,7 @@ fn b_modulo(args: &[Value]) -> Result<Value, String> {
     let a = as_integer_num("modulo", &args[0])?;
     let b = as_integer_num("modulo", &args[1])?;
     a.modulo(&b)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "modulo: division by zero".into())
 }
 
@@ -1589,7 +1604,7 @@ pub fn div_and_mod_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
     let m = xi
         .euclid_mod(&yi)
         .map_err(|_| "div-and-mod: division by zero".to_string())?;
-    Ok((Value::Number(d), Value::Number(m)))
+    Ok((Value::from_number(d), Value::from_number(m)))
 }
 
 pub fn div0_and_mod0_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
@@ -1601,7 +1616,7 @@ pub fn div0_and_mod0_num(x: &Value, y: &Value) -> Result<(Value, Value), String>
     let m = xi
         .euclid_mod0(&yi)
         .map_err(|_| "div0-and-mod0: division by zero".to_string())?;
-    Ok((Value::Number(d), Value::Number(m)))
+    Ok((Value::from_number(d), Value::from_number(m)))
 }
 
 fn b_div_op(args: &[Value]) -> Result<Value, String> {
@@ -1611,7 +1626,7 @@ fn b_div_op(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("div", &args[0])?;
     let y = as_integer_num("div", &args[1])?;
     x.euclid_div(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "div: division by zero".into())
 }
 
@@ -1622,7 +1637,7 @@ fn b_mod_op(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("mod", &args[0])?;
     let y = as_integer_num("mod", &args[1])?;
     x.euclid_mod(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "mod: division by zero".into())
 }
 
@@ -1633,7 +1648,7 @@ fn b_div0_op(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("div0", &args[0])?;
     let y = as_integer_num("div0", &args[1])?;
     x.euclid_div0(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "div0: division by zero".into())
 }
 
@@ -1644,7 +1659,7 @@ fn b_mod0_op(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("mod0", &args[0])?;
     let y = as_integer_num("mod0", &args[1])?;
     x.euclid_mod0(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "mod0: division by zero".into())
 }
 
@@ -1660,7 +1675,7 @@ fn b_div_and_mod(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let m = x
         .euclid_mod(&y)
         .map_err(|_| "div-and-mod: division by zero".to_string())?;
-    ctx.pending_values = Some(vec![Value::Number(d), Value::Number(m)]);
+    ctx.pending_values = Some(vec![Value::from_number(d), Value::from_number(m)]);
     Ok(Value::Unspecified)
 }
 
@@ -1685,7 +1700,7 @@ fn b_truncate_quotient(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("truncate-quotient", &args[0])?;
     let y = as_integer_num("truncate-quotient", &args[1])?;
     x.quotient(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "truncate-quotient: division by zero".into())
 }
 
@@ -1696,7 +1711,7 @@ fn b_truncate_remainder(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("truncate-remainder", &args[0])?;
     let y = as_integer_num("truncate-remainder", &args[1])?;
     x.remainder(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "truncate-remainder: division by zero".into())
 }
 
@@ -1707,7 +1722,7 @@ fn b_floor_quotient(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("floor-quotient", &args[0])?;
     let y = as_integer_num("floor-quotient", &args[1])?;
     x.floor_quotient(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "floor-quotient: division by zero".into())
 }
 
@@ -1718,7 +1733,7 @@ fn b_floor_remainder(args: &[Value]) -> Result<Value, String> {
     let x = as_integer_num("floor-remainder", &args[0])?;
     let y = as_integer_num("floor-remainder", &args[1])?;
     x.modulo(&y)
-        .map(Value::Number)
+        .map(Value::from_number)
         .map_err(|_| "floor-remainder: division by zero".into())
 }
 
@@ -1734,7 +1749,7 @@ fn b_truncate_div(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let r = x
         .remainder(&y)
         .map_err(|_| "truncate/: division by zero".to_string())?;
-    ctx.pending_values = Some(vec![Value::Number(q), Value::Number(r)]);
+    ctx.pending_values = Some(vec![Value::from_number(q), Value::from_number(r)]);
     Ok(Value::Unspecified)
 }
 
@@ -1750,7 +1765,7 @@ fn b_floor_div(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     let r = x
         .modulo(&y)
         .map_err(|_| "floor/: division by zero".to_string())?;
-    ctx.pending_values = Some(vec![Value::Number(q), Value::Number(r)]);
+    ctx.pending_values = Some(vec![Value::from_number(q), Value::from_number(r)]);
     Ok(Value::Unspecified)
 }
 
@@ -1764,7 +1779,7 @@ pub fn truncate_div_num(x: &Value, y: &Value) -> Result<(Value, Value), String> 
     let r = xi
         .remainder(&yi)
         .map_err(|_| "truncate/: division by zero".to_string())?;
-    Ok((Value::Number(q), Value::Number(r)))
+    Ok((Value::from_number(q), Value::from_number(r)))
 }
 
 pub fn floor_div_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
@@ -1776,7 +1791,7 @@ pub fn floor_div_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
     let r = xi
         .modulo(&yi)
         .map_err(|_| "floor/: division by zero".to_string())?;
-    Ok((Value::Number(q), Value::Number(r)))
+    Ok((Value::from_number(q), Value::from_number(r)))
 }
 
 // =====================================================================
@@ -1788,7 +1803,7 @@ pub fn floor_div_num(x: &Value, y: &Value) -> Result<(Value, Value), String> {
 
 fn as_fx(name: &str, v: &Value) -> Result<i64, String> {
     match v {
-        Value::Number(Number::Fixnum(n)) => Ok(*n),
+        Value::Fixnum(n) => Ok(*n),
         _ => Err(type_err(name, "fixnum", v)),
     }
 }
@@ -2158,7 +2173,7 @@ fn b_greatest_fixnum(args: &[Value]) -> Result<Value, String> {
 
 fn as_fl(name: &str, v: &Value) -> Result<f64, String> {
     match v {
-        Value::Number(Number::Flonum(f)) => Ok(*f),
+        Value::Flonum(f) => Ok(*f),
         _ => Err(type_err(name, "flonum", v)),
     }
 }
@@ -2168,7 +2183,7 @@ fn b_fl_add(args: &[Value]) -> Result<Value, String> {
     for a in args {
         acc += as_fl("fl+", a)?;
     }
-    Ok(Value::Number(Number::Flonum(acc)))
+    Ok(Value::Flonum(acc))
 }
 
 fn b_fl_sub(args: &[Value]) -> Result<Value, String> {
@@ -2176,13 +2191,13 @@ fn b_fl_sub(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("fl-", "at least 1", 0));
     }
     if args.len() == 1 {
-        return Ok(Value::Number(Number::Flonum(-as_fl("fl-", &args[0])?)));
+        return Ok(Value::Flonum(-as_fl("fl-", &args[0])?));
     }
     let mut acc = as_fl("fl-", &args[0])?;
     for a in &args[1..] {
         acc -= as_fl("fl-", a)?;
     }
-    Ok(Value::Number(Number::Flonum(acc)))
+    Ok(Value::Flonum(acc))
 }
 
 fn b_fl_mul(args: &[Value]) -> Result<Value, String> {
@@ -2190,7 +2205,7 @@ fn b_fl_mul(args: &[Value]) -> Result<Value, String> {
     for a in args {
         acc *= as_fl("fl*", a)?;
     }
-    Ok(Value::Number(Number::Flonum(acc)))
+    Ok(Value::Flonum(acc))
 }
 
 fn b_fl_div(args: &[Value]) -> Result<Value, String> {
@@ -2198,13 +2213,13 @@ fn b_fl_div(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("fl/", "at least 1", 0));
     }
     if args.len() == 1 {
-        return Ok(Value::Number(Number::Flonum(1.0 / as_fl("fl/", &args[0])?)));
+        return Ok(Value::Flonum(1.0 / as_fl("fl/", &args[0])?));
     }
     let mut acc = as_fl("fl/", &args[0])?;
     for a in &args[1..] {
         acc /= as_fl("fl/", a)?;
     }
-    Ok(Value::Number(Number::Flonum(acc)))
+    Ok(Value::Flonum(acc))
 }
 
 fn fl_chain_pred(
@@ -2290,7 +2305,7 @@ fn b_fl_max(args: &[Value]) -> Result<Value, String> {
         let v = as_fl("flmax", a)?;
         acc = acc.max(v);
     }
-    Ok(Value::Number(Number::Flonum(acc)))
+    Ok(Value::Flonum(acc))
 }
 
 fn b_fl_min(args: &[Value]) -> Result<Value, String> {
@@ -2302,14 +2317,14 @@ fn b_fl_min(args: &[Value]) -> Result<Value, String> {
         let v = as_fl("flmin", a)?;
         acc = acc.min(v);
     }
-    Ok(Value::Number(Number::Flonum(acc)))
+    Ok(Value::Flonum(acc))
 }
 
 fn fl_unary(name: &str, args: &[Value], op: impl Fn(f64) -> f64) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err(name, "1", args.len()));
     }
-    Ok(Value::Number(Number::Flonum(op(as_fl(name, &args[0])?))))
+    Ok(Value::Flonum(op(as_fl(name, &args[0])?)))
 }
 
 fn b_fl_abs(args: &[Value]) -> Result<Value, String> {
@@ -2355,7 +2370,7 @@ fn b_fl_log(args: &[Value]) -> Result<Value, String> {
     if args.len() == 2 {
         let x = as_fl("fllog", &args[0])?;
         let base = as_fl("fllog", &args[1])?;
-        return Ok(Value::Number(Number::Flonum(x.log(base))));
+        return Ok(Value::Flonum(x.log(base)));
     }
     Err(arity_err("fllog", "1 or 2", args.len()))
 }
@@ -2377,7 +2392,7 @@ fn b_fl_expt(args: &[Value]) -> Result<Value, String> {
     }
     let x = as_fl("flexpt", &args[0])?;
     let y = as_fl("flexpt", &args[1])?;
-    Ok(Value::Number(Number::Flonum(x.powf(y))))
+    Ok(Value::Flonum(x.powf(y)))
 }
 
 fn b_fixnum_to_flonum(args: &[Value]) -> Result<Value, String> {
@@ -2385,7 +2400,7 @@ fn b_fixnum_to_flonum(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("fixnum->flonum", "1", args.len()));
     }
     let n = as_fx("fixnum->flonum", &args[0])?;
-    Ok(Value::Number(Number::Flonum(n as f64)))
+    Ok(Value::Flonum(n as f64))
 }
 
 fn b_expt(args: &[Value]) -> Result<Value, String> {
@@ -2416,7 +2431,7 @@ fn b_expt(args: &[Value]) -> Result<Value, String> {
                         b = b.mul(&b);
                     }
                 }
-                return Ok(Value::Number(acc));
+                return Ok(Value::from_number(acc));
             }
         }
     }
@@ -2429,7 +2444,10 @@ fn b_number_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("number?", "1", args.len()));
     }
-    Ok(Value::Boolean(matches!(args[0], Value::Number(_))))
+    Ok(Value::Boolean(matches!(
+        args[0],
+        Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+    )))
 }
 
 fn b_integer_p(args: &[Value]) -> Result<Value, String> {
@@ -2437,7 +2455,10 @@ fn b_integer_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("integer?", "1", args.len()));
     }
     Ok(Value::Boolean(match &args[0] {
-        Value::Number(n) => n.is_integer(),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.is_integer()
+        }
         _ => false,
     }))
 }
@@ -2448,10 +2469,7 @@ fn b_fixnum_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("fixnum?", "1", args.len()));
     }
-    Ok(Value::Boolean(matches!(
-        &args[0],
-        Value::Number(Number::Fixnum(_))
-    )))
+    Ok(Value::Boolean(matches!(&args[0], Value::Fixnum(_))))
 }
 
 /// `(flonum? v)` — true iff v is an inexact real (Number::Flonum). R6RS.
@@ -2459,10 +2477,7 @@ fn b_flonum_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("flonum?", "1", args.len()));
     }
-    Ok(Value::Boolean(matches!(
-        &args[0],
-        Value::Number(Number::Flonum(_))
-    )))
+    Ok(Value::Boolean(matches!(&args[0], Value::Flonum(_))))
 }
 
 /// `(rational? v)` — true for any number except non-finite flonums.
@@ -2474,8 +2489,8 @@ fn b_rational_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("rational?", "1", args.len()));
     }
     Ok(Value::Boolean(match &args[0] {
-        Value::Number(Number::Flonum(f)) => f.is_finite(),
-        Value::Number(_) => true, // Fixnum / Big / Rational are all rational
+        Value::Flonum(f) => f.is_finite(),
+        Value::Fixnum(_) | Value::BigNumber(_) | Value::Rational(_) => true, // Fixnum / Big / Rational are all rational
         _ => false,
     }))
 }
@@ -2488,7 +2503,10 @@ fn b_real_valued_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("real-valued?", "1", args.len()));
     }
-    Ok(Value::Boolean(matches!(&args[0], Value::Number(_))))
+    Ok(Value::Boolean(matches!(
+        &args[0],
+        Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+    )))
 }
 
 /// `(rational-valued? v)` — real-valued? AND finite (mathematically a ratio).
@@ -2497,8 +2515,8 @@ fn b_rational_valued_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("rational-valued?", "1", args.len()));
     }
     Ok(Value::Boolean(match &args[0] {
-        Value::Number(Number::Flonum(f)) => f.is_finite(),
-        Value::Number(_) => true,
+        Value::Flonum(f) => f.is_finite(),
+        Value::Fixnum(_) | Value::BigNumber(_) | Value::Rational(_) => true,
         _ => false,
     }))
 }
@@ -2510,8 +2528,11 @@ fn b_integer_valued_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("integer-valued?", "1", args.len()));
     }
     Ok(Value::Boolean(match &args[0] {
-        Value::Number(Number::Flonum(f)) => f.is_finite() && f.fract() == 0.0,
-        Value::Number(n) => n.is_integer(),
+        Value::Flonum(f) => f.is_finite() && f.fract() == 0.0,
+        nv @ (Value::Fixnum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.is_integer()
+        }
         _ => false,
     }))
 }
@@ -2523,10 +2544,13 @@ fn b_real_to_flonum(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("real->flonum", "1", args.len()));
     }
     let n = match &args[0] {
-        Value::Number(n) => n.to_f64(),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64()
+        }
         v => return Err(type_err("real->flonum", "real number", v)),
     };
-    Ok(Value::Number(Number::Flonum(n)))
+    Ok(Value::Flonum(n))
 }
 
 /// R6RS `(rationalize x eps)` — return the simplest rational `r`
@@ -2542,12 +2566,12 @@ fn b_rationalize(args: &[Value]) -> Result<Value, String> {
     // Exact integer or exact rational input: already in simplest form
     // for any non-negative eps.
     if matches!(x, Number::Fixnum(_) | Number::Rat(_) | Number::Big(_)) {
-        return Ok(Value::Number(x));
+        return Ok(Value::from_number(x));
     }
     let xf = x.to_f64();
     let ef = eps.to_f64();
     if !xf.is_finite() {
-        return Ok(Value::Number(x));
+        return Ok(Value::from_number(x));
     }
     if ef < 0.0 {
         return Err("rationalize: negative epsilon".into());
@@ -2568,7 +2592,7 @@ fn b_rationalize(args: &[Value]) -> Result<Value, String> {
     let v = if den_i == 1 {
         Value::fixnum(signed_num)
     } else {
-        Value::Number(Number::Flonum(signed_num as f64 / den_i as f64))
+        Value::Flonum(signed_num as f64 / den_i as f64)
     };
     Ok(v)
 }
@@ -2650,18 +2674,9 @@ fn b_syntax_source(args: &[Value]) -> Result<Value, String> {
         None => Ok(Value::Boolean(false)),
         Some(s) => {
             // (file-id start end)
-            let end = Value::Pair(Pair::new(
-                Value::Number(Number::Fixnum(s.end as i64)),
-                Value::Null,
-            ));
-            let mid = Value::Pair(Pair::new(
-                Value::Number(Number::Fixnum(s.start as i64)),
-                end,
-            ));
-            Ok(Value::Pair(Pair::new(
-                Value::Number(Number::Fixnum(s.file.0 as i64)),
-                mid,
-            )))
+            let end = Value::Pair(Pair::new(Value::Fixnum(s.end as i64), Value::Null));
+            let mid = Value::Pair(Pair::new(Value::Fixnum(s.start as i64), end));
+            Ok(Value::Pair(Pair::new(Value::Fixnum(s.file.0 as i64), mid)))
         }
     }
 }
@@ -2683,7 +2698,7 @@ fn b_syntax_line(args: &[Value]) -> Result<Value, String> {
     };
     match span {
         None => Ok(Value::Boolean(false)),
-        Some(s) => Ok(Value::Number(Number::Fixnum(s.start as i64))),
+        Some(s) => Ok(Value::Fixnum(s.start as i64)),
     }
 }
 
@@ -2699,7 +2714,7 @@ fn b_syntax_column(args: &[Value]) -> Result<Value, String> {
     };
     match span {
         None => Ok(Value::Boolean(false)),
-        Some(s) => Ok(Value::Number(Number::Fixnum(s.end as i64))),
+        Some(s) => Ok(Value::Fixnum(s.end as i64)),
     }
 }
 
@@ -2896,7 +2911,7 @@ fn b_make_identifier(args: &[Value]) -> Result<Value, String> {
         v => return Err(type_err("make-identifier", "symbol or identifier", v)),
     };
     let mark = match &args[1] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        Value::Fixnum(n) if *n >= 0 => *n as u64,
         v => {
             return Err(type_err("make-identifier", "non-negative fixnum mark", v));
         }
@@ -2920,7 +2935,7 @@ fn b_fresh_mark(args: &[Value]) -> Result<Value, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static MARK_COUNTER: AtomicU64 = AtomicU64::new(1);
     let mark = MARK_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(Value::Number(Number::Fixnum(mark as i64)))
+    Ok(Value::Fixnum(mark as i64))
 }
 
 /// `(make-variable-transformer proc)` — R6RS §12.3. Wraps a
@@ -3818,7 +3833,7 @@ fn b_exact(args: &[Value]) -> Result<Value, String> {
     }
     let n = as_num("exact", &args[0])?;
     n.to_exact()
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "exact: non-finite flonum has no exact representation".into())
 }
 
@@ -3828,7 +3843,7 @@ fn b_numerator(args: &[Value]) -> Result<Value, String> {
     }
     let n = as_num("numerator", &args[0])?;
     n.numerator()
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "numerator: non-finite flonum has no numerator".into())
 }
 
@@ -3838,7 +3853,7 @@ fn b_denominator(args: &[Value]) -> Result<Value, String> {
     }
     let n = as_num("denominator", &args[0])?;
     n.denominator()
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "denominator: non-finite flonum has no denominator".into())
 }
 
@@ -3848,7 +3863,7 @@ fn b_nan_p(args: &[Value]) -> Result<Value, String> {
     }
     Ok(Value::Boolean(matches!(
         &args[0],
-        Value::Number(Number::Flonum(f)) if f.is_nan()
+        Value::Flonum(f) if f.is_nan()
     )))
 }
 
@@ -3857,8 +3872,8 @@ fn b_finite_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("finite?", "1", args.len()));
     }
     let r = match &args[0] {
-        Value::Number(Number::Flonum(f)) => f.is_finite(),
-        Value::Number(_) => true,
+        Value::Flonum(f) => f.is_finite(),
+        Value::Fixnum(_) | Value::BigNumber(_) | Value::Rational(_) => true,
         v => return Err(type_err("finite?", "number", v)),
     };
     Ok(Value::Boolean(r))
@@ -3869,8 +3884,8 @@ fn b_infinite_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("infinite?", "1", args.len()));
     }
     let r = match &args[0] {
-        Value::Number(Number::Flonum(f)) => f.is_infinite(),
-        Value::Number(_) => false,
+        Value::Flonum(f) => f.is_infinite(),
+        Value::Fixnum(_) | Value::BigNumber(_) | Value::Rational(_) => false,
         v => return Err(type_err("infinite?", "number", v)),
     };
     Ok(Value::Boolean(r))
@@ -3880,10 +3895,8 @@ fn b_exact_integer_p(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(arity_err("exact-integer?", "1", args.len()));
     }
-    let r = matches!(
-        &args[0],
-        Value::Number(Number::Fixnum(_)) | Value::Number(Number::Big(_))
-    ) || matches!(&args[0], Value::Number(Number::Rat(r)) if r.is_integer());
+    let r = matches!(&args[0], Value::Fixnum(_) | Value::BigNumber(_))
+        || matches!(&args[0], Value::Rational(r) if r.is_integer());
     Ok(Value::Boolean(r))
 }
 
@@ -3893,9 +3906,9 @@ fn b_exact_nonneg_int_p(args: &[Value]) -> Result<Value, String> {
     }
     use num_traits::Signed;
     let r = match &args[0] {
-        Value::Number(Number::Fixnum(v)) => *v >= 0,
-        Value::Number(Number::Big(b)) => !b.is_negative(),
-        Value::Number(Number::Rat(r)) => r.is_integer() && !r.numer().is_negative(),
+        Value::Fixnum(v) => *v >= 0,
+        Value::BigNumber(b) => !b.is_negative(),
+        Value::Rational(r) => r.is_integer() && !r.numer().is_negative(),
         _ => false,
     };
     Ok(Value::Boolean(r))
@@ -3907,9 +3920,7 @@ fn b_exact_rational_p(args: &[Value]) -> Result<Value, String> {
     }
     let r = matches!(
         &args[0],
-        Value::Number(Number::Fixnum(_))
-            | Value::Number(Number::Big(_))
-            | Value::Number(Number::Rat(_))
+        Value::Fixnum(_) | Value::BigNumber(_) | Value::Rational(_)
     );
     Ok(Value::Boolean(r))
 }
@@ -3927,7 +3938,10 @@ fn b_exact_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("exact?", "1", args.len()));
     }
     match &args[0] {
-        Value::Number(n) => Ok(Value::Boolean(n.is_exact())),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            Ok(Value::Boolean(n.is_exact()))
+        }
         v => Err(type_err("exact?", "number", v)),
     }
 }
@@ -3937,7 +3951,10 @@ fn b_inexact_p(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("inexact?", "1", args.len()));
     }
     match &args[0] {
-        Value::Number(n) => Ok(Value::Boolean(!n.is_exact())),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            Ok(Value::Boolean(!n.is_exact()))
+        }
         v => Err(type_err("inexact?", "number", v)),
     }
 }
@@ -4393,9 +4410,9 @@ fn b_string_to_number(args: &[Value]) -> Result<Value, String> {
     };
     // R7RS special-numeric tokens — return immediately.
     match raw.as_str() {
-        "+inf.0" => return Ok(Value::Number(Number::Flonum(f64::INFINITY))),
-        "-inf.0" => return Ok(Value::Number(Number::Flonum(f64::NEG_INFINITY))),
-        "+nan.0" | "-nan.0" => return Ok(Value::Number(Number::Flonum(f64::NAN))),
+        "+inf.0" => return Ok(Value::Flonum(f64::INFINITY)),
+        "-inf.0" => return Ok(Value::Flonum(f64::NEG_INFINITY)),
+        "+nan.0" | "-nan.0" => return Ok(Value::Flonum(f64::NAN)),
         _ => {}
     }
     // Strip prefixes — at most one radix prefix and one exactness prefix,
@@ -4486,7 +4503,7 @@ fn b_string_to_number(args: &[Value]) -> Result<Value, String> {
         },
         None => parsed,
     };
-    Ok(Value::Number(final_n))
+    Ok(Value::from_number(final_n))
 }
 
 // ---- vectors ----
@@ -6563,7 +6580,7 @@ fn b_square(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("square", "1", args.len()));
     }
     let n = as_num("square", &args[0])?;
-    Ok(Value::Number(n.mul(&n)))
+    Ok(Value::from_number(n.mul(&n)))
 }
 
 // ---- character extensions ----
@@ -6804,7 +6821,10 @@ fn equal_hash_rec(v: &Value, acc: &mut u64) {
     match v {
         Value::Null => mix(acc, 0x01),
         Value::Boolean(b) => mix(acc, 0x10 | (*b as u64)),
-        Value::Number(n) => mix(acc, fnv1a_hash(format!("{}", n).as_bytes()) as u64),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            mix(acc, fnv1a_hash(format!("{}", n).as_bytes()) as u64)
+        }
         Value::Character(c) => mix(acc, 0x20 | (*c as u64)),
         Value::String(s) => {
             mix(acc, 0x30);
@@ -6895,7 +6915,7 @@ fn ht_hash_ctx(h: &Hashtable, key: &Value, ctx: &mut EvalCtx) -> Result<u64, Str
     };
     let r = apply_procedure(&hash_proc, &[key.clone()], ctx).map_err(|d| format!("{:?}", d))?;
     Ok(match r {
-        Value::Number(Number::Fixnum(n)) => n as u64,
+        Value::Fixnum(n) => n as u64,
         _ => 0,
     })
 }
@@ -9215,9 +9235,17 @@ fn b_write_string(args: &[Value]) -> Result<Value, String> {
     let len = chars.len();
     let start = if args.len() >= 3 {
         match &args[2] {
-            Value::Number(n) => match n.to_f64() as i64 {
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                 i if i >= 0 && (i as usize) <= len => i as usize,
-                _ => return Err(format!("write-string: start out of range: {}", n.to_f64())),
+                _ => {
+                    return Err(format!(
+                        "write-string: start out of range: {}",
+                        nv.as_number().unwrap().to_f64()
+                    ))
+                }
             },
             v => return Err(type_err("write-string", "exact integer start", v)),
         }
@@ -9226,9 +9254,17 @@ fn b_write_string(args: &[Value]) -> Result<Value, String> {
     };
     let end = if args.len() == 4 {
         match &args[3] {
-            Value::Number(n) => match n.to_f64() as i64 {
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                 i if i >= 0 && (i as usize) <= len && (i as usize) >= start => i as usize,
-                _ => return Err(format!("write-string: end out of range: {}", n.to_f64())),
+                _ => {
+                    return Err(format!(
+                        "write-string: end out of range: {}",
+                        nv.as_number().unwrap().to_f64()
+                    ))
+                }
             },
             v => return Err(type_err("write-string", "exact integer end", v)),
         }
@@ -9263,10 +9299,17 @@ fn b_write_u8(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("write-u8", "2", args.len()));
     }
     let byte = match &args[0] {
-        Value::Number(n) => match n.to_f64() as i64 {
-            i if (0..=255).contains(&i) => i as u8,
-            _ => return Err(format!("write-u8: byte out of range: {}", n.to_f64())),
-        },
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            match nv.as_number().unwrap().to_f64() as i64 {
+                i if (0..=255).contains(&i) => i as u8,
+                _ => {
+                    return Err(format!(
+                        "write-u8: byte out of range: {}",
+                        nv.as_number().unwrap().to_f64()
+                    ))
+                }
+            }
+        }
         v => return Err(type_err("write-u8", "byte (0..255)", v)),
     };
     match &args[1] {
@@ -9293,12 +9336,15 @@ fn b_write_bytevector(args: &[Value]) -> Result<Value, String> {
     let len = bytes.len();
     let start = if args.len() >= 3 {
         match &args[2] {
-            Value::Number(n) => match n.to_f64() as i64 {
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                 i if i >= 0 && (i as usize) <= len => i as usize,
                 _ => {
                     return Err(format!(
                         "write-bytevector: start out of range: {}",
-                        n.to_f64()
+                        nv.as_number().unwrap().to_f64()
                     ))
                 }
             },
@@ -9309,12 +9355,15 @@ fn b_write_bytevector(args: &[Value]) -> Result<Value, String> {
     };
     let end = if args.len() == 4 {
         match &args[3] {
-            Value::Number(n) => match n.to_f64() as i64 {
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => match nv.as_number().unwrap().to_f64() as i64 {
                 i if i >= 0 && (i as usize) <= len && (i as usize) >= start => i as usize,
                 _ => {
                     return Err(format!(
                         "write-bytevector: end out of range: {}",
-                        n.to_f64()
+                        nv.as_number().unwrap().to_f64()
                     ))
                 }
             },
@@ -10050,7 +10099,7 @@ macro_rules! bv_int_ops {
                 Endian::Big => <$u_ty>::from_be_bytes(buf),
                 Endian::Little => <$u_ty>::from_le_bytes(buf),
             };
-            Ok(Value::Number(Number::from_i64(v as i64)))
+            Ok(Value::Fixnum(v as i64))
         }
 
         fn $fn_uset(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -10083,7 +10132,7 @@ macro_rules! bv_int_ops {
                 Endian::Big => <$s_ty>::from_be_bytes(buf),
                 Endian::Little => <$s_ty>::from_le_bytes(buf),
             };
-            Ok(Value::Number(Number::from_i64(v as i64)))
+            Ok(Value::Fixnum(v as i64))
         }
 
         fn $fn_sset(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -10116,7 +10165,7 @@ macro_rules! bv_int_ops {
                 Endian::Big => <$u_ty>::from_be_bytes(buf),
                 Endian::Little => <$u_ty>::from_le_bytes(buf),
             };
-            Ok(Value::Number(Number::from_i64(v as i64)))
+            Ok(Value::Fixnum(v as i64))
         }
 
         fn $fn_nuset(args: &[Value]) -> Result<Value, String> {
@@ -10147,7 +10196,7 @@ macro_rules! bv_int_ops {
                 Endian::Big => <$s_ty>::from_be_bytes(buf),
                 Endian::Little => <$s_ty>::from_le_bytes(buf),
             };
-            Ok(Value::Number(Number::from_i64(v as i64)))
+            Ok(Value::Fixnum(v as i64))
         }
 
         fn $fn_nsset(args: &[Value]) -> Result<Value, String> {
@@ -10255,7 +10304,7 @@ fn b_bytevector_s64_ref(args: &[Value], syms: &mut SymbolTable) -> Result<Value,
         Endian::Big => i64::from_be_bytes(buf),
         Endian::Little => i64::from_le_bytes(buf),
     };
-    Ok(Value::Number(Number::from_i64(v)))
+    Ok(Value::from_number(Number::from_i64(v)))
 }
 
 fn b_bytevector_s64_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -10304,7 +10353,7 @@ fn b_bytevector_s64_native_ref(args: &[Value]) -> Result<Value, String> {
         Endian::Big => i64::from_be_bytes(buf),
         Endian::Little => i64::from_le_bytes(buf),
     };
-    Ok(Value::Number(Number::from_i64(v)))
+    Ok(Value::from_number(Number::from_i64(v)))
 }
 
 fn b_bytevector_s64_native_set(args: &[Value]) -> Result<Value, String> {
@@ -10321,25 +10370,25 @@ fn b_bytevector_s64_native_set(args: &[Value]) -> Result<Value, String> {
 
 fn u64_to_value(v: u64) -> Value {
     if v <= i64::MAX as u64 {
-        Value::Number(Number::from_i64(v as i64))
+        Value::from_number(Number::from_i64(v as i64))
     } else {
         // Need a BigInt for values > i64::MAX. Use parse_decimal_integer.
         let s = v.to_string();
-        Value::Number(Number::parse_decimal_integer(&s).expect("u64 to bigint"))
+        Value::from_number(Number::parse_decimal_integer(&s).expect("u64 to bigint"))
     }
 }
 
 fn value_to_u64(name: &str, v: &Value) -> Result<u64, String> {
     use num_traits::ToPrimitive;
     match v {
-        Value::Number(Number::Fixnum(n)) => {
+        Value::Fixnum(n) => {
             if *n < 0 {
                 Err(format!("{}: value negative for u64", name))
             } else {
                 Ok(*n as u64)
             }
         }
-        Value::Number(Number::Big(b)) => b
+        Value::BigNumber(b) => b
             .to_u64()
             .ok_or_else(|| format!("{}: value out of u64 range", name)),
         _ => Err(type_err(name, "non-negative integer", v)),
@@ -10357,7 +10406,7 @@ fn b_bytevector_ieee_single_ref(args: &[Value], syms: &mut SymbolTable) -> Resul
         Endian::Big => f32::from_be_bytes(buf),
         Endian::Little => f32::from_le_bytes(buf),
     };
-    Ok(Value::Number(Number::Flonum(v as f64)))
+    Ok(Value::Flonum(v as f64))
 }
 
 fn b_bytevector_ieee_single_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -10383,7 +10432,7 @@ fn b_bytevector_ieee_double_ref(args: &[Value], syms: &mut SymbolTable) -> Resul
         Endian::Big => f64::from_be_bytes(buf),
         Endian::Little => f64::from_le_bytes(buf),
     };
-    Ok(Value::Number(Number::Flonum(v)))
+    Ok(Value::Flonum(v))
 }
 
 fn b_bytevector_ieee_double_set(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -10412,7 +10461,7 @@ fn b_bytevector_ieee_single_native_ref(args: &[Value]) -> Result<Value, String> 
         Endian::Big => f32::from_be_bytes(buf),
         Endian::Little => f32::from_le_bytes(buf),
     };
-    Ok(Value::Number(Number::Flonum(v as f64)))
+    Ok(Value::Flonum(v as f64))
 }
 
 fn b_bytevector_ieee_single_native_set(args: &[Value]) -> Result<Value, String> {
@@ -10444,7 +10493,7 @@ fn b_bytevector_ieee_double_native_ref(args: &[Value]) -> Result<Value, String> 
         Endian::Big => f64::from_be_bytes(buf),
         Endian::Little => f64::from_le_bytes(buf),
     };
-    Ok(Value::Number(Number::Flonum(v)))
+    Ok(Value::Flonum(v))
 }
 
 fn b_bytevector_ieee_double_native_set(args: &[Value]) -> Result<Value, String> {
@@ -10671,7 +10720,7 @@ fn b_bitwise_and(args: &[Value]) -> Result<Value, String> {
             .bit_and(&n)
             .ok_or_else(|| "bitwise-and: non-integer argument".to_string())?;
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_bitwise_or(args: &[Value]) -> Result<Value, String> {
@@ -10683,7 +10732,7 @@ fn b_bitwise_or(args: &[Value]) -> Result<Value, String> {
             .bit_or(&n)
             .ok_or_else(|| "bitwise-or: non-integer argument".to_string())?;
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_bitwise_xor(args: &[Value]) -> Result<Value, String> {
@@ -10695,7 +10744,7 @@ fn b_bitwise_xor(args: &[Value]) -> Result<Value, String> {
             .bit_xor(&n)
             .ok_or_else(|| "bitwise-xor: non-integer argument".to_string())?;
     }
-    Ok(Value::Number(acc))
+    Ok(Value::from_number(acc))
 }
 
 fn b_bitwise_not(args: &[Value]) -> Result<Value, String> {
@@ -10704,7 +10753,7 @@ fn b_bitwise_not(args: &[Value]) -> Result<Value, String> {
     }
     let n = as_integer_num("bitwise-not", &args[0])?;
     n.bit_not()
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-not: non-integer argument".to_string())
 }
 
@@ -10715,7 +10764,7 @@ fn b_bitwise_arith_shift(args: &[Value]) -> Result<Value, String> {
     let n = as_integer_num("bitwise-arithmetic-shift", &args[0])?;
     let count = as_integer_num("bitwise-arithmetic-shift", &args[1])?;
     n.arith_shift(&count)
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-arithmetic-shift: non-integer or out-of-range argument".to_string())
 }
 
@@ -10730,7 +10779,7 @@ fn b_bitwise_arith_shift_left(args: &[Value]) -> Result<Value, String> {
         return Err("bitwise-arithmetic-shift-left: negative count".into());
     }
     n.arith_shift(&count)
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-arithmetic-shift-left: out-of-range argument".to_string())
 }
 
@@ -10746,7 +10795,7 @@ fn b_bitwise_arith_shift_right(args: &[Value]) -> Result<Value, String> {
     }
     let neg_count = count.neg();
     n.arith_shift(&neg_count)
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-arithmetic-shift-right: out-of-range argument".to_string())
 }
 
@@ -10756,7 +10805,7 @@ fn b_bitwise_bit_count(args: &[Value]) -> Result<Value, String> {
     }
     let n = as_integer_num("bitwise-bit-count", &args[0])?;
     n.bit_count()
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-bit-count: non-integer argument".to_string())
 }
 
@@ -10766,7 +10815,7 @@ fn b_bitwise_length(args: &[Value]) -> Result<Value, String> {
     }
     let n = as_integer_num("bitwise-length", &args[0])?;
     n.bit_length()
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-length: non-integer argument".to_string())
 }
 
@@ -10800,7 +10849,7 @@ fn b_bitwise_if(args: &[Value]) -> Result<Value, String> {
         .bit_and(&else_)
         .ok_or_else(|| "bitwise-if: non-integer argument".to_string())?;
     a.bit_or(&b)
-        .map(Value::Number)
+        .map(Value::from_number)
         .ok_or_else(|| "bitwise-if: non-integer argument".to_string())
 }
 
@@ -10815,7 +10864,7 @@ fn b_exact_integer_sqrt(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Stri
     let (s, r) = n
         .exact_integer_sqrt()
         .ok_or_else(|| "exact-integer-sqrt: negative or non-integer argument".to_string())?;
-    ctx.pending_values = Some(vec![Value::Number(s), Value::Number(r)]);
+    ctx.pending_values = Some(vec![Value::from_number(s), Value::from_number(r)]);
     Ok(Value::Unspecified)
 }
 
@@ -10825,7 +10874,7 @@ pub fn exact_integer_sqrt_num(x: &Value) -> Result<(Value, Value), String> {
     let (s, r) = n
         .exact_integer_sqrt()
         .ok_or_else(|| "exact-integer-sqrt: negative or non-integer argument".to_string())?;
-    Ok((Value::Number(s), Value::Number(r)))
+    Ok((Value::from_number(s), Value::from_number(r)))
 }
 
 // ---- environments ----
@@ -11200,8 +11249,8 @@ fn b_syntax_datum(args: &[Value]) -> Result<Value, String> {
     Ok(new_vector(vec![
         Value::string(SYNTAX_DATUM_TAG),
         args[0].clone(),
-        Value::Number(cs_core::Number::from_i64(start as i64)),
-        Value::Number(cs_core::Number::from_i64(end as i64)),
+        Value::Fixnum(start as i64),
+        Value::Fixnum(end as i64),
     ]))
 }
 
@@ -11251,7 +11300,7 @@ fn decode_non_negative_offset(who: &str, label: &str, v: &Value) -> Result<u32, 
 }
 
 fn value_to_u32_offset(v: &Value) -> Option<u32> {
-    let Value::Number(cs_core::Number::Fixnum(i)) = v else {
+    let Value::Fixnum(i) = v else {
         return None;
     };
     if *i < 0 {
@@ -13575,7 +13624,7 @@ fn b_current_jiffy(args: &[Value]) -> Result<Value, String> {
         Ok(Value::fixnum(elapsed as i64))
     } else {
         // Overflow path — once we've been running >292 years.
-        Ok(Value::Number(
+        Ok(Value::from_number(
             Number::parse_decimal_integer(&elapsed.to_string())
                 .ok_or_else(|| "current-jiffy: bigint format failure".to_string())?,
         ))
@@ -13849,7 +13898,10 @@ pub fn allocator_tier(v: &Value) -> &'static str {
         | Value::Character(_)
         | Value::Symbol(_)
         | Value::Identifier { .. }
-        | Value::Number(_) => "leaf",
+        | Value::Fixnum(_)
+        | Value::Flonum(_)
+        | Value::BigNumber(_)
+        | Value::Rational(_) => "leaf",
     }
 }
 
@@ -13863,7 +13915,7 @@ fn fixnum_or_bigint(n: u64) -> Value {
         Value::fixnum(n as i64)
     } else {
         match Number::parse_decimal_integer(&n.to_string()) {
-            Some(num) => Value::Number(num),
+            Some(num) => Value::from_number(num),
             None => Value::fixnum(i64::MAX), // unreachable in practice
         }
     }
@@ -13965,7 +14017,7 @@ fn b_gc_set_threshold(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("gc-set-threshold!", "1", args.len()));
     }
     let n = match &args[0] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
+        Value::Fixnum(n) if *n >= 0 => *n as usize,
         v => return Err(type_err("gc-set-threshold!", "non-negative fixnum", v)),
     };
     #[cfg(feature = "tracing-cycle-collector")]
@@ -14420,7 +14472,7 @@ fn enum_set_parts(v: &Value) -> Result<(Vec<Value>, i64), String> {
     if let Value::Vector(vec) = v {
         let b = vec.borrow();
         if b.len() == 3 {
-            if let (Value::String(_), Value::Vector(uv), Value::Number(Number::Fixnum(bits))) =
+            if let (Value::String(_), Value::Vector(uv), Value::Fixnum(bits)) =
                 (&b[0], &b[1], &b[2])
             {
                 let uv = uv.borrow().clone();
@@ -14794,7 +14846,11 @@ fn rtd_tag(rtd: &Value) -> Option<cs_core::Symbol> {
 }
 
 fn rtd_total_fields(rtd: &Value) -> usize {
-    if let Some(Value::Number(n)) = vec_at(rtd, 8) {
+    if let Some(
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+    ) = vec_at(rtd, 8)
+    {
+        let n = nv.as_number().unwrap();
         return n.to_f64().max(0.0) as usize;
     }
     0

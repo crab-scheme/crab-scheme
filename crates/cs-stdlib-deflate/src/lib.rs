@@ -67,7 +67,7 @@ fn expect_bv(name: &str, args: &[Value], idx: usize) -> Result<Vec<u8>, FfiError
 fn opt_level(args: &[Value], idx: usize, default: u32, max: u32) -> Result<u32, FfiError> {
     match args.get(idx) {
         None => Ok(default),
-        Some(Value::Number(cs_core::Number::Fixnum(v))) => {
+        Some(Value::Fixnum(v)) => {
             if *v < 0 || (*v as u32) > max {
                 Err(FfiError::HostFailure(format!(
                     "compress level must be 0..={}; got {}",
@@ -93,8 +93,8 @@ const DEFAULT_MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 fn opt_max_bytes(args: &[Value], idx: usize) -> Result<u64, FfiError> {
     match args.get(idx) {
         None => Ok(DEFAULT_MAX_DECOMPRESSED),
-        Some(Value::Number(cs_core::Number::Fixnum(v))) if *v >= 0 => Ok(*v as u64),
-        Some(Value::Number(cs_core::Number::Fixnum(v))) => Err(FfiError::HostFailure(format!(
+        Some(Value::Fixnum(v)) if *v >= 0 => Ok(*v as u64),
+        Some(Value::Fixnum(v)) => Err(FfiError::HostFailure(format!(
             "max-output-bytes must be non-negative; got {}",
             v
         ))),

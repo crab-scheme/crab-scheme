@@ -405,7 +405,7 @@ pub extern "C" fn vm_env_set_fixnum(sym: i64, value: i64) {
     // SAFETY: as in vm_env_lookup_fixnum.
     let env = unsafe { &*env_ptr };
     let sym = Symbol(sym as u32);
-    let v = Value::Number(cs_core::Number::Fixnum(value));
+    let v = Value::Fixnum(value);
     if !env.set_existing(sym, v.clone()) {
         // No existing binding — define at root. Walk parent
         // chain holding Rc clones so each step keeps the parent
@@ -509,7 +509,7 @@ pub extern "C" fn vm_env_lookup_fixnum(sym: i64) -> i64 {
     let env = unsafe { &*env_ptr };
     let sym = Symbol(sym as u32);
     match env.get(sym) {
-        Some(Value::Number(cs_core::Number::Fixnum(n))) => n,
+        Some(Value::Fixnum(n)) => n,
         // ADR 0012 D-1 (iter JK) — deopt-instead-of-panic. The JIT
         // translator emits this Fixnum-only lookup for *every* free
         // variable (it can't know a free var's runtime type
@@ -618,10 +618,10 @@ pub unsafe extern "C" fn vm_env_lookup_any(sym: i64) -> i64 {
 /// the matching shape. Decoding mismatched tags / pointers is UB.
 unsafe fn i64_to_value(i: i64, tag: u8) -> Value {
     match tag {
-        JIT_RT_FIXNUM => Value::Number(cs_core::Number::Fixnum(i)),
+        JIT_RT_FIXNUM => Value::Fixnum(i),
         JIT_RT_BOOLEAN => Value::Boolean(i != 0),
         JIT_RT_CHARACTER => Value::Character(char::from_u32(i as u32).unwrap_or('\u{FFFD}')),
-        JIT_RT_FLONUM => Value::Number(cs_core::Number::Flonum(f64::from_bits(i as u64))),
+        JIT_RT_FLONUM => Value::Flonum(f64::from_bits(i as u64)),
         JIT_RT_NULL => Value::Null,
         JIT_RT_SYMBOL => Value::Symbol(cs_core::Symbol(i as u32)),
         JIT_RT_ANY => {
@@ -1335,7 +1335,7 @@ impl NanboxValue {
             // Oversized: wrap in `Gc<Value>` directly via the
             // Wrap as Gc<Value>. (Calling back through `from_value`
             // would re-enter `fixnum` → infinite recursion.)
-            let g = cs_gc::Gc::new(Value::Number(cs_core::Number::Fixnum(n)));
+            let g = cs_gc::Gc::new(Value::Fixnum(n));
             let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
             NanboxValue(nb_make(NB_TAG_GC_VALUE, nb_encode_gc_ptr(ptr, false)) as i64)
         }
@@ -1379,8 +1379,8 @@ impl NanboxValue {
             Value::Boolean(b) => Self::boolean(b),
             Value::Character(c) => Self::character(c),
             Value::Symbol(s) => Self::symbol(s),
-            Value::Number(cs_core::Number::Fixnum(n)) => Self::fixnum(n),
-            Value::Number(cs_core::Number::Flonum(f)) => Self::flonum(f),
+            Value::Fixnum(n) => Self::fixnum(n),
+            Value::Flonum(f) => Self::flonum(f),
             // For pointer variants, take the Gc/Rc raw pointer
             // directly. Pointers must have low bits zero (8-byte
             // align) and upper 16 bits zero (x86-64 user-space),
@@ -1459,7 +1459,7 @@ impl NanboxValue {
             // sensitive code. A future iter could carve out a
             // dedicated NB_TAG_IDENTIFIER if identifier-heavy
             // code shows up in the hot path.
-            other @ (Value::Number(_) | Value::Identifier { .. }) => {
+            other @ (Value::BigNumber(_) | Value::Rational(_) | Value::Identifier { .. }) => {
                 let g = cs_gc::Gc::new(other);
                 let ptr = cs_gc::Gc::into_raw_jit(g) as u64;
                 NanboxValue(nb_make(NB_TAG_GC_VALUE, nb_encode_gc_ptr(ptr, false)) as i64)
@@ -1481,13 +1481,13 @@ impl NanboxValue {
         let bits = self.0 as u64;
         if !nb_is_tagged(bits) {
             // Not in the tagged range — it's a raw f64.
-            return Value::Number(cs_core::Number::Flonum(f64::from_bits(bits)));
+            return Value::Flonum(f64::from_bits(bits));
         }
         let tag = nb_tag_of(bits);
         let payload = nb_payload_of(bits);
         match tag {
             t if t == NB_TAG_FIXNUM => {
-                Value::Number(cs_core::Number::Fixnum(nb_sign_extend_47(payload)))
+                Value::Fixnum(nb_sign_extend_47(payload))
             }
             t if t == NB_TAG_BOOLEAN => Value::Boolean(payload != 0),
             t if t == NB_TAG_CHARACTER => {
@@ -2073,7 +2073,7 @@ pub unsafe extern "C" fn vm_boolean_p_gc(r: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn vm_fixnum_p_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
-    matches!(v, Value::Number(cs_core::Number::Fixnum(_))) as i64
+    matches!(v, Value::Fixnum(_)) as i64
 }
 
 /// `(flonum? v)` — true iff `v` is a flonum (f64). ADR 0012 D-2
@@ -2085,7 +2085,7 @@ pub unsafe extern "C" fn vm_fixnum_p_gc(r: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn vm_flonum_p_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
-    matches!(v, Value::Number(cs_core::Number::Flonum(_))) as i64
+    matches!(v, Value::Flonum(_)) as i64
 }
 
 /// `(procedure? v)` — true iff `v` is a procedure (closure or
@@ -2361,9 +2361,9 @@ pub unsafe extern "C" fn vm_exact_nonneg_int_p_gc(r: i64) -> i64 {
     use num_traits::Signed;
     let v = unsafe { gc_i64_to_value(r) };
     let ok = match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => n >= 0,
-        Value::Number(cs_core::Number::Big(b)) => !b.is_negative(),
-        Value::Number(cs_core::Number::Rat(r)) => r.is_integer() && !r.numer().is_negative(),
+        Value::Fixnum(n) => n >= 0,
+        Value::BigNumber(b) => !b.is_negative(),
+        Value::Rational(r) => r.is_integer() && !r.numer().is_negative(),
         _ => false,
     };
     ok as i64
@@ -2482,7 +2482,10 @@ fn equal_hash_rec(v: &Value, acc: &mut u64) {
     match v {
         Value::Null => mix(acc, 0x01),
         Value::Boolean(b) => mix(acc, 0x10 | (*b as u64)),
-        Value::Number(n) => mix(acc, fnv1a_hash_jit(format!("{}", n).as_bytes()) as u64),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            mix(acc, fnv1a_hash_jit(format!("{}", n).as_bytes()) as u64)
+        }
         Value::Character(c) => mix(acc, 0x20 | (*c as u64)),
         Value::String(s) => {
             mix(acc, 0x30);
@@ -3286,7 +3289,7 @@ pub unsafe extern "C" fn vm_assq_gc(key: i64, alist: i64) -> i64 {
 pub unsafe extern "C" fn vm_digit_value(c: i64) -> i64 {
     let v = match char::from_u32(c as u32) {
         Some(ch) => match ch.to_digit(10) {
-            Some(d) => Value::Number(cs_core::Number::Fixnum(d as i64)),
+            Some(d) => Value::Fixnum(d as i64),
             None => Value::Boolean(false),
         },
         None => Value::Boolean(false),
@@ -4823,7 +4826,7 @@ pub unsafe extern "C" fn vm_u8_list_to_bytevector_gc(lst: i64) -> i64 {
             Value::Pair(p) => {
                 let car = p.car();
                 let n = match car {
-                    Value::Number(cs_core::Number::Fixnum(n)) => n,
+                    Value::Fixnum(n) => n,
                     _ => {
                         jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                         return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
@@ -5023,7 +5026,7 @@ pub unsafe extern "C" fn vm_make_bytevector_buf(buf: *const i64, n: usize) -> i6
         let raw = unsafe { *buf.add(i) };
         let v = unsafe { gc_i64_to_value(raw) };
         match v {
-            Value::Number(cs_core::Number::Fixnum(x)) => bytes.push((x & 0xFF) as u8),
+            Value::Fixnum(x) => bytes.push((x & 0xFF) as u8),
             _ => {
                 jit_request_deopt(DEOPT_REASON_PAIR_MISS);
                 return value_to_gc_i64(Value::ByteVector(cs_gc::Gc::new(
@@ -7186,7 +7189,8 @@ pub unsafe extern "C" fn vm_string_to_vector_gc(s: i64) -> i64 {
 pub unsafe extern "C" fn vm_number_to_string_gc(n: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(n) };
     match v {
-        Value::Number(num) => {
+        numv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let num = numv.as_number().unwrap();
             let s = format!("{}", num);
             value_to_gc_i64(Value::String(cs_gc::Gc::new(std::cell::RefCell::new(
                 s.into(),
@@ -7213,7 +7217,7 @@ pub unsafe extern "C" fn vm_number_to_string_gc(n: i64) -> i64 {
 pub unsafe extern "C" fn vm_number_to_string_radix_gc(n: i64, radix: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(n) };
     match v {
-        Value::Number(cs_core::Number::Fixnum(i)) => {
+        Value::Fixnum(i) => {
             let s = match radix {
                 2 | 8 | 16 => format_radix(i, radix as u32),
                 10 => format!("{}", i),
@@ -7297,7 +7301,7 @@ pub unsafe extern "C" fn vm_string_to_number_gc(s: i64) -> i64 {
                 raw.parse::<f64>().ok().map(cs_core::Number::Flonum)
             };
             match parsed {
-                Some(n) => value_to_gc_i64(Value::Number(n)),
+                Some(n) => value_to_gc_i64(Value::from_number(n)),
                 None => value_to_gc_i64(Value::Boolean(false)),
             }
         }
@@ -7338,7 +7342,7 @@ pub unsafe extern "C" fn vm_string_to_number_radix_gc(s: i64, radix: i64) -> i64
                 return value_to_gc_i64(Value::Boolean(false));
             }
             match i64::from_str_radix(&raw, radix as u32) {
-                Ok(n) => value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(n))),
+                Ok(n) => value_to_gc_i64(Value::Fixnum(n)),
                 Err(_) => value_to_gc_i64(Value::Boolean(false)),
             }
         }
@@ -8717,7 +8721,7 @@ pub unsafe extern "C" fn vm_string_contains_gc(haystack: i64, needle: i64) -> i6
     match h.find(&n) {
         Some(byte_idx) => {
             let char_idx = h[..byte_idx].chars().count() as i64;
-            value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(char_idx)))
+            value_to_gc_i64(Value::Fixnum(char_idx))
         }
         None => value_to_gc_i64(Value::Boolean(false)),
     }
@@ -8743,7 +8747,7 @@ pub unsafe extern "C" fn vm_string_contains_right_gc(haystack: i64, needle: i64)
     match h.rfind(&n) {
         Some(byte_idx) => {
             let char_idx = h[..byte_idx].chars().count() as i64;
-            value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(char_idx)))
+            value_to_gc_i64(Value::Fixnum(char_idx))
         }
         None => value_to_gc_i64(Value::Boolean(false)),
     }
@@ -8775,7 +8779,7 @@ pub unsafe extern "C" fn vm_string_index_gc(s: i64, c: i64) -> i64 {
         }
     };
     match s_str.chars().position(|ch| ch == target) {
-        Some(i) => value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(i as i64))),
+        Some(i) => value_to_gc_i64(Value::Fixnum(i as i64)),
         None => value_to_gc_i64(Value::Boolean(false)),
     }
 }
@@ -8805,7 +8809,7 @@ pub unsafe extern "C" fn vm_string_index_right_gc(s: i64, c: i64) -> i64 {
     };
     let chars: Vec<char> = s_str.chars().collect();
     match chars.iter().rposition(|ch| *ch == target) {
-        Some(i) => value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(i as i64))),
+        Some(i) => value_to_gc_i64(Value::Fixnum(i as i64)),
         None => value_to_gc_i64(Value::Boolean(false)),
     }
 }
@@ -9248,7 +9252,7 @@ pub unsafe extern "C" fn vm_box_typed(i: i64, tag: i64) -> i64 {
 pub unsafe extern "C" fn vm_unbox_fixnum(r: i64) -> i64 {
     let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
     match *boxed {
-        Value::Number(cs_core::Number::Fixnum(n)) => n,
+        Value::Fixnum(n) => n,
         _ => {
             jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
             0
@@ -9277,7 +9281,7 @@ pub unsafe extern "C" fn vm_unbox_boolean(r: i64) -> i64 {
 pub unsafe extern "C" fn vm_unbox_flonum(r: i64) -> i64 {
     let boxed: Box<Value> = unsafe { Box::from_raw(r as *mut Value) };
     match *boxed {
-        Value::Number(cs_core::Number::Flonum(f)) => f.to_bits() as i64,
+        Value::Flonum(f) => f.to_bits() as i64,
         _ => {
             jit_request_deopt(DEOPT_REASON_FLONUM_MISS);
             f64::NAN.to_bits() as i64
@@ -9317,12 +9321,8 @@ pub unsafe extern "C" fn vm_eq_any(a: i64, b: i64) -> i64 {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Character(x), Value::Character(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
-        (Value::Number(cs_core::Number::Fixnum(x)), Value::Number(cs_core::Number::Fixnum(y))) => {
-            x == y
-        }
-        (Value::Number(cs_core::Number::Flonum(x)), Value::Number(cs_core::Number::Flonum(y))) => {
-            x.to_bits() == y.to_bits()
-        }
+        (Value::Fixnum(x), Value::Fixnum(y)) => x == y,
+        (Value::Flonum(x), Value::Flonum(y)) => x.to_bits() == y.to_bits(),
         (Value::Pair(x), Value::Pair(y)) => cs_core::Gc::ptr_eq(x, y),
         (Value::Vector(x), Value::Vector(y)) => cs_core::Gc::ptr_eq(x, y),
         (Value::String(x), Value::String(y)) => cs_core::Gc::ptr_eq(x, y),
@@ -9358,7 +9358,7 @@ pub unsafe extern "C" fn vm_box_typed_gc(i: i64, tag: i64) -> i64 {
 pub unsafe extern "C" fn vm_unbox_fixnum_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => n,
+        Value::Fixnum(n) => n,
         _ => {
             jit_request_deopt(DEOPT_REASON_FIXNUM_MISS);
             0
@@ -9384,7 +9384,7 @@ pub unsafe extern "C" fn vm_unbox_boolean_gc(r: i64) -> i64 {
 pub unsafe extern "C" fn vm_unbox_flonum_gc(r: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(r) };
     match v {
-        Value::Number(cs_core::Number::Flonum(f)) => f.to_bits() as i64,
+        Value::Flonum(f) => f.to_bits() as i64,
         _ => {
             jit_request_deopt(DEOPT_REASON_FLONUM_MISS);
             f64::NAN.to_bits() as i64
@@ -9417,12 +9417,8 @@ pub unsafe extern "C" fn vm_eq_any_gc(a: i64, b: i64) -> i64 {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Character(x), Value::Character(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
-        (Value::Number(cs_core::Number::Fixnum(x)), Value::Number(cs_core::Number::Fixnum(y))) => {
-            x == y
-        }
-        (Value::Number(cs_core::Number::Flonum(x)), Value::Number(cs_core::Number::Flonum(y))) => {
-            x.to_bits() == y.to_bits()
-        }
+        (Value::Fixnum(x), Value::Fixnum(y)) => x == y,
+        (Value::Flonum(x), Value::Flonum(y)) => x.to_bits() == y.to_bits(),
         (Value::Pair(x), Value::Pair(y)) => cs_core::Gc::ptr_eq(x, y),
         (Value::Vector(x), Value::Vector(y)) => cs_core::Gc::ptr_eq(x, y),
         (Value::String(x), Value::String(y)) => cs_core::Gc::ptr_eq(x, y),
@@ -9749,7 +9745,7 @@ pub unsafe extern "C" fn vm_ic_dispatch(
             let v = unsafe { gc_i64_to_value(raw) };
             let nibble = ((cached_param_types >> (i as u32 * 4)) & 0xF) as u8;
             let slot_val: i64 = match (nibble, &v) {
-                (JIT_RT_FIXNUM, Value::Number(cs_core::Number::Fixnum(n))) => *n,
+                (JIT_RT_FIXNUM, Value::Fixnum(n)) => *n,
                 (JIT_RT_BOOLEAN, Value::Boolean(b)) => {
                     if *b {
                         1
@@ -9758,7 +9754,7 @@ pub unsafe extern "C" fn vm_ic_dispatch(
                     }
                 }
                 (JIT_RT_CHARACTER, Value::Character(c)) => *c as u32 as i64,
-                (JIT_RT_FLONUM, Value::Number(cs_core::Number::Flonum(f))) => f.to_bits() as i64,
+                (JIT_RT_FLONUM, Value::Flonum(f)) => f.to_bits() as i64,
                 (JIT_RT_ANY, _) => value_to_gc_i64(v.clone()),
                 _ => {
                     type_miss = true;
@@ -11810,11 +11806,11 @@ mod bindings_cycle_visit_region_tests {
             decode_gc_handle::<cs_core::Pair>(raw_ptr, true)
         });
         match right.car() {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 11),
+            Value::Fixnum(n) => assert_eq!(n, 11),
             other => panic!("expected Fixnum(11) via decode_gc_handle, got {other:?}"),
         }
         match right.cdr() {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 22),
+            Value::Fixnum(n) => assert_eq!(n, 22),
             other => panic!("expected Fixnum(22) via decode_gc_handle, got {other:?}"),
         }
 
@@ -11827,8 +11823,7 @@ mod bindings_cycle_visit_region_tests {
         let wrong = std::mem::ManuallyDrop::new(unsafe {
             cs_gc::Gc::<cs_core::Pair>::from_raw_jit(raw_ptr)
         });
-        let wrong_car_is_correct =
-            matches!(wrong.car(), Value::Number(cs_core::Number::Fixnum(11)));
+        let wrong_car_is_correct = matches!(wrong.car(), Value::Fixnum(11));
         assert!(
             !wrong_car_is_correct,
             "the Rc-path decode was expected to misread the region \
@@ -14352,9 +14347,7 @@ fn try_fast_primop_nb(
     let resolve = |fa: &FastArg| -> Option<NanboxValue> {
         match fa {
             FastArg::Param(i) => Some(stack.at_nb(args_start + *i as usize)),
-            FastArg::Const(Value::Number(cs_core::Number::Fixnum(v))) => {
-                Some(NanboxValue::fixnum(*v))
-            }
+            FastArg::Const(Value::Fixnum(v)) => Some(NanboxValue::fixnum(*v)),
             FastArg::Const(_) => None,
         }
     };
@@ -14407,11 +14400,7 @@ fn apply_fast_primop(
     let a = resolve(&fp.args[0]);
     let b = resolve(&fp.args[1]);
     // Fast path: both Fixnum. Mirrors the inline arms in the main dispatch.
-    if let (
-        Value::Number(cs_core::Number::Fixnum(av)),
-        Value::Number(cs_core::Number::Fixnum(bv)),
-    ) = (&a, &b)
-    {
+    if let (Value::Fixnum(av), Value::Fixnum(bv)) = (&a, &b) {
         let av = *av;
         let bv = *bv;
         match &fp.op {
@@ -14560,7 +14549,7 @@ fn generic_arith2(
             }
         },
     };
-    Ok(Value::Number(r))
+    Ok(Value::from_number(r))
 }
 
 fn generic_cmp2(
@@ -14593,13 +14582,22 @@ fn generic_cmp2(
 
 fn as_number(v: &Value, name: &str) -> Result<cs_core::Number, String> {
     match v {
-        Value::Number(n) => Ok(n.clone()),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            Ok(n.clone())
+        }
         other => {
             // Include a short display of the offending value where it can
             // render without a SymbolTable. Symbols print as their handle
             // via Display, which is unhelpful — leave them off.
             let extra = match other {
-                Value::String(_) | Value::Number(_) | Value::Boolean(_) | Value::Character(_) => {
+                Value::String(_)
+                | Value::Fixnum(_)
+                | Value::Flonum(_)
+                | Value::BigNumber(_)
+                | Value::Rational(_)
+                | Value::Boolean(_)
+                | Value::Character(_) => {
                     let display = format!("{}", other);
                     let cap = 60;
                     let trimmed: String = if display.chars().count() > cap {
@@ -14798,7 +14796,7 @@ fn try_fast_data_primop(op: DataPrimOp, n: usize, stack: &mut ValueStack) -> Opt
             let i_v = stack.pop().expect("arity-checked pop");
             let vec_v = stack.pop().expect("arity-checked pop");
             let result = match (&vec_v, &i_v) {
-                (Value::Vector(v), Value::Number(cs_core::Number::Fixnum(i))) if *i >= 0 => {
+                (Value::Vector(v), Value::Fixnum(i)) if *i >= 0 => {
                     v.borrow().get(*i as usize).cloned()
                 }
                 _ => None,
@@ -14817,9 +14815,7 @@ fn try_fast_data_primop(op: DataPrimOp, n: usize, stack: &mut ValueStack) -> Opt
             let i_v = stack.pop().expect("arity-checked pop");
             let vec_v = stack.pop().expect("arity-checked pop");
             let in_bounds = match (&vec_v, &i_v) {
-                (Value::Vector(v), Value::Number(cs_core::Number::Fixnum(i))) if *i >= 0 => {
-                    (*i as usize) < v.borrow().len()
-                }
+                (Value::Vector(v), Value::Fixnum(i)) if *i >= 0 => (*i as usize) < v.borrow().len(),
                 _ => false,
             };
             if !in_bounds {
@@ -14828,8 +14824,7 @@ fn try_fast_data_primop(op: DataPrimOp, n: usize, stack: &mut ValueStack) -> Opt
                 stack.push(x);
                 return None;
             }
-            let (Value::Vector(v), Value::Number(cs_core::Number::Fixnum(i))) = (&vec_v, &i_v)
-            else {
+            let (Value::Vector(v), Value::Fixnum(i)) = (&vec_v, &i_v) else {
                 unreachable!("in_bounds only true for (Vector, Fixnum)");
             };
             // Mirrors b_vector_set exactly: region-allocated vectors
@@ -16300,7 +16295,7 @@ fn ho_apply(func: &Value, args: &[Value], syms: &mut SymbolTable) -> Result<Valu
             return Err(VmError::new("tabulate: needs n + proc"));
         }
         let n = match &args[0] {
-            Value::Number(cs_core::Number::Fixnum(n)) => *n,
+            Value::Fixnum(n) => *n,
             other => {
                 return Err(VmError::new(format!(
                     "tabulate: expected fixnum, got {}",
@@ -17009,7 +17004,7 @@ mod tests {
         let mut acc: i64 = 0;
         for a in args {
             match a {
-                Value::Number(Number::Fixnum(n)) => acc += n,
+                Value::Fixnum(n) => acc += n,
                 _ => return Err("expected fixnum".into()),
             }
         }
@@ -17022,7 +17017,7 @@ mod tests {
         }
         let mut iter = args.iter();
         let first = match iter.next().unwrap() {
-            Value::Number(Number::Fixnum(n)) => *n,
+            Value::Fixnum(n) => *n,
             _ => return Err("expected fixnum".into()),
         };
         let mut acc = first;
@@ -17030,7 +17025,7 @@ mod tests {
         for a in iter {
             consumed_more = true;
             match a {
-                Value::Number(Number::Fixnum(n)) => acc -= n,
+                Value::Fixnum(n) => acc -= n,
                 _ => return Err("expected fixnum".into()),
             }
         }
@@ -17044,7 +17039,7 @@ mod tests {
         let mut acc: i64 = 1;
         for a in args {
             match a {
-                Value::Number(Number::Fixnum(n)) => acc *= n,
+                Value::Fixnum(n) => acc *= n,
                 _ => return Err("expected fixnum".into()),
             }
         }
@@ -17056,9 +17051,7 @@ mod tests {
             return Err("=: 2 args".into());
         }
         match (&args[0], &args[1]) {
-            (Value::Number(Number::Fixnum(a)), Value::Number(Number::Fixnum(b))) => {
-                Ok(Value::Boolean(a == b))
-            }
+            (Value::Fixnum(a), Value::Fixnum(b)) => Ok(Value::Boolean(a == b)),
             _ => Err("expected fixnums".into()),
         }
     }
@@ -17083,7 +17076,7 @@ mod tests {
         let bc = compile(&expr).unwrap();
         let r = run(&bc, env, &mut syms).unwrap();
         match r {
-            Value::Number(Number::Fixnum(42)) => {}
+            Value::Fixnum(42) => {}
             other => panic!("expected 42, got {:?}", other),
         }
     }
@@ -17117,7 +17110,7 @@ mod tests {
         let bc = compile(&expr).unwrap();
         let r = run(&bc, env, &mut syms).unwrap();
         match r {
-            Value::Number(Number::Fixnum(6)) => {}
+            Value::Fixnum(6) => {}
             other => panic!("expected 6, got {:?}", other),
         }
     }
@@ -17144,7 +17137,7 @@ mod tests {
         let bc = compile(&expr).unwrap();
         let r = run(&bc, env, &mut syms).unwrap();
         match r {
-            Value::Number(Number::Fixnum(1)) => {}
+            Value::Fixnum(1) => {}
             other => panic!("expected 1, got {:?}", other),
         }
     }
@@ -17188,7 +17181,7 @@ mod tests {
         let bc = compile(&app).unwrap();
         let r = run(&bc, env, &mut syms).unwrap();
         match r {
-            Value::Number(Number::Fixnum(42)) => {}
+            Value::Fixnum(42) => {}
             other => panic!("expected 42, got {:?}", other),
         }
     }
@@ -17288,7 +17281,7 @@ mod tests {
         let bc = compile(&letrec).unwrap();
         let r = run(&bc, env, &mut syms).unwrap();
         match r {
-            Value::Number(Number::Fixnum(120)) => {}
+            Value::Fixnum(120) => {}
             other => panic!("expected 120, got {:?}", other),
         }
     }
@@ -17369,10 +17362,7 @@ mod gc_helper_tests {
         let v = unsafe { gc_i64_to_value(i) };
         match v {
             Value::Pair(p) => match (&*p.car.borrow(), &*p.cdr.borrow()) {
-                (
-                    Value::Number(cs_core::Number::Fixnum(7)),
-                    Value::Number(cs_core::Number::Fixnum(11)),
-                ) => {}
+                (Value::Fixnum(7), Value::Fixnum(11)) => {}
                 other => panic!("pair contents mismatch: {:?}", other),
             },
             other => panic!("expected Pair, got {:?}", other),
@@ -17407,14 +17397,11 @@ mod gc_helper_tests {
 
     #[test]
     fn value_to_gc_i64_and_back_preserves_value() {
-        let v = Value::Number(cs_core::Number::Fixnum(42));
+        let v = Value::Fixnum(42);
         let i = value_to_gc_i64(v.clone());
         let back = unsafe { gc_i64_to_value(i) };
         match (&v, &back) {
-            (
-                Value::Number(cs_core::Number::Fixnum(a)),
-                Value::Number(cs_core::Number::Fixnum(b)),
-            ) => assert_eq!(a, b),
+            (Value::Fixnum(a), Value::Fixnum(b)) => assert_eq!(a, b),
             _ => panic!("mismatch"),
         }
     }
@@ -17430,10 +17417,7 @@ mod gc_helper_tests {
         let car = unsafe { gc_i64_to_value(car_i) };
         let cdr = unsafe { gc_i64_to_value(cdr_i) };
         match (&car, &cdr) {
-            (
-                Value::Number(cs_core::Number::Fixnum(5)),
-                Value::Number(cs_core::Number::Fixnum(9)),
-            ) => {}
+            (Value::Fixnum(5), Value::Fixnum(9)) => {}
             other => panic!("unexpected (car, cdr): {:?}", other),
         }
     }
@@ -17462,17 +17446,14 @@ mod gc_helper_tests {
         // Functional check: after two drops the underlying Gc is gone.
         // We can't observe directly without exposing strong_count, so
         // do a positive smoke: round-trip a clone.
-        let i = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(123)));
+        let i = value_to_gc_i64(Value::Fixnum(123));
         let i2 = unsafe { vm_value_clone_gc(i) };
         // i and i2 are independent strong references to the same slot.
         // Both must decode to Number(123).
         let v1 = unsafe { gc_i64_to_value(i) };
         let v2 = unsafe { gc_i64_to_value(i2) };
         match (&v1, &v2) {
-            (
-                Value::Number(cs_core::Number::Fixnum(123)),
-                Value::Number(cs_core::Number::Fixnum(123)),
-            ) => {}
+            (Value::Fixnum(123), Value::Fixnum(123)) => {}
             other => panic!("unexpected clones: {:?}", other),
         }
     }
@@ -17515,14 +17496,14 @@ mod vector_helper_tests {
         let vec_i = unsafe { vm_alloc_vector_gc(3, fill) };
         // Bump count: set! consumes one, ref consumes another.
         let vec_i2 = unsafe { vm_value_clone_gc(vec_i) };
-        let x = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(99)));
+        let x = value_to_gc_i64(Value::Fixnum(99));
         let unit = unsafe { vm_vector_set_gc(vec_i, 2, x) };
         // Drop the Unspecified return so we don't leak the strong count.
         unsafe { vm_value_drop_gc(unit) };
         let got = unsafe { vm_vector_ref_gc(vec_i2, 2) };
         let v = unsafe { gc_i64_to_value(got) };
         match v {
-            Value::Number(cs_core::Number::Fixnum(99)) => {}
+            Value::Fixnum(99) => {}
             other => panic!("expected Fixnum(99), got {:?}", other),
         }
     }
@@ -17663,7 +17644,7 @@ mod gc_helper_tests_extra {
         let i = unsafe { vm_box_typed_gc(42, JIT_RT_FIXNUM as i64) };
         let v = unsafe { gc_i64_to_value(i) };
         match v {
-            Value::Number(cs_core::Number::Fixnum(42)) => {}
+            Value::Fixnum(42) => {}
             other => panic!("expected fixnum 42, got {:?}", other),
         }
     }
@@ -17677,7 +17658,7 @@ mod gc_helper_tests_extra {
 
     #[test]
     fn vm_unbox_fixnum_gc_extracts() {
-        let v = Value::Number(cs_core::Number::Fixnum(-17));
+        let v = Value::Fixnum(-17);
         let i = value_to_gc_i64(v);
         let n = unsafe { vm_unbox_fixnum_gc(i) };
         assert_eq!(n, -17);
@@ -17693,7 +17674,7 @@ mod gc_helper_tests_extra {
 
     #[test]
     fn vm_unbox_flonum_gc_extracts() {
-        let i = value_to_gc_i64(Value::Number(cs_core::Number::Flonum(2.5)));
+        let i = value_to_gc_i64(Value::Flonum(2.5));
         let bits = unsafe { vm_unbox_flonum_gc(i) };
         let f = f64::from_bits(bits as u64);
         assert!((f - 2.5).abs() < 1e-12);
@@ -17711,7 +17692,7 @@ mod gc_helper_tests_extra {
             1
         );
         assert_eq!(
-            unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(0)))) },
+            unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Fixnum(0))) },
             1
         );
         assert_eq!(unsafe { vm_any_truthy_gc(value_to_gc_i64(Value::Null)) }, 1);
@@ -17725,7 +17706,7 @@ mod gc_helper_tests_extra {
         // transient scope on top — the shared-Runtime env shape.
         let base = Env::root();
         let builtin = Symbol(1);
-        base.define(builtin, Value::Number(cs_core::Number::Fixnum(100)));
+        base.define(builtin, Value::Fixnum(100));
 
         let overlay = Env::child_define_root(base.clone());
         let scope = Env::child(overlay.clone()); // EnterScope-style transient child
@@ -17733,23 +17714,15 @@ mod gc_helper_tests_extra {
         // A top-level define from within the transient scope installs in the
         // overlay (nearest boundary), NOT in the shared base.
         let user = Symbol(2);
-        scope
-            .define_root()
-            .define(user, Value::Number(cs_core::Number::Fixnum(7)));
+        scope.define_root().define(user, Value::Fixnum(7));
 
-        assert!(matches!(
-            overlay.get(user),
-            Some(Value::Number(cs_core::Number::Fixnum(7)))
-        ));
+        assert!(matches!(overlay.get(user), Some(Value::Fixnum(7))));
         assert!(
             base.get(user).is_none(),
             "a user define must not leak into the shared base"
         );
         // Lookups still fall through to the base (builtins visible).
-        assert!(matches!(
-            overlay.get(builtin),
-            Some(Value::Number(cs_core::Number::Fixnum(100)))
-        ));
+        assert!(matches!(overlay.get(builtin), Some(Value::Fixnum(100))));
 
         // define_root resolves to the overlay from the scope and the overlay, and
         // to the base (actual root, unmarked) from the base itself.
@@ -17825,11 +17798,11 @@ mod gc_helper_tests_extra {
             Value::Symbol(cs_core::Symbol(0)),
             Value::Symbol(cs_core::Symbol(42)),
             Value::Symbol(cs_core::Symbol(u32::MAX)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(-1)),
-            Value::Number(cs_core::Number::Fixnum(NB_FIXNUM_MAX)),
-            Value::Number(cs_core::Number::Fixnum(NB_FIXNUM_MIN)),
+            Value::Fixnum(0),
+            Value::Fixnum(1),
+            Value::Fixnum(-1),
+            Value::Fixnum(NB_FIXNUM_MAX),
+            Value::Fixnum(NB_FIXNUM_MIN),
         ] {
             let label = format!("{:?}", v);
             let nb = NanboxValue::from_value(v.clone());
@@ -17841,10 +17814,7 @@ mod gc_helper_tests_extra {
                 (Value::Boolean(a), Value::Boolean(b)) => a == b,
                 (Value::Character(a), Value::Character(b)) => a == b,
                 (Value::Symbol(a), Value::Symbol(b)) => a.0 == b.0,
-                (
-                    Value::Number(cs_core::Number::Fixnum(a)),
-                    Value::Number(cs_core::Number::Fixnum(b)),
-                ) => a == b,
+                (Value::Fixnum(a), Value::Fixnum(b)) => a == b,
                 _ => false,
             };
             assert!(matches, "{}: round-trip mismatch: {:?}", label, back);
@@ -17932,8 +17902,8 @@ mod gc_helper_tests_extra {
         let d = value_to_gc_i64(Value::Symbol(cs_core::Symbol(42)));
         assert_eq!(unsafe { vm_eq_any_gc(c, d) }, 0);
         // Fixnum value equality.
-        let e = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(5)));
-        let f = value_to_gc_i64(Value::Number(cs_core::Number::Fixnum(5)));
+        let e = value_to_gc_i64(Value::Fixnum(5));
+        let f = value_to_gc_i64(Value::Fixnum(5));
         assert_eq!(unsafe { vm_eq_any_gc(e, f) }, 1);
         // Distinct heap pairs are NOT eq? (different Gc allocations).
         let p1 = unsafe { vm_alloc_pair_gc(1, JIT_RT_FIXNUM, 2, JIT_RT_FIXNUM) };
@@ -17958,7 +17928,7 @@ mod nb_arith_tests {
     fn assert_fixnum(nb: i64, expected: i64) {
         let v = unsafe { NanboxValue(nb).to_value() };
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, expected),
+            Value::Fixnum(n) => assert_eq!(n, expected),
             other => panic!("expected Fixnum({}), got {:?}", expected, other),
         }
     }
@@ -18025,8 +17995,8 @@ mod nb_arith_tests {
         // Decode and verify it represents NB_FIXNUM_MAX + 1.
         let v = unsafe { NanboxValue(r).to_value() };
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, NB_FIXNUM_MAX + 1),
-            Value::Number(cs_core::Number::Big(_)) => { /* acceptable */ }
+            Value::Fixnum(n) => assert_eq!(n, NB_FIXNUM_MAX + 1),
+            Value::BigNumber(_) => { /* acceptable */ }
             other => panic!("expected Fixnum(NB_FIXNUM_MAX+1) or Big, got {:?}", other),
         }
         assert_eq!(jit_take_deopt(), 0);
@@ -18038,7 +18008,7 @@ mod nb_arith_tests {
         let r = unsafe { vm_value_add_nb(nb_fixnum(1), NanboxValue::flonum(2.5).into_raw()) };
         let v = unsafe { NanboxValue(r).to_value() };
         match v {
-            Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.5).abs() < 1e-9),
+            Value::Flonum(f) => assert!((f - 3.5).abs() < 1e-9),
             other => panic!("expected Flonum(3.5), got {:?}", other),
         }
         assert_eq!(
@@ -18092,7 +18062,7 @@ mod data_primop_tests {
 
     fn assert_fixnum(v: &Value, expected: i64) {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, expected),
+            Value::Fixnum(n) => assert_eq!(*n, expected),
             other => panic!("expected Fixnum({}), got {:?}", expected, other),
         }
     }

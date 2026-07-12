@@ -2138,7 +2138,7 @@ fn run_aot_verify(
         }
     };
     let jit_stdout = match &v {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => n.to_string(),
+        cs_core::Value::Fixnum(n) => n.to_string(),
         // AOT today only returns Fixnums via the Nb shim; other Value
         // variants would indicate a contract mismatch with AOT's
         // emitted main shim.

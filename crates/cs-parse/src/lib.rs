@@ -54,7 +54,7 @@ impl Datum {
     pub fn to_value(&self) -> Value {
         match self {
             Datum::Boolean(b, _) => Value::Boolean(*b),
-            Datum::Number(n, _) => Value::Number(n.clone()),
+            Datum::Number(n, _) => Value::from_number(n.clone()),
             Datum::Character(c, _) => Value::Character(*c),
             Datum::String(s, _) => Value::string((**s).clone()),
             Datum::Symbol(s, _) => Value::Symbol(*s),

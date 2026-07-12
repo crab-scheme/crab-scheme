@@ -157,7 +157,7 @@ fn counter_state_migration_v1_to_v2() {
                             .eval_str("<t>", r#"(lookup-code 'beam-e2e-counter "schema-version")"#)
                             .expect("schema-version lookup");
                         let new_schema = match &sv {
-                            cs_core::Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                            cs_core::Value::Fixnum(n) => *n,
                             _ => local_schema,
                         };
                         if new_schema > local_schema {

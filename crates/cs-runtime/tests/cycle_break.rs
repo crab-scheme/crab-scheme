@@ -48,7 +48,10 @@ fn detector_fires_on_self_loop_observability_preserved() {
     // even if Weak tombstone was applied).
     let result = rt.eval_str("<verify>", "(car x)").expect("car x");
     assert!(
-        matches!(result, cs_core::Value::Number(_)),
+        matches!(
+            result,
+            cs_core::Value::Fixnum(_) | cs_core::Value::Flonum(_) | cs_core::Value::BigNumber(_) | cs_core::Value::Rational(_)
+        ),
         "(car x) returned {result:?}, expected Number(1)"
     );
     let cdr_result = rt.eval_str("<verify>", "(pair? (cdr x))").expect("cdr x");
@@ -167,7 +170,10 @@ fn iter_7_1_x_y_top_bound_self_cycle_actually_breaks() {
     // pair x.
     let car_val = rt.eval_str("<verify>", "(car x)").expect("car x");
     assert!(
-        matches!(car_val, cs_core::Value::Number(_)),
+        matches!(
+            car_val,
+            cs_core::Value::Fixnum(_) | cs_core::Value::Flonum(_) | cs_core::Value::BigNumber(_) | cs_core::Value::Rational(_)
+        ),
         "(car x) returned {car_val:?}, expected Number"
     );
     let cdr_eq_x = rt.eval_str("<verify>", "(eq? (cdr x) x)").expect("eq?");

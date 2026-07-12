@@ -60,13 +60,15 @@ fn infer_const(v: &Value) -> Type {
         Value::Vector(_) => Type::Vector,
         Value::ByteVector(_) => Type::ByteVector,
         Value::Pair(_) => Type::Pair,
-        Value::Number(n) => match n {
-            Number::Fixnum(_) | Number::Big(_) => Type::Fixnum,
-            Number::Flonum(_) => Type::Flonum,
-            // Rationals don't have a Phase-2 atom — Phase 3 may
-            // add one. For now they're `Any` rather than wrong.
-            Number::Rat(_) => Type::Any,
-        },
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            match nv.as_number().unwrap() {
+                Number::Fixnum(_) | Number::Big(_) => Type::Fixnum,
+                Number::Flonum(_) => Type::Flonum,
+                // Rationals don't have a Phase-2 atom — Phase 3 may
+                // add one. For now they're `Any` rather than wrong.
+                Number::Rat(_) => Type::Any,
+            }
+        }
         // No Phase-2 atom: procedures, ports, hashtables, promises,
         // the unspecified value, eof — all fall through.
         Value::Procedure(_)

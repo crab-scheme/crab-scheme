@@ -46,14 +46,26 @@ const SUMPAIRS: &str = "(define (sumpairs n acc) \
 
 fn as_i64(v: &cs_core::Value) -> i64 {
     match v {
-        cs_core::Value::Number(n) => n.to_f64() as i64,
+        nv @ (cs_core::Value::Fixnum(_)
+        | cs_core::Value::Flonum(_)
+        | cs_core::Value::BigNumber(_)
+        | cs_core::Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64() as i64
+        }
         other => panic!("expected a number, got {other:?}"),
     }
 }
 
 fn as_f64(v: &cs_core::Value) -> f64 {
     match v {
-        cs_core::Value::Number(n) => n.to_f64(),
+        nv @ (cs_core::Value::Fixnum(_)
+        | cs_core::Value::Flonum(_)
+        | cs_core::Value::BigNumber(_)
+        | cs_core::Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64()
+        }
         other => panic!("expected a number, got {other:?}"),
     }
 }

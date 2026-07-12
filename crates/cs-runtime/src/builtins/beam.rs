@@ -76,7 +76,10 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
         Value::Eof => Ok(SendableValue::Eof),
         Value::Boolean(b) => Ok(SendableValue::Boolean(*b)),
         Value::Character(c) => Ok(SendableValue::Character(*c)),
-        Value::Number(n) => num_to_sendable(n),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            num_to_sendable(&n)
+        }
         Value::String(s) => Ok(SendableValue::String(s.borrow().clone())),
         Value::Symbol(s) => Ok(SendableValue::Symbol(syms.name(*s).to_string())),
         // Identifiers cross as their name (mark dropped). Marks
@@ -140,13 +143,13 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
         SendableValue::Eof => Value::Eof,
         SendableValue::Boolean(b) => Value::Boolean(*b),
         SendableValue::Character(c) => Value::Character(*c),
-        SendableValue::Fixnum(n) => Value::Number(Number::Fixnum(*n)),
-        SendableValue::Flonum(f) => Value::Number(Number::from_f64(*f)),
+        SendableValue::Fixnum(n) => Value::Fixnum(*n),
+        SendableValue::Flonum(f) => Value::from_number(Number::from_f64(*f)),
         SendableValue::BigInt(d) => {
             // Round-trip via the decimal string. Parser failure
             // is impossible: we produced this string in
             // num_to_sendable from a valid bigint.
-            Value::Number(Number::parse_decimal_integer(d).expect("bigint round-trip"))
+            Value::from_number(Number::parse_decimal_integer(d).expect("bigint round-trip"))
         }
         SendableValue::String(s) => Value::string(s.clone()),
         SendableValue::Symbol(name) => Value::Symbol(syms.intern(name)),
@@ -2112,7 +2115,7 @@ pub fn b_beam_conn_serve_gets(args: &[Value], syms: &mut SymbolTable) -> Result<
     };
     let node = value_to_str(&args[1], syms, "conn-serve-gets")?;
     let nshards = match &args[2] {
-        Value::Number(Number::Fixnum(n)) => *n,
+        Value::Fixnum(n) => *n,
         other => {
             return Err(format!(
                 "conn-serve-gets: nshards must be a fixnum, got {}",
@@ -2202,7 +2205,7 @@ pub fn b_beam_conn_serve_gets(args: &[Value], syms: &mut SymbolTable) -> Result<
     let out_v = Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(out)));
     Ok(Value::Pair(Pair::new(
         out_v,
-        Value::Number(Number::Fixnum(consumed as i64)),
+        Value::Fixnum(consumed as i64),
     )))
 }
 
@@ -2236,7 +2239,7 @@ pub fn b_beam_conn_serve_batch(args: &[Value], syms: &mut SymbolTable) -> Result
     };
     let node = value_to_str(&args[1], syms, "conn-serve-batch")?;
     let nshards = match &args[2] {
-        Value::Number(Number::Fixnum(n)) => *n,
+        Value::Fixnum(n) => *n,
         other => {
             return Err(format!(
                 "conn-serve-batch: nshards must be a fixnum, got {}",
@@ -2325,7 +2328,7 @@ pub fn b_beam_conn_serve_batch(args: &[Value], syms: &mut SymbolTable) -> Result
     let out_v = Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(out)));
     Ok(Value::Pair(Pair::new(
         out_v,
-        Value::Number(Number::Fixnum(consumed as i64)),
+        Value::Fixnum(consumed as i64),
     )))
 }
 
@@ -2364,7 +2367,7 @@ pub fn b_beam_native_classify_route(
         }
     }
     let nshards = match &args[2] {
-        Value::Number(Number::Fixnum(n)) => *n,
+        Value::Fixnum(n) => *n,
         other => {
             return Err(format!(
                 "native-classify-route: nshards must be a fixnum, got {}",
@@ -2378,7 +2381,7 @@ pub fn b_beam_native_classify_route(
         CcRoute::All => Value::Symbol(syms.intern("all")),
         CcRoute::Cluster => Value::Symbol(syms.intern("cluster")),
         CcRoute::CrossSlot => Value::Symbol(syms.intern("crossslot")),
-        CcRoute::Shard(s) => Value::Number(Number::Fixnum(s)),
+        CcRoute::Shard(s) => Value::Fixnum(s),
     })
 }
 
@@ -2387,7 +2390,7 @@ pub fn b_beam_table_size(args: &[Value], syms: &mut SymbolTable) -> Result<Value
     check_arity("table-size", args, 1)?;
     let name = value_to_str(&args[0], syms, "table-size")?;
     let n = primop_table_size(&name)?;
-    Ok(Value::Number(Number::Fixnum(n as i64)))
+    Ok(Value::Fixnum(n as i64))
 }
 
 /// `(spawn name arg ...)` — look up the named procedure in the
@@ -2572,7 +2575,7 @@ pub fn b_beam_system_monitor(args: &[Value], syms: &mut SymbolTable) -> Result<V
     let ref_id = with_current_actor(|a| a.monitor(target))
         .ok_or_else(|| "system-monitor!: not inside an actor body".to_string())?
         .map_err(|e| format!("system-monitor!: {e}"))?;
-    Ok(Value::Number(Number::Fixnum(ref_id as i64)))
+    Ok(Value::Fixnum(ref_id as i64))
 }
 
 /// `(system-demonitor! pid ref-id)` — cancel a prior monitor.
@@ -2582,7 +2585,7 @@ pub fn b_beam_system_demonitor(args: &[Value], syms: &mut SymbolTable) -> Result
     check_arity("system-demonitor!", args, 2)?;
     let target = value_to_pid(&args[0], syms, "system-demonitor!")?;
     let ref_id = match &args[1] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        Value::Fixnum(n) if *n >= 0 => *n as u64,
         other => {
             return Err(format!(
                 "system-demonitor!: ref_id must be a non-negative integer, got {}",
@@ -2623,7 +2626,7 @@ pub fn b_beam_system_trap_exit(args: &[Value], _syms: &mut SymbolTable) -> Resul
 pub fn b_beam_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("reductions", args, 0)?;
     let n = REDUCTIONS.with(|c| c.get());
-    Ok(Value::Number(Number::Fixnum(n as i64)))
+    Ok(Value::Fixnum(n as i64))
 }
 
 /// `(bump-reductions! n)` — add `n` to the calling actor's
@@ -2635,7 +2638,7 @@ pub fn b_beam_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Valu
 pub fn b_beam_bump_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("bump-reductions!", args, 1)?;
     let n = match &args[0] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        Value::Fixnum(n) if *n >= 0 => *n as u64,
         other => {
             return Err(format!(
                 "bump-reductions!: expected non-negative integer, got {}",
@@ -2648,7 +2651,7 @@ pub fn b_beam_bump_reductions(args: &[Value], _syms: &mut SymbolTable) -> Result
         c.set(v);
         v
     });
-    Ok(Value::Number(Number::Fixnum(new as i64)))
+    Ok(Value::Fixnum(new as i64))
 }
 
 /// `(yield)` — cooperative hand-off. Calls
@@ -2728,8 +2731,8 @@ fn do_sleep(ms: u64) {
 pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("sleep-ms", args, 1)?;
     let ms = match &args[0] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as u64,
-        Value::Number(Number::Fixnum(n)) => {
+        Value::Fixnum(n) if *n >= 0 => *n as u64,
+        Value::Fixnum(n) => {
             return Err(format!(
                 "sleep-ms: duration must be non-negative, got {}",
                 n
@@ -2755,14 +2758,10 @@ pub fn b_beam_sleep_ms(args: &[Value], _syms: &mut SymbolTable) -> Result<Value,
 pub fn b_beam_sleep(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("sleep", args, 1)?;
     let secs_f: f64 = match &args[0] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as f64,
-        Value::Number(Number::Fixnum(n)) => {
-            return Err(format!("sleep: duration must be non-negative, got {}", n))
-        }
-        Value::Number(Number::Flonum(f)) if *f >= 0.0 => *f,
-        Value::Number(Number::Flonum(f)) => {
-            return Err(format!("sleep: duration must be non-negative, got {}", f))
-        }
+        Value::Fixnum(n) if *n >= 0 => *n as f64,
+        Value::Fixnum(n) => return Err(format!("sleep: duration must be non-negative, got {}", n)),
+        Value::Flonum(f) if *f >= 0.0 => *f,
+        Value::Flonum(f) => return Err(format!("sleep: duration must be non-negative, got {}", f)),
         other => {
             return Err(format!(
                 "sleep: expected non-negative number, got {}",
@@ -2862,7 +2861,7 @@ pub fn b_beam_raw_receive(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
         0 => None,
         1 => match &args[0] {
             Value::Boolean(false) => None,
-            Value::Number(Number::Fixnum(n)) if *n >= 0 => Some(*n as u64),
+            Value::Fixnum(n) if *n >= 0 => Some(*n as u64),
             other => {
                 return Err(format!(
                     "raw-receive: timeout must be #f or a non-negative integer, got {}",
@@ -2935,7 +2934,7 @@ pub fn b_beam_load_module(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
         }
     }
     let epoch = primop_load_module(&module, exports);
-    Ok(Value::Number(Number::Fixnum(epoch as i64)))
+    Ok(Value::Fixnum(epoch as i64))
 }
 
 /// `(lookup-code 'module "export")` — current version. Returns
@@ -2969,7 +2968,7 @@ pub fn b_beam_code_soft_purge(args: &[Value], syms: &mut SymbolTable) -> Result<
     check_arity("code-soft-purge!", args, 2)?;
     let module = value_to_str(&args[0], syms, "code-soft-purge!")?;
     let count = match &args[1] {
-        Value::Number(Number::Fixnum(n)) if *n >= 0 => *n as usize,
+        Value::Fixnum(n) if *n >= 0 => *n as usize,
         other => {
             return Err(format!(
                 "code-soft-purge!: holder-count must be a non-negative integer, got {}",
@@ -2998,7 +2997,7 @@ pub fn b_beam_code_versions(args: &[Value], syms: &mut SymbolTable) -> Result<Va
     match primop_code_versions(&module) {
         Some((old, cur)) => {
             let epoch_v = |o: Option<u32>| match o {
-                Some(e) => Value::Number(Number::Fixnum(e as i64)),
+                Some(e) => Value::Fixnum(e as i64),
                 None => Value::Boolean(false),
             };
             let tail = Pair::new(epoch_v(cur), Value::Null);
@@ -3098,8 +3097,8 @@ mod tests {
             Value::Boolean(true),
             Value::Boolean(false),
             Value::Character('λ'),
-            Value::Number(Number::Fixnum(42)),
-            Value::Number(Number::Flonum(3.14)),
+            Value::Fixnum(42),
+            Value::Flonum(3.14),
             Value::Unspecified,
             Value::Eof,
         ];
@@ -3163,9 +3162,9 @@ mod tests {
         let mut syms = SymbolTable::new();
 
         // (1 2 3) as a proper list = (1 . (2 . (3 . ())))
-        let a = Pair::new(Value::Number(Number::Fixnum(3)), Value::Null);
-        let b = Pair::new(Value::Number(Number::Fixnum(2)), Value::Pair(a));
-        let lst = Value::Pair(Pair::new(Value::Number(Number::Fixnum(1)), Value::Pair(b)));
+        let a = Pair::new(Value::Fixnum(3), Value::Null);
+        let b = Pair::new(Value::Fixnum(2), Value::Pair(a));
+        let lst = Value::Pair(Pair::new(Value::Fixnum(1), Value::Pair(b)));
 
         let s = to_sendable_in(&lst, &syms).expect("encode");
         let back = from_sendable(&s, &mut syms);
@@ -3193,7 +3192,7 @@ mod tests {
     fn round_trip_vector() {
         let mut syms = SymbolTable::new();
         let v = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(vec![
-            Value::Number(Number::Fixnum(1)),
+            Value::Fixnum(1),
             Value::Boolean(true),
             Value::Null,
         ])));
@@ -3220,10 +3219,7 @@ mod tests {
     #[test]
     fn payload_round_trip() {
         let mut syms = SymbolTable::new();
-        let v = Value::Pair(Pair::new(
-            Value::Number(Number::Fixnum(7)),
-            Value::Boolean(false),
-        ));
+        let v = Value::Pair(Pair::new(Value::Fixnum(7), Value::Boolean(false)));
         let s = to_sendable_in(&v, &syms).expect("encode");
         let p = payload_of(s.clone());
         let s2 = payload_to_sendable(&p).expect("downcast");
@@ -3920,8 +3916,7 @@ mod tests {
     fn sleep_ms_zero_returns_immediately() {
         let mut syms = SymbolTable::new();
         let start = std::time::Instant::now();
-        let v =
-            b_beam_sleep_ms(&[Value::Number(Number::Fixnum(0))], &mut syms).expect("sleep-ms 0");
+        let v = b_beam_sleep_ms(&[Value::Fixnum(0)], &mut syms).expect("sleep-ms 0");
         assert!(matches!(v, Value::Unspecified));
         // Zero-sleep must not take more than a generous 50ms (scheduler jitter).
         assert!(start.elapsed().as_millis() < 50);
@@ -3931,7 +3926,7 @@ mod tests {
     fn sleep_ms_waits_at_least_requested_duration() {
         let mut syms = SymbolTable::new();
         let start = std::time::Instant::now();
-        b_beam_sleep_ms(&[Value::Number(Number::Fixnum(20))], &mut syms).expect("sleep-ms 20");
+        b_beam_sleep_ms(&[Value::Fixnum(20)], &mut syms).expect("sleep-ms 20");
         // Relax lower bound to 15ms to tolerate OS timer granularity.
         assert!(
             start.elapsed().as_millis() >= 15,
@@ -3943,8 +3938,8 @@ mod tests {
     #[test]
     fn sleep_ms_negative_errors() {
         let mut syms = SymbolTable::new();
-        let err = b_beam_sleep_ms(&[Value::Number(Number::Fixnum(-1))], &mut syms)
-            .expect_err("negative should error");
+        let err =
+            b_beam_sleep_ms(&[Value::Fixnum(-1)], &mut syms).expect_err("negative should error");
         assert!(err.contains("non-negative"), "got: {}", err);
     }
 
@@ -3960,7 +3955,7 @@ mod tests {
     fn sleep_zero_seconds_returns_immediately() {
         let mut syms = SymbolTable::new();
         let start = std::time::Instant::now();
-        let v = b_beam_sleep(&[Value::Number(Number::Fixnum(0))], &mut syms).expect("sleep 0");
+        let v = b_beam_sleep(&[Value::Fixnum(0)], &mut syms).expect("sleep 0");
         assert!(matches!(v, Value::Unspecified));
         assert!(start.elapsed().as_millis() < 50);
     }
@@ -3969,22 +3964,22 @@ mod tests {
     fn sleep_zero_float_returns_immediately() {
         let mut syms = SymbolTable::new();
         let start = std::time::Instant::now();
-        b_beam_sleep(&[Value::Number(Number::Flonum(0.0))], &mut syms).expect("sleep 0.0");
+        b_beam_sleep(&[Value::Flonum(0.0)], &mut syms).expect("sleep 0.0");
         assert!(start.elapsed().as_millis() < 50);
     }
 
     #[test]
     fn sleep_negative_errors() {
         let mut syms = SymbolTable::new();
-        let err = b_beam_sleep(&[Value::Number(Number::Fixnum(-1))], &mut syms)
-            .expect_err("negative int should error");
+        let err =
+            b_beam_sleep(&[Value::Fixnum(-1)], &mut syms).expect_err("negative int should error");
         assert!(err.contains("non-negative"), "got: {}", err);
     }
 
     #[test]
     fn sleep_negative_float_errors() {
         let mut syms = SymbolTable::new();
-        let err = b_beam_sleep(&[Value::Number(Number::Flonum(-0.5))], &mut syms)
+        let err = b_beam_sleep(&[Value::Flonum(-0.5)], &mut syms)
             .expect_err("negative float should error");
         assert!(err.contains("non-negative"), "got: {}", err);
     }
@@ -4009,8 +4004,8 @@ mod tests {
             .spawn(|| {
                 let start = std::time::Instant::now();
                 let mut syms = SymbolTable::new();
-                b_beam_sleep_ms(&[Value::Number(Number::Fixnum(20))], &mut syms).map(|_| ())?;
-                b_beam_sleep(&[Value::Number(Number::Flonum(0.02))], &mut syms).map(|_| ())?;
+                b_beam_sleep_ms(&[Value::Fixnum(20)], &mut syms).map(|_| ())?;
+                b_beam_sleep(&[Value::Flonum(0.02)], &mut syms).map(|_| ())?;
                 assert!(
                     start.elapsed() >= Duration::from_millis(30),
                     "both sleeps should actually block when no driver is present"
@@ -4031,7 +4026,7 @@ mod tests {
             .name("tokio-runtime-worker".to_string())
             .spawn(|| {
                 let mut syms = SymbolTable::new();
-                b_beam_sleep_ms(&[Value::Number(Number::Fixnum(5))], &mut syms).map(|_| ())
+                b_beam_sleep_ms(&[Value::Fixnum(5)], &mut syms).map(|_| ())
             })
             .unwrap()
             .join()

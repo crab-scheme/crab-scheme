@@ -53,7 +53,7 @@ fn call1(ptr: *const u8, a: i64) -> cs_core::Value {
 
 fn as_fixnum(v: cs_core::Value, ctx: &str) -> i64 {
     match v {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => n,
+        cs_core::Value::Fixnum(n) => n,
         other => panic!("{ctx}: expected Fixnum, got {other:?}"),
     }
 }
@@ -187,7 +187,7 @@ fn unboxed_sum_of_squares_is_correct() {
         let v = call2(ptr, a, b);
         let expected = a * a + b * b;
         match v {
-            cs_core::Value::Number(cs_core::Number::Fixnum(n)) => {
+            cs_core::Value::Fixnum(n) => {
                 assert_eq!(n, expected, "ss({a},{b})");
             }
             other => panic!("ss({a},{b}): expected Fixnum({expected}), got {other:?}"),
@@ -326,7 +326,7 @@ fn unboxed_mul_overflow_requests_deopt() {
         "no deopt expected for sq(1000)"
     );
     match unsafe { NanboxValue(small).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 1_000_000),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 1_000_000),
         other => panic!("expected Fixnum(1000000), got {other:?}"),
     }
 

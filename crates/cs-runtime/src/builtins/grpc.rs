@@ -239,7 +239,7 @@ fn value_to_str(v: &Value, syms: &SymbolTable, who: &str) -> Result<String, Stri
 
 fn value_to_i64(v: &Value, who: &str) -> Result<i64, String> {
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => Ok(*n),
+        Value::Fixnum(n) => Ok(*n),
         other => Err(format!(
             "{}: expected fixnum, got {}",
             who,
@@ -568,7 +568,7 @@ pub fn b_grpc_serve(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Str
         let _ = value_to_i64(&args[2], "grpc-serve")?;
     }
     let (id, _bound) = primop_serve(&addr, pid)?;
-    Ok(Value::Number(cs_core::Number::Fixnum(id)))
+    Ok(Value::Fixnum(id))
 }
 
 /// `(grpc-serve-tls addr handler-pid cert-pem key-pem ca-pem require-client-cert?)`
@@ -608,7 +608,7 @@ pub fn b_grpc_serve_tls(args: &[Value], syms: &mut SymbolTable) -> Result<Value,
         &ca_pem,
         require_client_cert,
     )?;
-    Ok(Value::Number(cs_core::Number::Fixnum(id)))
+    Ok(Value::Fixnum(id))
 }
 
 pub fn b_grpc_server_stop(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {

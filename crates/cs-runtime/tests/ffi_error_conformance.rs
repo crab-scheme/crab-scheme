@@ -217,7 +217,7 @@ fn eval_continues_after_caught_ffi_error() {
                 other => panic!("{label}: expected 'caught, got {:?}", other),
             }
             match &*p.cdr.borrow() {
-                Value::Number(Number::Fixnum(123)) => {}
+                Value::Fixnum(123) => {}
                 other => panic!("{label}: expected 123 in cdr, got {:?}", other),
             }
         }

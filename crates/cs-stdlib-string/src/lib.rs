@@ -75,7 +75,7 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
+        Some(Value::Fixnum(v)) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum".into(),
             got: other.type_name().to_string(),

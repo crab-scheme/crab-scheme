@@ -152,7 +152,10 @@ fn random_bytes(name: &str, n: usize) -> Result<Vec<u8>, FfiError> {
 /// Read a non-negative integer count.
 fn expect_count(name: &str, args: &[Value], idx: usize) -> Result<usize, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(n)) => {
+        Some(
+            nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let n = nv.as_number().unwrap();
             let f = n.to_f64();
             if !f.is_finite() || f < 0.0 || f.fract() != 0.0 {
                 return Err(fail(format!(

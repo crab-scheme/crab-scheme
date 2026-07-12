@@ -102,7 +102,7 @@ fn pin_value_accessor_returns_correct_data() {
     let v = rt.eval_str("<pin>", "42").unwrap();
     let p = rt.pin(v);
     match p.value() {
-        Value::Number(Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected 42, got {:?}", other),
     }
 }

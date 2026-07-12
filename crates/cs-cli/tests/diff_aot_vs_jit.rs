@@ -155,11 +155,11 @@ fn run_via_jit(src: &str, entry: &str, cli_args: &[&str]) -> String {
 /// the Nb shim, so this only needs to handle the integer case.
 fn render_value(v: &Value) -> String {
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => n.to_string(),
+        Value::Fixnum(n) => n.to_string(),
         // Match the AOT binary's flonum fast path
         // (`println!("{}", f64::from_bits(...))`), which uses Rust's
         // f64 Display — e.g. 5.0 renders as "5", 1.5 as "1.5".
-        Value::Number(cs_core::Number::Flonum(x)) => format!("{x}"),
+        Value::Flonum(x) => format!("{x}"),
         other => panic!("diff_aot_vs_jit: unsupported Value variant {other:?}"),
     }
 }

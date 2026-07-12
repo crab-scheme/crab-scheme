@@ -163,8 +163,8 @@ fn io_fail(name: &str, path: &str, e: std::io::Error) -> FfiError {
 fn opt_max_bytes(args: &[Value], idx: usize) -> Result<u64, FfiError> {
     match args.get(idx) {
         None => Ok(DEFAULT_MAX_EXTRACTED),
-        Some(Value::Number(cs_core::Number::Fixnum(v))) if *v >= 0 => Ok(*v as u64),
-        Some(Value::Number(cs_core::Number::Fixnum(v))) => Err(FfiError::HostFailure(format!(
+        Some(Value::Fixnum(v)) if *v >= 0 => Ok(*v as u64),
+        Some(Value::Fixnum(v)) => Err(FfiError::HostFailure(format!(
             "max-output-bytes must be non-negative; got {}",
             v
         ))),

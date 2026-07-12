@@ -58,7 +58,7 @@ fn macro_generates_callable_two_arg_fn() {
         rt.register_host_procedure(rust_add_host_proc());
     });
     match (walker, vm) {
-        (Value::Number(Number::Fixnum(42)), Value::Number(Number::Fixnum(42))) => {}
+        (Value::Fixnum(42), Value::Fixnum(42)) => {}
         other => panic!("expected (42, 42) on both tiers, got {:?}", other),
     }
 }
@@ -82,7 +82,7 @@ fn macro_handles_list_arg() {
         rt.register_host_procedure(rust_sum_host_proc());
     });
     match (walker, vm) {
-        (Value::Number(Number::Fixnum(100)), Value::Number(Number::Fixnum(100))) => {}
+        (Value::Fixnum(100), Value::Fixnum(100)) => {}
         other => panic!("expected (100, 100) on both tiers, got {:?}", other),
     }
 }
@@ -93,7 +93,8 @@ fn macro_handles_result_ok() {
         rt.register_host_procedure(rust_divide_host_proc());
     });
     let check = |v: Value, label: &str| match v {
-        Value::Number(n) => {
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
             assert!((n.to_f64() - 5.0).abs() < 1e-9, "{label}: {:?}", n);
         }
         other => panic!("{}: expected number, got {:?}", label, other),

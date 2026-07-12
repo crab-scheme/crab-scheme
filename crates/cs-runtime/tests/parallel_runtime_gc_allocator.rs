@@ -51,14 +51,8 @@ fn leaf_values_report_leaf() {
     assert_eq!(allocator_tier(&Value::Eof), "leaf");
     assert_eq!(allocator_tier(&Value::Boolean(true)), "leaf");
     assert_eq!(allocator_tier(&Value::Character('z')), "leaf");
-    assert_eq!(
-        allocator_tier(&Value::Number(cs_core::Number::Fixnum(42))),
-        "leaf"
-    );
-    assert_eq!(
-        allocator_tier(&Value::Number(cs_core::Number::Flonum(1.5))),
-        "leaf"
-    );
+    assert_eq!(allocator_tier(&Value::Fixnum(42)), "leaf");
+    assert_eq!(allocator_tier(&Value::Flonum(1.5)), "leaf");
 }
 
 #[test]

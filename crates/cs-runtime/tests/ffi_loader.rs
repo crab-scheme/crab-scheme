@@ -63,7 +63,7 @@ fn load_shared_library_registers_example_magic() {
     );
     let result = rt.eval_str("<ffi_loader>", &prog).unwrap();
     match result {
-        Value::Number(Number::Fixnum(n)) => {
+        Value::Fixnum(n) => {
             assert_eq!(n, cs_ffi_example::EXAMPLE_MAGIC_VALUE);
         }
         other => panic!("expected fixnum 42, got {:?}", other),
@@ -96,7 +96,7 @@ fn rust_level_load_shared_library_works_directly() {
     rt.load_shared_library(path.to_str().unwrap()).unwrap();
     let result = rt.eval_str("<ffi_loader>", "(example-magic)").unwrap();
     match result {
-        Value::Number(Number::Fixnum(n)) => {
+        Value::Fixnum(n) => {
             assert_eq!(n, cs_ffi_example::EXAMPLE_MAGIC_VALUE);
         }
         other => panic!("expected fixnum 42, got {:?}", other),

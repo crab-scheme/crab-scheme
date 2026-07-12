@@ -98,7 +98,7 @@ fn expect_string(name: &str, args: &[Value], idx: usize) -> Result<String, FfiEr
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(cs_core::Number::Fixnum(v))) => Ok(*v),
+        Some(Value::Fixnum(v)) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum",
             got: other.type_name().to_string(),
@@ -215,7 +215,12 @@ fn http_server_accept(args: &[Value]) -> Result<Value, FfiError> {
     let server_id = expect_fixnum("http-server-accept", args, 0)?;
     let timeout = match args.get(1) {
         None => None,
-        Some(Value::Number(n)) => Some(Duration::from_millis(n.to_f64() as u64)),
+        Some(
+            nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let n = nv.as_number().unwrap();
+            Some(Duration::from_millis(n.to_f64() as u64))
+        }
         Some(other) => {
             return Err(FfiError::TypeMismatch {
                 expected: "fixnum or no arg",

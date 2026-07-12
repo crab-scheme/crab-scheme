@@ -348,7 +348,7 @@ extern "C" fn ffi_alloc_fixnum(rt: *mut RuntimeFfi, n: i64) -> ValueRef {
         return ValueRef { handle: 0 };
     }
     let runtime = unsafe { runtime_from_ffi_ptr(rt) };
-    let v = Value::Number(cs_core::Number::Fixnum(n));
+    let v = Value::Fixnum(n);
     ValueRef {
         handle: runtime.pin_raw(v),
     }
@@ -415,8 +415,8 @@ extern "C" fn ffi_value_kind(rt: *mut RuntimeFfi, v: ValueRef) -> ValueKind {
     match val {
         Value::Null => ValueKind::Null,
         Value::Boolean(_) => ValueKind::Boolean,
-        Value::Number(cs_core::Number::Fixnum(_)) => ValueKind::Fixnum,
-        Value::Number(cs_core::Number::Flonum(_)) => ValueKind::Flonum,
+        Value::Fixnum(_) => ValueKind::Fixnum,
+        Value::Flonum(_) => ValueKind::Flonum,
         Value::Character(_) => ValueKind::Character,
         Value::Symbol(_) => ValueKind::Symbol,
         Value::String(_) => ValueKind::String,
@@ -500,7 +500,7 @@ extern "C" fn ffi_decode_fixnum(rt: *mut RuntimeFfi, v: ValueRef, out: *mut i64)
     }
     let runtime = unsafe { runtime_from_ffi_ptr(rt) };
     match runtime.lookup_raw(v.handle) {
-        Some(Value::Number(cs_core::Number::Fixnum(n))) => {
+        Some(Value::Fixnum(n)) => {
             unsafe { *out = n };
             1
         }
@@ -514,7 +514,7 @@ extern "C" fn ffi_decode_flonum(rt: *mut RuntimeFfi, v: ValueRef, out: *mut f64)
     }
     let runtime = unsafe { runtime_from_ffi_ptr(rt) };
     match runtime.lookup_raw(v.handle) {
-        Some(Value::Number(cs_core::Number::Flonum(f))) => {
+        Some(Value::Flonum(f)) => {
             unsafe { *out = f };
             1
         }
@@ -685,7 +685,7 @@ mod tests {
         let mut rt = Runtime::new();
         let mut ctx = rt.ffi_context();
         let p = ctx.as_ffi_ptr();
-        let handle = rt.pin_raw(Value::Number(cs_core::Number::Fixnum(42)));
+        let handle = rt.pin_raw(Value::Fixnum(42));
         let mut out: i64 = 0;
         // SAFETY: p non-null; handle is live.
         let ok = unsafe { ((*p).decode_fixnum)(p, ValueRef { handle }, &mut out) };
@@ -712,7 +712,7 @@ mod tests {
         let mut rt = Runtime::new();
         let mut ctx = rt.ffi_context();
         let p = ctx.as_ffi_ptr();
-        let handle = rt.pin_raw(Value::Number(cs_core::Number::Flonum(3.14)));
+        let handle = rt.pin_raw(Value::Flonum(3.14));
         let mut out: f64 = 0.0;
         let ok = unsafe { ((*p).decode_flonum)(p, ValueRef { handle }, &mut out) };
         assert_eq!(ok, 1);
@@ -790,7 +790,7 @@ mod tests {
         let mut rt = Runtime::new();
         let mut ctx = rt.ffi_context();
         let p = ctx.as_ffi_ptr();
-        let h_fix = rt.pin_raw(Value::Number(cs_core::Number::Fixnum(1)));
+        let h_fix = rt.pin_raw(Value::Fixnum(1));
         let h_str = rt.pin_raw(Value::string("a"));
         let h_bool = rt.pin_raw(Value::Boolean(true));
         let h_null = rt.pin_raw(Value::Null);
@@ -866,7 +866,7 @@ mod tests {
         assert_ne!(r.handle, 0);
         let stored = rt.lookup_raw(r.handle).unwrap();
         match stored {
-            Value::Number(cs_core::Number::Fixnum(7)) => {}
+            Value::Fixnum(7) => {}
             other => panic!("expected fixnum 7, got {:?}", other),
         }
         rt.unpin_raw(r.handle);
@@ -921,7 +921,7 @@ mod tests {
 
         let walker = rt.eval_str("<test>", "(example-magic)").unwrap();
         match walker {
-            Value::Number(cs_core::Number::Fixnum(n)) => {
+            Value::Fixnum(n) => {
                 assert_eq!(n, cs_ffi_example::EXAMPLE_MAGIC_VALUE);
             }
             other => panic!("walker: expected fixnum, got {:?}", other),
@@ -929,7 +929,7 @@ mod tests {
 
         let vm = rt.eval_str_via_vm("<test>", "(example-magic)").unwrap();
         match vm {
-            Value::Number(cs_core::Number::Fixnum(n)) => {
+            Value::Fixnum(n) => {
                 assert_eq!(n, cs_ffi_example::EXAMPLE_MAGIC_VALUE);
             }
             other => panic!("vm: expected fixnum, got {:?}", other),
