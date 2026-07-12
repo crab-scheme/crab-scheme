@@ -797,8 +797,8 @@ pub fn encode_value_in(v: &Value, syms: &SymbolTable, out: &mut Vec<u8>) -> Resu
         }
         Value::Pair(p) => {
             out.push(10);
-            encode_value_in(&p.car.borrow(), syms, out)?;
-            encode_value_in(&p.cdr.borrow(), syms, out)?;
+            encode_value_in(&p.car(), syms, out)?;
+            encode_value_in(&p.cdr(), syms, out)?;
         }
         Value::Vector(items) => {
             out.push(11);
