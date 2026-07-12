@@ -471,6 +471,14 @@ impl<T: 'static> Gc<T> {
         // the strong count handoff.
         let this = ManuallyDrop::new(this);
         let rc = unsafe { Rc::from_raw(this.rc_ptr().as_ptr()) };
+        // cs-i6p.1: mirror the `Drop` impl's dealloc bookkeeping
+        // — `Rc::into_inner` frees the RcBox exactly when this
+        // was the last strong reference, same condition as
+        // `Drop`. Checked before the consuming call since
+        // `into_inner` takes `rc` by value.
+        if Rc::strong_count(&rc) == 1 {
+            crate::alloc_telemetry::record_dealloc::<T>();
+        }
         Rc::into_inner(rc)
     }
 }
@@ -650,7 +658,15 @@ impl<T> Drop for Gc<T> {
         // reconstructing the `Rc` and letting it drop here
         // runs the normal Rc teardown (decrement, free on
         // last drop).
-        unsafe { drop(Rc::from_raw(self.rc_ptr().as_ptr())) };
+        let rc = unsafe { Rc::from_raw(self.rc_ptr().as_ptr()) };
+        // cs-i6p.1: this drop only actually frees the RcBox
+        // (undoing the `record_alloc` from `Gc::new`) when it's
+        // the last strong reference. Check before dropping —
+        // `Rc::strong_count` still sees `rc`'s own count.
+        if Rc::strong_count(&rc) == 1 {
+            crate::alloc_telemetry::record_dealloc::<T>();
+        }
+        drop(rc);
     }
 }
 

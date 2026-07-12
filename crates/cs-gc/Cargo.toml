@@ -21,6 +21,11 @@ regions = ["dep:bumpalo"]
 # by reclaiming residual cycles. Off by default; opt in for
 # embedders that want it.
 tracing-cycle-collector = []
+# cs-i6p.1: per-type (pair/vector/string/closure/bignum/other)
+# allocation histogram in `cs_gc::alloc_telemetry::histogram`.
+# Off by default — the hot path in `record_alloc` stays a plain
+# thread-local add when this isn't enabled.
+alloc-histogram = []
 
 [dependencies]
 bumpalo = { workspace = true, optional = true }
