@@ -9,6 +9,12 @@ use cs_core::{Value, WriteMode};
 use cs_diag::{render_with, Diagnostic, SourceMap};
 use cs_runtime::Runtime;
 
+// cs-vnf.2 — mimalloc as the global allocator. wasm32 targets keep the
+// default allocator (see Cargo.toml's target-gated dependency).
+#[cfg(not(target_family = "wasm"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Execution tier selection for `--tier`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Tier {
