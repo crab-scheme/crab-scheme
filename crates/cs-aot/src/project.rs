@@ -243,6 +243,11 @@ fn render_cargo_toml(opts: &ProjectOptions) -> String {
             CsVmDep::Version(v) => format!("\"{v}\""),
         };
         s.push_str(&format!("cs-runtime = {rt_dep}\n"));
+        // cs-vnf.2 — L1 binaries get mimalloc like the CLI and the L3
+        // archive do; without this the generated project silently kept
+        // the system allocator. Nb mode only: RawI64 kernels barely
+        // allocate and their projects stay dependency-free.
+        s.push_str("mimalloc = \"0.1\"\n");
     }
     s.push('\n');
 
@@ -300,6 +305,12 @@ fn render_main_rs(
     // arith/cmp ops are calls into these helpers (nb_add_inline,
     // etc.) — see `nb_helpers_source` for the contract.
     if opts.mode == EmitMode::Nb {
+        // cs-vnf.2 — mirror cs-cli / cs-aot-rt: L1 binaries use
+        // mimalloc (matches the mimalloc dep render_cargo_toml emits).
+        src.push_str(
+            "#[global_allocator]\n\
+             static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;\n\n",
+        );
         src.push_str(nb_helpers_source());
     }
 
