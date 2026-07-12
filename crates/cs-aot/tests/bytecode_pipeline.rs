@@ -66,11 +66,7 @@ fn const_pool(vals: Vec<Value>) -> Rc<Vec<NanboxValue>> {
 fn fact_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
     let n = syms.intern("n");
     let fact = syms.intern("fact");
-    let consts = const_pool(vec![
-        Value::Number(Number::Fixnum(0)),
-        Value::Number(Number::Fixnum(1)),
-        Value::Number(Number::Fixnum(1)),
-    ]);
+    let consts = const_pool(vec![Value::Fixnum(0), Value::Fixnum(1), Value::Fixnum(1)]);
     let body = vec![
         VmInst::LoadVar(n),
         VmInst::Const(0),
@@ -121,11 +117,7 @@ fn workspace_target_dir() -> PathBuf {
 fn fib_lambda(syms: &mut SymbolTable) -> (CompiledLambda, cs_core::Symbol) {
     let n = syms.intern("n");
     let fib = syms.intern("fib");
-    let consts = const_pool(vec![
-        Value::Number(Number::Fixnum(2)),
-        Value::Number(Number::Fixnum(1)),
-        Value::Number(Number::Fixnum(2)),
-    ]);
+    let consts = const_pool(vec![Value::Fixnum(2), Value::Fixnum(1), Value::Fixnum(2)]);
     let body = vec![
         VmInst::LoadVar(n),
         VmInst::Const(0),

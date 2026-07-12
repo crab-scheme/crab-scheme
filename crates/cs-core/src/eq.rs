@@ -29,10 +29,10 @@ pub fn eq(a: &Value, b: &Value) -> bool {
         (Value::Identifier { name: n1, mark: m1 }, Value::Identifier { name: n2, mark: m2 }) => {
             n1 == n2 && m1 == m2
         }
-        (Value::Number(x), Value::Number(y)) => match (x, y) {
-            (crate::Number::Fixnum(a), crate::Number::Fixnum(b)) => a == b,
-            _ => false, // Other number types: eq? is implementation-defined; we say false unless identity.
-        },
+        // eq? on numbers is only true for two equal Fixnums; every
+        // other numeric shape (Flonum/Big/Rational) is eq?-false and
+        // falls through to the outer `_ => false`.
+        (Value::Fixnum(a), Value::Fixnum(b)) => a == b,
         (Value::String(x), Value::String(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Pair(x), Value::Pair(y)) => crate::Gc::ptr_eq(x, y),
         (Value::Vector(x), Value::Vector(y)) => crate::Gc::ptr_eq(x, y),
@@ -47,10 +47,10 @@ pub fn eq(a: &Value, b: &Value) -> bool {
 
 /// R6RS `eqv?`: like `eq?` but compares numbers and characters by value.
 pub fn eqv(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.is_exact() == y.is_exact() && x.eq_value(y),
-        _ => eq(a, b),
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        return x.is_exact() == y.is_exact() && x.eq_value(&y);
     }
+    eq(a, b)
 }
 
 /// R6RS `equal?`: structural equality. Handles cycles.
@@ -130,8 +130,8 @@ fn hash_eq(v: &Value) -> u64 {
         // `eq` only ever returns true for two Fixnums; every other number
         // shape is `eq?`-false against everything (see `eq` above), so any
         // fixed bucket for them is safe — they'll never match in-bucket.
-        Value::Number(Number::Fixnum(n)) => 0x400u64.wrapping_add(*n as u64),
-        Value::Number(_) => 0x4FF,
+        Value::Fixnum(n) => 0x400u64.wrapping_add(*n as u64),
+        Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_) => 0x4FF,
         Value::String(g) => 0x500u64.wrapping_add(crate::Gc::as_addr(g) as u64),
         Value::Pair(g) => 0x600u64.wrapping_add(crate::Gc::as_addr(g) as u64),
         Value::Vector(g) => 0x700u64.wrapping_add(crate::Gc::as_addr(g) as u64),
@@ -144,10 +144,10 @@ fn hash_eq(v: &Value) -> u64 {
 }
 
 fn hash_eqv(v: &Value) -> u64 {
-    match v {
-        Value::Number(n) => hash_number(n),
-        _ => hash_eq(v),
+    if let Some(n) = v.as_number() {
+        return hash_number(&n);
     }
+    hash_eq(v)
 }
 
 /// Hashes a number respecting exactness: an exact and inexact value that
@@ -222,7 +222,6 @@ fn hash_equal(v: &Value, depth: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Number;
 
     #[test]
     fn eq_fixnum() {
@@ -234,7 +233,7 @@ mod tests {
     #[test]
     fn eqv_compares_numbers() {
         let a = Value::fixnum(5);
-        let b = Value::Number(Number::Fixnum(5));
+        let b = Value::Fixnum(5);
         assert!(eqv(&a, &b));
     }
 
@@ -306,7 +305,7 @@ mod tests {
         // aren't required to differ, but the common case should, and
         // correctness never depends on it (eqv? still resolves collisions).
         let exact = Value::fixnum(2);
-        let inexact = Value::Number(Number::Flonum(2.0));
+        let inexact = Value::Flonum(2.0);
         assert!(!eqv(&exact, &inexact));
         assert_ne!(
             hash_value(&exact, HtEqKind::Eqv),

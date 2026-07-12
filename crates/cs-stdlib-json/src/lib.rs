@@ -99,7 +99,8 @@ fn value_to_json(v: &Value) -> Result<J, FfiError> {
     match v {
         Value::Null => Ok(J::Array(Vec::new())),
         Value::Boolean(b) => Ok(J::Bool(*b)),
-        Value::Number(n) => {
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
             let f = n.to_f64();
             if f.fract() == 0.0 && f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
                 Ok(J::Number((f as i64).into()))

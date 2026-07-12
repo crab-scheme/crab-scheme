@@ -115,20 +115,24 @@ fn render(directive: char, v: &Value, out: &mut String) -> Result<(), FfiError> 
             out.push('"');
         }
         ('a' | 's', Value::Character(c)) => out.push(*c),
-        ('a' | 's' | 'd', Value::Number(n)) => {
+        (
+            'a' | 's' | 'd',
+            nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let n = nv.as_number().unwrap();
             // ~a/~s/~d all defer to Number's Display impl, which
             // preserves precision across Fixnum/Big/Rat/Flonum.
             // ~d on a Flonum or Rat formats it as-is rather than
             // truncating to i64 (which silently corrupts ≥ 2^53).
             let _ = write!(out, "{}", n);
         }
-        ('x', Value::Number(cs_core::Number::Fixnum(v))) => {
+        ('x', Value::Fixnum(v)) => {
             let _ = write!(out, "{:x}", v);
         }
-        ('X', Value::Number(cs_core::Number::Fixnum(v))) => {
+        ('X', Value::Fixnum(v)) => {
             let _ = write!(out, "{:X}", v);
         }
-        ('x' | 'X', Value::Number(_)) => {
+        ('x' | 'X', Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
             return Err(FfiError::HostFailure(
                 "format-string: ~x/~X only formats fixnums (bignum/rational/flonum not supported)"
                     .into(),

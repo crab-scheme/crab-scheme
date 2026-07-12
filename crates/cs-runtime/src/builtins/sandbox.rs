@@ -149,7 +149,7 @@ fn b_make_wasm_sandbox(args: &[Value], syms: &mut cs_core::SymbolTable) -> Resul
     let id = register_sandbox(inst);
     Ok(new_vector(vec![
         Value::string(SANDBOX_TAG),
-        Value::Number(cs_core::Number::from_i64(id.into())),
+        Value::Fixnum(id.into()),
     ]))
 }
 

@@ -38,11 +38,11 @@ fn registered_proc_is_callable() {
     });
     let (walker, vm) = eval_with_proc(p, "(rust-add 2 3)");
     match walker {
-        Value::Number(Number::Fixnum(5)) => {}
+        Value::Fixnum(5) => {}
         other => panic!("walker: expected 5, got {:?}", other),
     }
     match vm {
-        Value::Number(Number::Fixnum(5)) => {}
+        Value::Fixnum(5) => {}
         other => panic!("vm: expected 5, got {:?}", other),
     }
 }
@@ -120,11 +120,11 @@ fn proc_taking_list_round_trips() {
     });
     let (walker, vm) = eval_with_proc(p, "(sum '(1 2 3 4 5))");
     match walker {
-        Value::Number(Number::Fixnum(15)) => {}
+        Value::Fixnum(15) => {}
         other => panic!("walker: expected 15, got {:?}", other),
     }
     match vm {
-        Value::Number(Number::Fixnum(15)) => {}
+        Value::Fixnum(15) => {}
         other => panic!("vm: expected 15, got {:?}", other),
     }
 }

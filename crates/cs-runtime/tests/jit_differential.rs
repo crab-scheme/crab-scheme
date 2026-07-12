@@ -57,7 +57,14 @@ fn assert_three_tier_agreement(defines: &[&str], warmup: Option<&str>, expr: &st
     let vm_jit = define_warm_eval(true, defines, warmup, expr);
 
     match (&walker, &vm_no_jit, &vm_jit) {
-        (Value::Number(a), Value::Number(b), Value::Number(c)) => {
+        (
+            av @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+            bv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+            cv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let a = av.as_number().unwrap();
+            let b = bv.as_number().unwrap();
+            let c = cv.as_number().unwrap();
             assert_eq!(a.to_f64(), b.to_f64(), "walker vs vm-no-jit");
             assert_eq!(b.to_f64(), c.to_f64(), "vm-no-jit vs vm-jit");
         }
@@ -93,7 +100,12 @@ fn diff_fact_12() {
 
     let walker = walker_eval(defines, "(fact 12)");
     match (&walker, &jit_result) {
-        (Value::Number(a), Value::Number(b)) => {
+        (
+            av @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+            bv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let a = av.as_number().unwrap();
+            let b = bv.as_number().unwrap();
             assert_eq!(a.to_f64(), b.to_f64());
             assert_eq!(a.to_f64(), 479001600.0);
         }
@@ -182,7 +194,12 @@ fn diff_loop_sum_1_to_n() {
     let jit_result = rt.eval_str_via_vm("<diff>", "(loop-sum 100)").unwrap();
     let walker = walker_eval(defines, "(loop-sum 100)");
     match (&walker, &jit_result) {
-        (Value::Number(a), Value::Number(b)) => {
+        (
+            av @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+            bv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let a = av.as_number().unwrap();
+            let b = bv.as_number().unwrap();
             assert_eq!(a.to_f64(), b.to_f64());
             assert_eq!(a.to_f64(), 5050.0);
         }
@@ -244,7 +261,12 @@ fn diff_gcd() {
     let jit_result = rt.eval_str_via_vm("<diff>", "(gcd 48 18)").unwrap();
     let walker = walker_eval(defines, "(gcd 48 18)");
     match (&walker, &jit_result) {
-        (Value::Number(a), Value::Number(b)) => {
+        (
+            av @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+            bv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let a = av.as_number().unwrap();
+            let b = bv.as_number().unwrap();
             assert_eq!(a.to_f64(), b.to_f64());
             assert_eq!(a.to_f64(), 6.0);
         }
@@ -288,7 +310,10 @@ fn diff_jit_with_free_var_lookup() {
     let jit = rt_jit.eval_str_via_vm("<diff>", "(add-base 42)").unwrap();
 
     let unwrap = |v: &Value, label: &str| match v {
-        Value::Number(n) => n.to_f64(),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64()
+        }
         other => panic!("{label}: not a number, got {:?}", other),
     };
     assert_eq!(unwrap(&walker, "walker"), unwrap(&vm, "vm"));
@@ -318,7 +343,10 @@ fn diff_jit_with_set_bang_through_env() {
     let jit = rt_jit.eval_str_via_vm("<diff>", "c").unwrap();
 
     let unwrap = |v: &Value, label: &str| match v {
-        Value::Number(n) => n.to_f64(),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64()
+        }
         other => panic!("{label}: not a number, got {:?}", other),
     };
     assert_eq!(unwrap(&walker, "walker"), unwrap(&jit, "jit"));
@@ -350,7 +378,10 @@ fn diff_pure_arithmetic_fast_path() {
     let dist2_walker = walker_eval(defines, "(dist2 10 3)");
 
     let extract = |v: &Value| match v {
-        Value::Number(n) => n.to_f64(),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64()
+        }
         other => panic!("expected number, got {:?}", other),
     };
     assert_eq!(extract(&triple_jit), extract(&triple_walker));
@@ -526,10 +557,9 @@ fn diff_real_to_flonum_returns_flonum() {
         let walker = walker_eval(defines, expr);
         // Flonum agreement on bit-pattern.
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(a)),
-                Value::Number(cs_core::Number::Flonum(b)),
-            ) => assert_eq!(a.to_bits(), b.to_bits(), "tier-disagreement on {}", expr),
+            (Value::Flonum(a), Value::Flonum(b)) => {
+                assert_eq!(a.to_bits(), b.to_bits(), "tier-disagreement on {}", expr)
+            }
             other => panic!("expected flonums on {}, got {:?}", expr, other),
         }
     }
@@ -572,10 +602,7 @@ fn diff_flonum_arithmetic() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(j)),
-                Value::Number(cs_core::Number::Flonum(w)),
-            ) => {
+            (Value::Flonum(j), Value::Flonum(w)) => {
                 assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -613,10 +640,7 @@ fn diff_flonum_comparison() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -654,10 +678,7 @@ fn diff_flonum_branch() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(j)),
-                Value::Number(cs_core::Number::Flonum(w)),
-            ) => {
+            (Value::Flonum(j), Value::Flonum(w)) => {
                 assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -705,10 +726,7 @@ fn diff_flonum_unary_and_minmax() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(j)),
-                Value::Number(cs_core::Number::Flonum(w)),
-            ) => {
+            (Value::Flonum(j), Value::Flonum(w)) => {
                 assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -804,10 +822,7 @@ fn diff_arg_side_flonum_passthrough() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(j)),
-                Value::Number(cs_core::Number::Flonum(w)),
-            ) => {
+            (Value::Flonum(j), Value::Flonum(w)) => {
                 assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -864,10 +879,7 @@ fn diff_flonum_rounding_ops() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(j)),
-                Value::Number(cs_core::Number::Flonum(w)),
-            ) => {
+            (Value::Flonum(j), Value::Flonum(w)) => {
                 assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -915,7 +927,7 @@ fn diff_jit_recompile_on_arg_type_change() {
     let flo_jit = rt.eval_str_via_vm("<diff>", "(sqr 3.5)").unwrap();
     let flo_walker = walker_eval(defines, "(sqr 3.5)");
     match (&flo_jit, &flo_walker) {
-        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
+        (Value::Flonum(j), Value::Flonum(w)) => {
             assert_eq!(j.to_bits(), w.to_bits());
             assert_eq!(*j, 12.25);
         }
@@ -1023,7 +1035,7 @@ fn diff_jit_let_loop_flonum_accumulator() {
     let jit = rt.eval_str_via_vm("<diff>", "(sumsq 5000)").unwrap();
     let walker = walker_eval(defines, "(sumsq 5000)");
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
+        (Value::Flonum(j), Value::Flonum(w)) => {
             assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on (sumsq 5000)");
             // sum of i*i for i in 0..5000 = 41654167500.0
             assert_eq!(*j, 41654167500.0);
@@ -1055,7 +1067,7 @@ fn diff_jit_tail_call_deep_recursion() {
     let jit = rt.eval_str_via_vm("<diff>", "(sumsq 250000)").unwrap();
     let walker = walker_eval(defines, "(sumsq 250000)");
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
+        (Value::Flonum(j), Value::Flonum(w)) => {
             assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on (sumsq 250000)");
         }
         other => panic!("expected flonums, got {:?}", other),
@@ -1095,10 +1107,7 @@ fn diff_jit_mixed_fixnum_flonum_arithmetic() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Flonum(j)),
-                Value::Number(cs_core::Number::Flonum(w)),
-            ) => {
+            (Value::Flonum(j), Value::Flonum(w)) => {
                 assert_eq!(j.to_bits(), w.to_bits(), "tier-mismatch on {}", expr);
                 assert_eq!(*j, *expected, "value mismatch on {}", expr);
             }
@@ -1140,12 +1149,7 @@ fn diff_jit_cons_pair_return() {
                 let wc = wp.car.borrow().clone();
                 let wd = wp.cdr.borrow().clone();
                 match (&jc, &wc, &jd, &wd) {
-                    (
-                        Value::Number(cs_core::Number::Fixnum(a)),
-                        Value::Number(cs_core::Number::Fixnum(b)),
-                        Value::Number(cs_core::Number::Fixnum(c)),
-                        Value::Number(cs_core::Number::Fixnum(d)),
-                    ) => {
+                    (Value::Fixnum(a), Value::Fixnum(b), Value::Fixnum(c), Value::Fixnum(d)) => {
                         assert_eq!(a, b);
                         assert_eq!(c, d);
                         assert_eq!(*a, *ec);
@@ -1244,7 +1248,7 @@ fn diff_jit_tail_recursive_length_acc() {
     let jit = rt.eval_str_via_vm("<diff>", &expr).unwrap();
     let walker = walker_eval(defines, &expr);
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 200);
         }
@@ -1288,7 +1292,7 @@ fn diff_jit_const_null_in_body() {
 
     // Pair input: car = 5.
     match &jit_pair {
-        Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, 5),
+        Value::Fixnum(n) => assert_eq!(*n, 5),
         other => panic!("expected fixnum 5, got {:?}", other),
     }
 
@@ -1302,10 +1306,7 @@ fn diff_jit_const_null_in_body() {
     // Walker agreement.
     let walker_pair = walker_eval(defines, "(head-or-empty (cons 5 6))");
     let walker_nil = walker_eval(defines, "(head-or-empty (quote ()))");
-    assert!(matches!(
-        walker_pair,
-        Value::Number(cs_core::Number::Fixnum(5))
-    ));
+    assert!(matches!(walker_pair, Value::Fixnum(5)));
     assert!(matches!(walker_nil, Value::Null));
 }
 
@@ -1359,10 +1360,7 @@ fn diff_jit_recursive_length() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", expr);
                 assert_eq!(*j, *expected, "wrong value on {}", expr);
             }
@@ -1416,10 +1414,7 @@ fn diff_jit_recursive_sum_list() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", expr);
                 assert_eq!(*j, *expected, "wrong value on {}", expr);
             }
@@ -1454,10 +1449,7 @@ fn diff_jit_arith_on_any_operand() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", expr);
                 assert_eq!(*j, *expected, "wrong value on {}", expr);
             }
@@ -1495,7 +1487,7 @@ fn diff_jit_mixed_tier_return() {
         .unwrap();
     let walker_pair = walker_eval(defines, "(head (cons 7 8) -1)");
     match (&jit_pair, &walker_pair) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 7);
         }
@@ -1507,7 +1499,7 @@ fn diff_jit_mixed_tier_return() {
     let jit_fb = rt.eval_str_via_vm("<diff>", "(head 0 42)").unwrap();
     let walker_fb = walker_eval(defines, "(head 0 42)");
     match (&jit_fb, &walker_fb) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 42);
         }
@@ -1541,7 +1533,7 @@ fn diff_jit_multi_use_any_param() {
     let jit_pair = rt.eval_str_via_vm("<diff>", "(head (cons 7 8))").unwrap();
     let walker_pair = walker_eval(defines, "(head (cons 7 8))");
     match (&jit_pair, &walker_pair) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 7);
         }
@@ -1586,10 +1578,7 @@ fn diff_jit_pair_predicate() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", expr);
                 assert_eq!(*j, *expected, "wrong value on {}", expr);
             }
@@ -1619,10 +1608,7 @@ fn diff_jit_null_predicate() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", expr);
                 assert_eq!(*j, expected, "wrong value on {}", expr);
             }
@@ -1663,10 +1649,7 @@ fn diff_jit_car_cdr_passthrough() {
         let jit = rt.eval_str_via_vm("<diff>", expr).unwrap();
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", expr);
                 assert_eq!(*j, *expected, "wrong value on {}", expr);
             }
@@ -1714,10 +1697,7 @@ fn diff_jit_eq_on_any_symbol() {
         ("miss", &jit_miss, &walker_miss, 0),
     ] {
         match (jit, walker) {
-            (
-                Value::Number(cs_core::Number::Fixnum(j)),
-                Value::Number(cs_core::Number::Fixnum(w)),
-            ) => {
+            (Value::Fixnum(j), Value::Fixnum(w)) => {
                 assert_eq!(j, w, "tier mismatch on {}", label);
                 assert_eq!(*j, expected, "wrong value on {}", label);
             }
@@ -1755,7 +1735,7 @@ fn diff_jit_unbox_flonum_via_car() {
 
     let walker = walker_eval(defines, "(head-add (cons 3.5 0))");
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Flonum(j)), Value::Number(cs_core::Number::Flonum(w))) => {
+        (Value::Flonum(j), Value::Flonum(w)) => {
             assert_eq!(j.to_bits(), w.to_bits(), "tier mismatch");
             assert!((j - 5.0).abs() < 1e-9, "expected 5.0, got {}", j);
         }
@@ -1852,14 +1832,14 @@ fn diff_jit_general_call_via_slow_path() {
     );
 
     match &result {
-        Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, 42),
+        Value::Fixnum(n) => assert_eq!(*n, 42),
         other => panic!("expected fixnum 42, got {:?}", other),
     }
 
     // Walker agreement.
     let walker = walker_eval(defines, "(outer 41)");
     match (&result, &walker) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
         }
         other => panic!("walker / jit disagree: {:?}", other),
@@ -1891,7 +1871,7 @@ fn diff_jit_vector_ref_from_make_vector() {
     );
     let walker = walker_eval(defines, "(vec-first 5)");
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 42);
         }
@@ -1922,7 +1902,7 @@ fn diff_jit_vector_length() {
     );
     let walker = walker_eval(defines, "(vlen 7)");
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 7);
         }
@@ -1956,7 +1936,7 @@ fn diff_jit_vector_pred() {
         after
     );
     match (&jit_vec, &jit_pair) {
-        (Value::Number(cs_core::Number::Fixnum(1)), Value::Number(cs_core::Number::Fixnum(0))) => {}
+        (Value::Fixnum(1), Value::Fixnum(0)) => {}
         other => panic!("expected (1, 0), got {:?}", other),
     }
 }
@@ -1992,7 +1972,7 @@ fn diff_jit_deopt_on_type_miss() {
     // Pair input: JIT path, should succeed.
     let jit_pair = rt.eval_str_via_vm("<diff>", "(head (cons 7 8))").unwrap();
     match &jit_pair {
-        Value::Number(cs_core::Number::Fixnum(7)) => {}
+        Value::Fixnum(7) => {}
         other => panic!("expected fixnum 7 from pair input, got {:?}", other),
     }
     let after_first = cs_vm::vm::jit_call_count();
@@ -2039,13 +2019,13 @@ fn diff_jit_ic_hot_path_dispatches_general_call() {
     assert!(after > 0, "outer never JITted (count={})", after);
 
     match result {
-        Value::Number(cs_core::Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected fixnum 42, got {:?}", other),
     }
 
     let walker = walker_eval(defines, "(outer 41)");
     match (&result, &walker) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w, "tier mismatch")
         }
         _ => panic!("type mismatch"),
@@ -2077,7 +2057,7 @@ fn diff_jit_string_length_via_make_string() {
     );
     let walker = walker_eval(defines, "(slen 5)");
     match (&jit, &walker) {
-        (Value::Number(cs_core::Number::Fixnum(j)), Value::Number(cs_core::Number::Fixnum(w))) => {
+        (Value::Fixnum(j), Value::Fixnum(w)) => {
             assert_eq!(j, w);
             assert_eq!(*j, 5);
         }
@@ -2146,7 +2126,7 @@ fn diff_jit_string_pred() {
         after
     );
     match (&jit_str, &jit_pair) {
-        (Value::Number(cs_core::Number::Fixnum(1)), Value::Number(cs_core::Number::Fixnum(0))) => {}
+        (Value::Fixnum(1), Value::Fixnum(0)) => {}
         other => panic!("expected (1, 0), got {:?}", other),
     }
 }
@@ -2196,7 +2176,7 @@ fn diff_jit_make_closure_in_body() {
         "mk never dispatched through JIT (count={after})"
     );
     match &result {
-        Value::Number(cs_core::Number::Fixnum(13)) => {}
+        Value::Fixnum(13) => {}
         other => panic!("expected 13, got {:?}", other),
     }
 }
@@ -2227,11 +2207,7 @@ fn diff_jit_length_walks_spine() {
         "len never dispatched through JIT (count={after})"
     );
     match (&r0, &r1, &r5) {
-        (
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(5)),
-        ) => {}
+        (Value::Fixnum(0), Value::Fixnum(1), Value::Fixnum(5)) => {}
         other => panic!("expected (0, 1, 5), got {:?}", other),
     }
 }
@@ -2265,12 +2241,7 @@ fn diff_jit_list_pred() {
         "is-list? never dispatched through JIT (count={after})"
     );
     match (&r_list, &r_null, &r_improper, &r_atom) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(1), Value::Fixnum(1), Value::Fixnum(0), Value::Fixnum(0)) => {}
         other => panic!("expected (1, 1, 0, 0), got {:?}", other),
     }
 }
@@ -2312,7 +2283,7 @@ fn diff_jit_reverse_allocates_new_spine() {
         r_empty
     );
     match (&len, &first) {
-        (Value::Number(cs_core::Number::Fixnum(4)), Value::Number(cs_core::Number::Fixnum(3))) => {}
+        (Value::Fixnum(4), Value::Fixnum(3)) => {}
         other => panic!("expected (4, 3), got {:?}", other),
     }
 }
@@ -2352,7 +2323,7 @@ fn diff_jit_memq_matches_by_eq() {
         "find never dispatched through JIT (count={after})"
     );
     match (&hit, &miss, &len) {
-        (Value::Symbol(_), Value::Boolean(false), Value::Number(cs_core::Number::Fixnum(2))) => {}
+        (Value::Symbol(_), Value::Boolean(false), Value::Fixnum(2)) => {}
         other => panic!("expected (Symbol(b), #f, 2), got {:?}", other),
     }
 }
@@ -2392,7 +2363,7 @@ fn diff_jit_assq_walks_alist() {
         "lookup never dispatched through JIT (count={after})"
     );
     match (&val, &miss) {
-        (Value::Number(cs_core::Number::Fixnum(2)), Value::Boolean(false)) => {}
+        (Value::Fixnum(2), Value::Boolean(false)) => {}
         other => panic!("expected (2, #f), got {:?}", other),
     }
 }
@@ -2438,10 +2409,7 @@ fn diff_jit_set_car_cdr_mutate_pair() {
         "mutate-car!/cdr! never dispatched through JIT (count={after})"
     );
     match (&new_car, &new_cdr) {
-        (
-            Value::Number(cs_core::Number::Fixnum(42)),
-            Value::Number(cs_core::Number::Fixnum(88)),
-        ) => {}
+        (Value::Fixnum(42), Value::Fixnum(88)) => {}
         other => panic!("expected (42, 88), got {:?}", other),
     }
 }
@@ -2483,12 +2451,7 @@ fn diff_jit_char_ordered_comparisons() {
         "char comparisons never dispatched through JIT (count={after})"
     );
     match (&lt_yes, &gt_no, &le_eq, &ge_eq) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-        ) => {}
+        (Value::Fixnum(1), Value::Fixnum(0), Value::Fixnum(1), Value::Fixnum(1)) => {}
         other => panic!("expected (1, 0, 1, 1), got {:?}", other),
     }
 }
@@ -2530,12 +2493,7 @@ fn diff_jit_memv_assv_eqv_search() {
         "memv/assv never dispatched through JIT (count={after})"
     );
     match (&mv_hit, &mv_miss, &av_hit, &av_miss) {
-        (
-            Value::Number(cs_core::Number::Fixnum(2)),
-            Value::Boolean(false),
-            Value::Symbol(_),
-            Value::Boolean(false),
-        ) => {}
+        (Value::Fixnum(2), Value::Boolean(false), Value::Symbol(_), Value::Boolean(false)) => {}
         other => panic!("expected (2, #f, Symbol(b), #f), got {:?}", other),
     }
 }
@@ -2600,12 +2558,7 @@ fn diff_jit_member_assoc_equal_search() {
         "member/assoc never dispatched through JIT (count={after})"
     );
     match (&m_hit_len, &m_miss, &a_hit, &a_miss) {
-        (
-            Value::Number(cs_core::Number::Fixnum(2)),
-            Value::Boolean(false),
-            Value::Symbol(_),
-            Value::Boolean(false),
-        ) => {}
+        (Value::Fixnum(2), Value::Boolean(false), Value::Symbol(_), Value::Boolean(false)) => {}
         other => panic!("expected (2, #f, Symbol(x), #f), got {:?}", other),
     }
 }
@@ -2656,12 +2609,12 @@ fn diff_jit_char_unicode_predicates() {
     );
     match (&alpha_a, &alpha_5, &numer_5, &numer_a, &white_sp, &white_a) {
         (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
         ) => {}
         other => panic!("expected (1,0,1,0,1,0), got {:?}", other),
     }
@@ -2721,12 +2674,12 @@ fn diff_jit_char_case_ops() {
     );
     match (&up_a, &dn_a, &uc_a, &uc_lower, &lc_a, &lc_upper) {
         (
-            Value::Number(cs_core::Number::Fixnum(65)),
-            Value::Number(cs_core::Number::Fixnum(97)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Fixnum(65),
+            Value::Fixnum(97),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
         ) => {}
         other => panic!("expected (65, 97, 1, 0, 1, 0), got {:?}", other),
     }
@@ -2772,12 +2725,7 @@ fn diff_jit_list_ref_and_tail() {
         "list-ref/list-tail never dispatched through JIT (count={after})"
     );
     match (&ref0, &ref2, &tail_len, &tail_id) {
-        (
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(30)),
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(4)),
-        ) => {}
+        (Value::Fixnum(10), Value::Fixnum(30), Value::Fixnum(3), Value::Fixnum(4)) => {}
         other => panic!("expected (10, 30, 3, 4), got {:?}", other),
     }
 }
@@ -2814,11 +2762,11 @@ fn diff_jit_modulo_signs() {
     );
     match (&pp, &np, &pn, &nn, &exact) {
         (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(-3)),
-            Value::Number(cs_core::Number::Fixnum(-1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Fixnum(1),
+            Value::Fixnum(3),
+            Value::Fixnum(-3),
+            Value::Fixnum(-1),
+            Value::Fixnum(0),
         ) => {}
         other => panic!("expected (1, 3, -3, -1, 0), got {:?}", other),
     }
@@ -2856,11 +2804,7 @@ fn diff_jit_substring_slices() {
         "substring never dispatched through JIT (count={after})"
     );
     match (&len, &empty_len, &full_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(5)),
-        ) => {}
+        (Value::Fixnum(5), Value::Fixnum(0), Value::Fixnum(5)) => {}
         other => panic!("expected (5, 0, 5), got {:?}", other),
     }
 }
@@ -2893,11 +2837,7 @@ fn diff_jit_list_copy_fresh_spine() {
         "list-copy never dispatched through JIT (count={after})"
     );
     match (&len, &first, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(4)),
-            Value::Number(cs_core::Number::Fixnum(100)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(4), Value::Fixnum(100), Value::Fixnum(0)) => {}
         other => panic!("expected (4, 100, 0), got {:?}", other),
     }
 }
@@ -2936,10 +2876,7 @@ fn diff_jit_list_set_mutates_indexed_pair() {
         "list-set! never dispatched through JIT (count={after})"
     );
     match (&r0, &r2) {
-        (
-            Value::Number(cs_core::Number::Fixnum(42)),
-            Value::Number(cs_core::Number::Fixnum(99)),
-        ) => {}
+        (Value::Fixnum(42), Value::Fixnum(99)) => {}
         other => panic!("expected (42, 99), got {:?}", other),
     }
 }
@@ -2973,11 +2910,11 @@ fn diff_jit_gcd_lcm_pair() {
     );
     match (&g_12_8, &g_neg, &g_zero, &l_12_8, &l_zero) {
         (
-            Value::Number(cs_core::Number::Fixnum(4)),
-            Value::Number(cs_core::Number::Fixnum(4)),
-            Value::Number(cs_core::Number::Fixnum(7)),
-            Value::Number(cs_core::Number::Fixnum(24)),
-            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Fixnum(4),
+            Value::Fixnum(4),
+            Value::Fixnum(7),
+            Value::Fixnum(24),
+            Value::Fixnum(0),
         ) => {}
         other => panic!("expected (4, 4, 7, 24, 0), got {:?}", other),
     }
@@ -3023,12 +2960,7 @@ fn diff_jit_bytevector_read_ops() {
         "bytevector ops never dispatched through JIT (count={after})"
     );
     match (&p_bv, &p_other, &len, &byte) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(42)),
-        ) => {}
+        (Value::Fixnum(1), Value::Fixnum(0), Value::Fixnum(10), Value::Fixnum(42)) => {}
         other => panic!("expected (1, 0, 10, 42), got {:?}", other),
     }
 }
@@ -3073,12 +3005,7 @@ fn diff_jit_bytevector_write_ops() {
         "bytevector write ops never dispatched through JIT (count={after})"
     );
     match (&len, &byte0, &byte7, &mutated) {
-        (
-            Value::Number(cs_core::Number::Fixnum(8)),
-            Value::Number(cs_core::Number::Fixnum(171)),
-            Value::Number(cs_core::Number::Fixnum(171)),
-            Value::Number(cs_core::Number::Fixnum(42)),
-        ) => {}
+        (Value::Fixnum(8), Value::Fixnum(171), Value::Fixnum(171), Value::Fixnum(42)) => {}
         other => panic!("expected (8, 171, 171, 42), got {:?}", other),
     }
 }
@@ -3113,10 +3040,7 @@ fn diff_jit_char_foldcase_and_titlecase() {
         "char-foldcase/titlecase never dispatched through JIT (count={after})"
     );
     match (&fc_a, &tc_a) {
-        (
-            Value::Number(cs_core::Number::Fixnum(97)),
-            Value::Number(cs_core::Number::Fixnum(65)),
-        ) => {}
+        (Value::Fixnum(97), Value::Fixnum(65)) => {}
         other => panic!("expected (97, 65), got {:?}", other),
     }
 }
@@ -3145,12 +3069,7 @@ fn diff_jit_expt_fixnum() {
         "expt never dispatched through JIT (count={after})"
     );
     match (&p_2_10, &p_3_5, &p_5_0, &p_0_3) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1024)),
-            Value::Number(cs_core::Number::Fixnum(243)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(1024), Value::Fixnum(243), Value::Fixnum(1), Value::Fixnum(0)) => {}
         other => panic!("expected (1024, 243, 1, 0), got {:?}", other),
     }
 }
@@ -3196,12 +3115,7 @@ fn diff_jit_char_ci_comparisons() {
         "char-ci ops never dispatched through JIT (count={after})"
     );
     match (&eq_aA, &eq_AB, &lt_Ab, &lt_Ba) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(1), Value::Fixnum(0), Value::Fixnum(1), Value::Fixnum(0)) => {}
         other => panic!("expected (1, 0, 1, 0), got {:?}", other),
     }
 }
@@ -3234,11 +3148,7 @@ fn diff_jit_digit_value_mixed_return() {
         "digit-value never dispatched through JIT (count={after})"
     );
     match (&d5, &d0, &dA) {
-        (
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Boolean(false),
-        ) => {}
+        (Value::Fixnum(5), Value::Fixnum(0), Value::Boolean(false)) => {}
         other => panic!("expected (5, 0, #f), got {:?}", other),
     }
 }
@@ -3275,11 +3185,7 @@ fn diff_jit_vector_list_conversions() {
         "vector<->list never dispatched through JIT (count={after})"
     );
     match (&v_len, &l_len, &first) {
-        (
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(4)),
-            Value::Number(cs_core::Number::Fixnum(42)),
-        ) => {}
+        (Value::Fixnum(5), Value::Fixnum(4), Value::Fixnum(42)) => {}
         other => panic!("expected (5, 4, 42), got {:?}", other),
     }
 }
@@ -3324,11 +3230,7 @@ fn diff_jit_string_list_conversions() {
         "string<->list never dispatched through JIT (count={after})"
     );
     match (&s_len, &l_len, &first) {
-        (
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(90)),
-        ) => {}
+        (Value::Fixnum(5), Value::Fixnum(3), Value::Fixnum(90)) => {}
         other => panic!("expected (5, 3, 90), got {:?}", other),
     }
 }
@@ -3369,7 +3271,7 @@ fn diff_jit_symbol_string_conversions() {
         "symbol<->string never dispatched through JIT (count={after})"
     );
     match (&len, &first) {
-        (Value::Number(cs_core::Number::Fixnum(5)), Value::Character('Z')) => {}
+        (Value::Fixnum(5), Value::Character('Z')) => {}
         other => panic!("expected (5, #\\Z), got {:?}", other),
     }
 }
@@ -3413,10 +3315,7 @@ fn diff_jit_vector_bytevector_fill() {
         "fill ops never dispatched through JIT (count={after})"
     );
     match (&v_res, &bv_res) {
-        (
-            Value::Number(cs_core::Number::Fixnum(77)),
-            Value::Number(cs_core::Number::Fixnum(200)),
-        ) => {}
+        (Value::Fixnum(77), Value::Fixnum(200)) => {}
         other => panic!("expected (77, 200), got {:?}", other),
     }
 }
@@ -3492,7 +3391,7 @@ fn diff_jit_string_vector_copy() {
         "string-copy/vector-copy never dispatched through JIT (count={after})"
     );
     match (&s_len, &v_len) {
-        (Value::Number(cs_core::Number::Fixnum(7)), Value::Number(cs_core::Number::Fixnum(5))) => {}
+        (Value::Fixnum(7), Value::Fixnum(5)) => {}
         other => panic!("expected (7, 5), got {:?}", other),
     }
 }
@@ -3526,8 +3425,7 @@ fn diff_jit_bytevector_copy() {
         "bytevector-copy never dispatched through JIT (count={after})"
     );
     match (&len, &byte) {
-        (Value::Number(cs_core::Number::Fixnum(9)), Value::Number(cs_core::Number::Fixnum(42))) => {
-        }
+        (Value::Fixnum(9), Value::Fixnum(42)) => {}
         other => panic!("expected (9, 42), got {:?}", other),
     }
 }
@@ -3560,12 +3458,7 @@ fn diff_jit_any_type_predicates() {
         "type predicates never dispatched through JIT (count={after})"
     );
     match (&p_yes, &p_no, &s_yes, &s_no) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(1), Value::Fixnum(0), Value::Fixnum(1), Value::Fixnum(0)) => {}
         other => panic!("expected (1, 0, 1, 0), got {:?}", other),
     }
 }
@@ -3604,12 +3497,12 @@ fn diff_jit_immediate_type_predicates_on_any() {
     );
     match (&c_yes, &c_no, &b_yes, &b_no, &fx_yes, &fx_no) {
         (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
+            Value::Fixnum(1),
+            Value::Fixnum(0),
         ) => {}
         other => panic!("expected (1,0,1,0,1,0), got {:?}", other),
     }
@@ -3640,8 +3533,7 @@ fn diff_jit_flonum_transcendentals() {
         "transcendentals never dispatched through JIT (count={after})"
     );
     match (&sin0, &exp0) {
-        (Value::Number(cs_core::Number::Flonum(a)), Value::Number(cs_core::Number::Flonum(b)))
-            if a.abs() < 1e-12 && (*b - 1.0).abs() < 1e-12 => {}
+        (Value::Flonum(a), Value::Flonum(b)) if a.abs() < 1e-12 && (*b - 1.0).abs() < 1e-12 => {}
         other => panic!("expected (sin 0 ≈ 0, exp 0 ≈ 1), got {:?}", other),
     }
 }
@@ -3674,11 +3566,8 @@ fn diff_jit_flonum_inverse_trig() {
         "inverse trig never dispatched through JIT (count={after})"
     );
     match (&asin0, &acos1, &atan0) {
-        (
-            Value::Number(cs_core::Number::Flonum(a)),
-            Value::Number(cs_core::Number::Flonum(b)),
-            Value::Number(cs_core::Number::Flonum(c)),
-        ) if a.abs() < 1e-12 && b.abs() < 1e-12 && c.abs() < 1e-12 => {}
+        (Value::Flonum(a), Value::Flonum(b), Value::Flonum(c))
+            if a.abs() < 1e-12 && b.abs() < 1e-12 && c.abs() < 1e-12 => {}
         other => panic!("expected (asin 0, acos 1, atan 0 all ≈ 0), got {:?}", other),
     }
 }
@@ -3743,7 +3632,7 @@ fn diff_jit_variadic_min_max() {
         "variadic min/max never dispatched through JIT (count={after})"
     );
     match (&mn, &mx) {
-        (Value::Number(cs_core::Number::Fixnum(3)), Value::Number(cs_core::Number::Fixnum(9))) => {}
+        (Value::Fixnum(3), Value::Fixnum(9)) => {}
         other => panic!("expected (3, 9), got {:?}", other),
     }
 }
@@ -3778,11 +3667,7 @@ fn diff_jit_variadic_bitwise() {
         "variadic bitwise never dispatched through JIT (count={after})"
     );
     match (&r_and, &r_or, &r_xor) {
-        (
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(7)),
-            Value::Number(cs_core::Number::Fixnum(7)),
-        ) => {}
+        (Value::Fixnum(3), Value::Fixnum(7), Value::Fixnum(7)) => {}
         other => panic!("expected (3, 7, 7), got {:?}", other),
     }
 }
@@ -3811,10 +3696,7 @@ fn diff_jit_bitwise_not() {
         "bitwise-not never dispatched through JIT (count={after})"
     );
     match (&r0, &r5) {
-        (
-            Value::Number(cs_core::Number::Fixnum(-1)),
-            Value::Number(cs_core::Number::Fixnum(-6)),
-        ) => {}
+        (Value::Fixnum(-1), Value::Fixnum(-6)) => {}
         other => panic!("expected (-1, -6), got {:?}", other),
     }
 }
@@ -3846,11 +3728,7 @@ fn diff_jit_arithmetic_shift() {
         "arithmetic-shift never dispatched through JIT (count={after})"
     );
     match (&r_l, &r_r, &r_neg) {
-        (
-            Value::Number(cs_core::Number::Fixnum(16)),
-            Value::Number(cs_core::Number::Fixnum(4)),
-            Value::Number(cs_core::Number::Fixnum(-4)),
-        ) => {}
+        (Value::Fixnum(16), Value::Fixnum(4), Value::Fixnum(-4)) => {}
         other => panic!("expected (16, 4, -4), got {:?}", other),
     }
 }
@@ -3886,12 +3764,7 @@ fn diff_jit_variadic_compares() {
         "variadic compares never dispatched through JIT (count={after})"
     );
     match (&lt_ok, &lt_no, &eq_ok, &eq_no) {
-        (
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(1), Value::Fixnum(0), Value::Fixnum(1), Value::Fixnum(0)) => {}
         other => panic!("expected (1,0,1,0), got {:?}", other),
     }
 }
@@ -3927,11 +3800,7 @@ fn diff_jit_variadic_list() {
         "variadic list never dispatched through JIT (count={after})"
     );
     match (&len, &first, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(3), Value::Fixnum(10), Value::Fixnum(0)) => {}
         other => panic!("expected (3, 10, 0), got {:?}", other),
     }
 }
@@ -3968,11 +3837,7 @@ fn diff_jit_variadic_vector() {
         "variadic vector never dispatched through JIT (count={after})"
     );
     match (&len, &elem, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(20)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(3), Value::Fixnum(20), Value::Fixnum(0)) => {}
         other => panic!("expected (3, 20, 0), got {:?}", other),
     }
 }
@@ -4009,11 +3874,7 @@ fn diff_jit_variadic_string() {
         "variadic string never dispatched through JIT (count={after})"
     );
     match (&len, &ch, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Character('y'),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(3), Value::Character('y'), Value::Fixnum(0)) => {}
         other => panic!("expected (3, #\\y, 0), got {:?}", other),
     }
 }
@@ -4050,11 +3911,7 @@ fn diff_jit_variadic_bytevector() {
         "variadic bytevector never dispatched through JIT (count={after})"
     );
     match (&len, &byte, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Number(cs_core::Number::Fixnum(20)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(3), Value::Fixnum(20), Value::Fixnum(0)) => {}
         other => panic!("expected (3, 20, 0), got {:?}", other),
     }
 }
@@ -4127,12 +3984,7 @@ fn diff_jit_variadic_append() {
         .eval_str_via_vm("<diff>", "(list-ref (ap3 '(1 2) '(3) '(4 5)) 4)")
         .unwrap();
     match (&lst, &empty, &len, &last) {
-        (
-            Value::Pair(_),
-            Value::Null,
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(5)),
-        ) => {}
+        (Value::Pair(_), Value::Null, Value::Fixnum(5), Value::Fixnum(5)) => {}
         other => panic!("expected (pair, null, 5, 5), got {:?}", other),
     }
 }
@@ -4169,11 +4021,7 @@ fn diff_jit_variadic_vector_append() {
         "variadic vector-append never dispatched through JIT (count={after})"
     );
     match (&len, &elem, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(4)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(5), Value::Fixnum(4), Value::Fixnum(0)) => {}
         other => panic!("expected (5, 4, 0), got {:?}", other),
     }
 }
@@ -4217,11 +4065,7 @@ fn diff_jit_variadic_bytevector_append() {
         "variadic bytevector-append never dispatched through JIT (count={after})"
     );
     match (&len, &byte, &empty_len) {
-        (
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Number(cs_core::Number::Fixnum(40)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(5), Value::Fixnum(40), Value::Fixnum(0)) => {}
         other => panic!("expected (5, 40, 0), got {:?}", other),
     }
 }
@@ -4284,11 +4128,11 @@ fn diff_jit_cxr_accessors() {
     );
     match (&caar, &cadr, &cddr, &caddr, &cadddr) {
         (
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(20)),
+            Value::Fixnum(10),
+            Value::Fixnum(20),
             Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(30)),
-            Value::Number(cs_core::Number::Fixnum(40)),
+            Value::Fixnum(30),
+            Value::Fixnum(40),
         ) => {}
         other => panic!("expected (10, 20, pair, 30, 40), got {:?}", other),
     }
@@ -4538,11 +4382,7 @@ fn diff_jit_sqrt_flo_and_fix() {
         "sqrt never dispatched through JIT (count={after})"
     );
     match (&f9, &f25, &f2) {
-        (
-            Value::Number(cs_core::Number::Flonum(a)),
-            Value::Number(cs_core::Number::Flonum(b)),
-            Value::Number(cs_core::Number::Flonum(c)),
-        ) => {
+        (Value::Flonum(a), Value::Flonum(b), Value::Flonum(c)) => {
             assert!((a - 3.0).abs() < 1e-12, "sqrt(9.0) = {a}");
             assert!((b - 5.0).abs() < 1e-12, "sqrt(25) = {b}");
             assert!((c - 2.0_f64.sqrt()).abs() < 1e-12, "sqrt(2.0) = {c}");
@@ -4581,11 +4421,7 @@ fn diff_jit_abs_min_max_flonum() {
         "flonum abs/max/min never dispatched through JIT (count={after})"
     );
     match (&a, &mx, &mn) {
-        (
-            Value::Number(cs_core::Number::Flonum(av)),
-            Value::Number(cs_core::Number::Flonum(mxv)),
-            Value::Number(cs_core::Number::Flonum(mnv)),
-        ) => {
+        (Value::Flonum(av), Value::Flonum(mxv), Value::Flonum(mnv)) => {
             assert!((av - 3.5).abs() < 1e-12, "abs -3.5 = {av}");
             assert!((mxv - 7.5).abs() < 1e-12, "max 2.5 7.5 = {mxv}");
             assert!((mnv - 2.5).abs() < 1e-12, "min 2.5 7.5 = {mnv}");
@@ -4630,11 +4466,7 @@ fn diff_jit_number_string_conversion() {
         other => panic!("expected (string, string), got {:?}", other),
     }
     match (&n_int, &n_flo, &n_bad) {
-        (
-            Value::Number(cs_core::Number::Fixnum(42)),
-            Value::Number(cs_core::Number::Flonum(f)),
-            Value::Boolean(false),
-        ) => {
+        (Value::Fixnum(42), Value::Flonum(f), Value::Boolean(false)) => {
             assert!((f - 1.5).abs() < 1e-12);
         }
         other => panic!("expected (42, 1.5, #f), got {:?}", other),
@@ -4683,11 +4515,11 @@ fn diff_jit_r7rs_div_ops() {
     );
     match (&r1, &r2, &r3, &r4, &r5) {
         (
-            Value::Number(cs_core::Number::Fixnum(-3)),
-            Value::Number(cs_core::Number::Fixnum(-1)),
-            Value::Number(cs_core::Number::Fixnum(-4)),
-            Value::Number(cs_core::Number::Fixnum(1)),
-            Value::Number(cs_core::Number::Fixnum(-4)),
+            Value::Fixnum(-3),
+            Value::Fixnum(-1),
+            Value::Fixnum(-4),
+            Value::Fixnum(1),
+            Value::Fixnum(-4),
         ) => {}
         other => panic!("expected (-3, -1, -4, 1, -4), got {:?}", other),
     }
@@ -4985,7 +4817,7 @@ fn diff_jit_square_flonum() {
     let flo = rt.eval_str_via_vm("<diff>", "(sq-flo 2.5)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&fix, &flo) {
-        (Value::Number(cs_core::Number::Fixnum(49)), Value::Number(cs_core::Number::Flonum(f))) => {
+        (Value::Fixnum(49), Value::Flonum(f)) => {
             assert!((f - 6.25).abs() < 1e-12, "sq-flo 2.5 = {f}");
         }
         other => panic!("expected (49, 6.25), got {:?}", other),
@@ -5015,7 +4847,7 @@ fn diff_jit_integer_ops_flonum_guard() {
     let mod_val = rt.eval_str_via_vm("<diff>", "(mod2 17 5)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&and_val, &mod_val) {
-        (Value::Number(cs_core::Number::Fixnum(8)), Value::Number(cs_core::Number::Fixnum(2))) => {}
+        (Value::Fixnum(8), Value::Fixnum(2)) => {}
         other => panic!("expected (8, 2), got {:?}", other),
     }
     // Flonum operand: bitwise-and 1.5 must error rather than
@@ -5056,12 +4888,7 @@ fn diff_jit_make_list_2arg() {
         "make-list never dispatched through JIT (count={after})"
     );
     match (&three_zero, &zero_x, &len, &elem) {
-        (
-            Value::Pair(_),
-            Value::Null,
-            Value::Number(cs_core::Number::Fixnum(5)),
-            Value::Symbol(_),
-        ) => {}
+        (Value::Pair(_), Value::Null, Value::Fixnum(5), Value::Symbol(_)) => {}
         other => panic!("expected (pair, null, 5, symbol), got {:?}", other),
     }
 }
@@ -5093,12 +4920,7 @@ fn diff_jit_iota_1arg() {
         "iota never dispatched through JIT (count={after})"
     );
     match (&lst, &zero, &len, &last) {
-        (
-            Value::Pair(_),
-            Value::Null,
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(9)),
-        ) => {}
+        (Value::Pair(_), Value::Null, Value::Fixnum(10), Value::Fixnum(9)) => {}
         other => panic!("expected (pair, null, 10, 9), got {:?}", other),
     }
 }
@@ -5132,11 +4954,7 @@ fn diff_jit_last_pair_and_last() {
         "last-pair/last never dispatched through JIT (count={after})"
     );
     match (&lp, &lp_car, &la) {
-        (
-            Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(30)),
-            Value::Number(cs_core::Number::Fixnum(30)),
-        ) => {}
+        (Value::Pair(_), Value::Fixnum(30), Value::Fixnum(30)) => {}
         other => panic!("expected (pair, 30, 30), got {:?}", other),
     }
 }
@@ -5256,7 +5074,7 @@ fn diff_jit_vector_copy_bang_3arg() {
             // index 0 stays 0, indices 1..=3 = 7, 8, 9, index 4 stays 0.
             for (i, expected) in [0i64, 7, 8, 9, 0].iter().enumerate() {
                 match &inner[i] {
-                    Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(*n, *expected),
+                    Value::Fixnum(n) => assert_eq!(*n, *expected),
                     other => panic!("at {i}: expected fixnum {expected}, got {:?}", other),
                 }
             }
@@ -5379,12 +5197,7 @@ fn diff_jit_string_contains() {
     let empty = rt.eval_str_via_vm("<diff>", "(sc \"hello\" \"\")").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&hit, &miss, &head, &empty) {
-        (
-            Value::Number(cs_core::Number::Fixnum(6)),
-            Value::Boolean(false),
-            Value::Number(cs_core::Number::Fixnum(0)),
-            Value::Number(cs_core::Number::Fixnum(0)),
-        ) => {}
+        (Value::Fixnum(6), Value::Boolean(false), Value::Fixnum(0), Value::Fixnum(0)) => {}
         other => panic!("expected (6, #f, 0, 0), got {:?}", other),
     }
 }
@@ -5453,7 +5266,7 @@ fn diff_jit_reverse_bang() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&r, &first) {
-        (Value::Pair(_), Value::Number(cs_core::Number::Fixnum(40))) => {}
+        (Value::Pair(_), Value::Fixnum(40)) => {}
         other => panic!("expected (pair, 40), got {:?}", other),
     }
 }
@@ -5487,12 +5300,7 @@ fn diff_jit_take_drop() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&t, &t_len, &d, &d_car) {
-        (
-            Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(4)),
-        ) => {}
+        (Value::Pair(_), Value::Fixnum(3), Value::Pair(_), Value::Fixnum(4)) => {}
         other => panic!("expected (pair, 3, pair, 4), got {:?}", other),
     }
 }
@@ -5581,12 +5389,7 @@ fn diff_jit_ordinal_accessors() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&a, &b, &c, &d) {
-        (
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(20)),
-            Value::Number(cs_core::Number::Fixnum(30)),
-            Value::Number(cs_core::Number::Fixnum(40)),
-        ) => {}
+        (Value::Fixnum(10), Value::Fixnum(20), Value::Fixnum(30), Value::Fixnum(40)) => {}
         other => panic!("expected (10, 20, 30, 40), got {:?}", other),
     }
 }
@@ -5641,12 +5444,12 @@ fn diff_jit_more_ordinal_accessors() {
     let _ = cs_vm::vm::jit_call_count();
     match (&r5, &r6, &r7, &r8, &r9, &r10) {
         (
-            Value::Number(cs_core::Number::Fixnum(50)),
-            Value::Number(cs_core::Number::Fixnum(60)),
-            Value::Number(cs_core::Number::Fixnum(70)),
-            Value::Number(cs_core::Number::Fixnum(80)),
-            Value::Number(cs_core::Number::Fixnum(90)),
-            Value::Number(cs_core::Number::Fixnum(100)),
+            Value::Fixnum(50),
+            Value::Fixnum(60),
+            Value::Fixnum(70),
+            Value::Fixnum(80),
+            Value::Fixnum(90),
+            Value::Fixnum(100),
         ) => {}
         other => panic!("expected (50..100), got {:?}", other),
     }
@@ -5683,7 +5486,7 @@ fn diff_jit_concatenate_and_not_pair_p() {
     match (&c, &c_len, &np_t, &np_f, &np_null) {
         (
             Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(5)),
+            Value::Fixnum(5),
             Value::Boolean(true),
             Value::Boolean(false),
             Value::Boolean(true),
@@ -5715,12 +5518,7 @@ fn diff_jit_iota_2arg() {
     let zero = rt.eval_str_via_vm("<diff>", "(io2 0 10)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&lst, &first, &last, &zero) {
-        (
-            Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(100)),
-            Value::Number(cs_core::Number::Fixnum(103)),
-            Value::Null,
-        ) => {}
+        (Value::Pair(_), Value::Fixnum(100), Value::Fixnum(103), Value::Null) => {}
         other => panic!("expected (pair, 100, 103, null), got {:?}", other),
     }
 }
@@ -5751,12 +5549,7 @@ fn diff_jit_iota_3arg() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&l, &first, &last, &neg) {
-        (
-            Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(10)),
-            Value::Number(cs_core::Number::Fixnum(22)),
-            Value::Number(cs_core::Number::Fixnum(80)),
-        ) => {}
+        (Value::Pair(_), Value::Fixnum(10), Value::Fixnum(22), Value::Fixnum(80)) => {}
         other => panic!("expected (pair, 10, 22, 80), got {:?}", other),
     }
 }
@@ -5827,12 +5620,7 @@ fn diff_jit_string_split_2arg() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match (&parts, &len, &first, &char_sep_len) {
-        (
-            Value::Pair(_),
-            Value::Number(cs_core::Number::Fixnum(3)),
-            Value::String(fs),
-            Value::Number(cs_core::Number::Fixnum(3)),
-        ) => {
+        (Value::Pair(_), Value::Fixnum(3), Value::String(fs), Value::Fixnum(3)) => {
             assert_eq!(&*fs.borrow(), "foo");
         }
         other => panic!("expected (pair, 3, \"foo\", 3), got {:?}", other),
@@ -6019,11 +5807,11 @@ fn diff_jit_string_index_family() {
         .eval_str_via_vm("<diff>", "(sir \"hello\" #\\z)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&cr_hit, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&cr_hit, Value::Fixnum(8)));
     assert!(matches!(&cr_miss, Value::Boolean(false)));
-    assert!(matches!(&i_hit, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&i_hit, Value::Fixnum(2)));
     assert!(matches!(&i_miss, Value::Boolean(false)));
-    assert!(matches!(&ir_hit, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&ir_hit, Value::Fixnum(3)));
     assert!(matches!(&ir_miss, Value::Boolean(false)));
 }
 
@@ -6065,10 +5853,7 @@ fn diff_jit_bytevector_utf8_conversion() {
     let _ = cs_vm::vm::jit_call_count();
     match &lst {
         Value::Pair(p) => {
-            assert!(matches!(
-                p.car.borrow().clone(),
-                Value::Number(cs_core::Number::Fixnum(65))
-            ));
+            assert!(matches!(p.car.borrow().clone(), Value::Fixnum(65)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
@@ -6116,24 +5901,24 @@ fn diff_jit_log2_atan2() {
     let _ = cs_vm::vm::jit_call_count();
     // log_2(8) = 3
     match &l8 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 3.0).abs() < 1e-9),
         other => panic!("expected flonum 3.0, got {:?}", other),
     }
     // log_10(100) = 2
     match &l100 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 2.0).abs() < 1e-9),
         other => panic!("expected flonum 2.0, got {:?}", other),
     }
     // atan2(1,1) = π/4 ≈ 0.7854
     match &a45 {
-        Value::Number(cs_core::Number::Flonum(f)) => {
+        Value::Flonum(f) => {
             assert!((f - std::f64::consts::FRAC_PI_4).abs() < 1e-9)
         }
         other => panic!("expected π/4, got {:?}", other),
     }
     // atan2(0,1) = 0
     match &a0 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!(f.abs() < 1e-9),
+        Value::Flonum(f) => assert!(f.abs() < 1e-9),
         other => panic!("expected 0.0, got {:?}", other),
     }
 }
@@ -6166,12 +5951,12 @@ fn diff_jit_bitwise_bit_count_length() {
     let l1 = rt.eval_str_via_vm("<diff>", "(bl 1)").unwrap();
     let l0 = rt.eval_str_via_vm("<diff>", "(bl 0)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&c7, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&c255, Value::Number(cs_core::Number::Fixnum(8))));
-    assert!(matches!(&c0, Value::Number(cs_core::Number::Fixnum(0))));
-    assert!(matches!(&l16, Value::Number(cs_core::Number::Fixnum(5))));
-    assert!(matches!(&l1, Value::Number(cs_core::Number::Fixnum(1))));
-    assert!(matches!(&l0, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&c7, Value::Fixnum(3)));
+    assert!(matches!(&c255, Value::Fixnum(8)));
+    assert!(matches!(&c0, Value::Fixnum(0)));
+    assert!(matches!(&l16, Value::Fixnum(5)));
+    assert!(matches!(&l1, Value::Fixnum(1)));
+    assert!(matches!(&l0, Value::Fixnum(0)));
 }
 
 #[test]
@@ -6212,9 +5997,9 @@ fn diff_jit_bitwise_shift_and_bit_set_p() {
     // Out-of-range
     let bo = rt.eval_str_via_vm("<diff>", "(bs 5 100)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&s1, Value::Number(cs_core::Number::Fixnum(8))));
-    assert!(matches!(&s2, Value::Number(cs_core::Number::Fixnum(4))));
-    assert!(matches!(&s3, Value::Number(cs_core::Number::Fixnum(-2))));
+    assert!(matches!(&s1, Value::Fixnum(8)));
+    assert!(matches!(&s2, Value::Fixnum(4)));
+    assert!(matches!(&s3, Value::Fixnum(-2)));
     assert!(matches!(&b0, Value::Boolean(true)));
     assert!(matches!(&b1, Value::Boolean(false)));
     assert!(matches!(&b2, Value::Boolean(true)));
@@ -6260,13 +6045,10 @@ fn diff_jit_bytevector_s8_ref_set() {
         .eval_str_via_vm("<diff>", "(ss (make-bytevector 4 0) 2 -42)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&neg, Value::Number(cs_core::Number::Fixnum(-128))));
-    assert!(matches!(&pos, Value::Number(cs_core::Number::Fixnum(127))));
-    assert!(matches!(&neg1, Value::Number(cs_core::Number::Fixnum(-1))));
-    assert!(matches!(
-        &setget,
-        Value::Number(cs_core::Number::Fixnum(-42))
-    ));
+    assert!(matches!(&neg, Value::Fixnum(-128)));
+    assert!(matches!(&pos, Value::Fixnum(127)));
+    assert!(matches!(&neg1, Value::Fixnum(-1)));
+    assert!(matches!(&setget, Value::Fixnum(-42)));
 }
 
 #[test]
@@ -6318,15 +6100,9 @@ fn diff_jit_bytevector_u16_s16_native() {
         .eval_str_via_vm("<diff>", "(ss (make-bytevector 4 0) 0 -30000)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&uw, Value::Number(cs_core::Number::Fixnum(60000))));
-    assert!(matches!(
-        &sw_pos,
-        Value::Number(cs_core::Number::Fixnum(30000))
-    ));
-    assert!(matches!(
-        &sw_neg,
-        Value::Number(cs_core::Number::Fixnum(-30000))
-    ));
+    assert!(matches!(&uw, Value::Fixnum(60000)));
+    assert!(matches!(&sw_pos, Value::Fixnum(30000)));
+    assert!(matches!(&sw_neg, Value::Fixnum(-30000)));
 }
 
 #[test]
@@ -6368,18 +6144,9 @@ fn diff_jit_bytevector_u32_s32_native() {
         .eval_str_via_vm("<diff>", "(ss (make-bytevector 8 0) 4 -2000000000)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(
-        &uw,
-        Value::Number(cs_core::Number::Fixnum(4000000000))
-    ));
-    assert!(matches!(
-        &sw_pos,
-        Value::Number(cs_core::Number::Fixnum(2000000000))
-    ));
-    assert!(matches!(
-        &sw_neg,
-        Value::Number(cs_core::Number::Fixnum(-2000000000))
-    ));
+    assert!(matches!(&uw, Value::Fixnum(4000000000)));
+    assert!(matches!(&sw_pos, Value::Fixnum(2000000000)));
+    assert!(matches!(&sw_neg, Value::Fixnum(-2000000000)));
 }
 
 #[test]
@@ -6420,12 +6187,12 @@ fn diff_jit_bytevector_ieee_native() {
     let _ = cs_vm::vm::jit_call_count();
     // f32 roundtrip exact for 2.5 (representable)
     match &s {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.5).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 2.5).abs() < 1e-9),
         other => panic!("expected flonum, got {:?}", other),
     }
     // f64 roundtrip exact
     match &d {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.14159265).abs() < 1e-12),
+        Value::Flonum(f) => assert!((f - 3.14159265).abs() < 1e-12),
         other => panic!("expected flonum, got {:?}", other),
     }
 }
@@ -6479,18 +6246,9 @@ fn diff_jit_bytevector_u64_s64_native() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     // i64::MAX
-    assert!(matches!(
-        &u,
-        Value::Number(cs_core::Number::Fixnum(9223372036854775807))
-    ));
-    assert!(matches!(
-        &sp,
-        Value::Number(cs_core::Number::Fixnum(9223372036854775807))
-    ));
-    assert!(matches!(
-        &sn,
-        Value::Number(cs_core::Number::Fixnum(-9223372036854775808))
-    ));
+    assert!(matches!(&u, Value::Fixnum(9223372036854775807)));
+    assert!(matches!(&sp, Value::Fixnum(9223372036854775807)));
+    assert!(matches!(&sn, Value::Fixnum(-9223372036854775808)));
 }
 
 #[test]
@@ -6590,11 +6348,11 @@ fn diff_jit_fx_arith_and_compare() {
     let ge_gt = rt.eval_str_via_vm("<diff>", "(ge 5 4)").unwrap();
     let ge_lt = rt.eval_str_via_vm("<diff>", "(ge 3 4)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&plus, Value::Number(cs_core::Number::Fixnum(42))));
-    assert!(matches!(&minus, Value::Number(cs_core::Number::Fixnum(42))));
-    assert!(matches!(&times, Value::Number(cs_core::Number::Fixnum(42))));
-    assert!(matches!(&mx, Value::Number(cs_core::Number::Fixnum(12))));
-    assert!(matches!(&mn, Value::Number(cs_core::Number::Fixnum(5))));
+    assert!(matches!(&plus, Value::Fixnum(42)));
+    assert!(matches!(&minus, Value::Fixnum(42)));
+    assert!(matches!(&times, Value::Fixnum(42)));
+    assert!(matches!(&mx, Value::Fixnum(12)));
+    assert!(matches!(&mn, Value::Fixnum(5)));
     assert!(matches!(&eq_t, Value::Boolean(true)));
     assert!(matches!(&eq_f, Value::Boolean(false)));
     assert!(matches!(&lt, Value::Boolean(true)));
@@ -6645,17 +6403,17 @@ fn diff_jit_fx_bitwise_aliases() {
     let s_f = rt.eval_str_via_vm("<diff>", "(s 5 1)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     // 12 & 10 = 8
-    assert!(matches!(&a, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&a, Value::Fixnum(8)));
     // 12 | 3 = 15
-    assert!(matches!(&o, Value::Number(cs_core::Number::Fixnum(15))));
+    assert!(matches!(&o, Value::Fixnum(15)));
     // 12 ^ 5 = 9
-    assert!(matches!(&x, Value::Number(cs_core::Number::Fixnum(9))));
+    assert!(matches!(&x, Value::Fixnum(9)));
     // !0 = -1
-    assert!(matches!(&n, Value::Number(cs_core::Number::Fixnum(-1))));
+    assert!(matches!(&n, Value::Fixnum(-1)));
     // popcount(255) = 8
-    assert!(matches!(&c, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&c, Value::Fixnum(8)));
     // length(16) = 5
-    assert!(matches!(&l, Value::Number(cs_core::Number::Fixnum(5))));
+    assert!(matches!(&l, Value::Fixnum(5)));
     assert!(matches!(&s_t, Value::Boolean(true)));
     assert!(matches!(&s_f, Value::Boolean(false)));
 }
@@ -6690,18 +6448,18 @@ fn diff_jit_fx_shift_and_first_bit() {
     let f0 = rt.eval_str_via_vm("<diff>", "(fb 0)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     // arithmetic-shift: positive count = left, negative = right
-    assert!(matches!(&h_pos, Value::Number(cs_core::Number::Fixnum(8))));
-    assert!(matches!(&h_neg, Value::Number(cs_core::Number::Fixnum(4))));
+    assert!(matches!(&h_pos, Value::Fixnum(8)));
+    assert!(matches!(&h_neg, Value::Fixnum(4)));
     // shift-left 1<<3 = 8
-    assert!(matches!(&l, Value::Number(cs_core::Number::Fixnum(8))));
+    assert!(matches!(&l, Value::Fixnum(8)));
     // shift-right 16>>2 = 4
-    assert!(matches!(&r, Value::Number(cs_core::Number::Fixnum(4))));
+    assert!(matches!(&r, Value::Fixnum(4)));
     // trailing zeros: 8 = 0b1000 -> 3
-    assert!(matches!(&f8, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&f8, Value::Fixnum(3)));
     // 1 -> 0
-    assert!(matches!(&f1, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&f1, Value::Fixnum(0)));
     // 0 -> -1
-    assert!(matches!(&f0, Value::Number(cs_core::Number::Fixnum(-1))));
+    assert!(matches!(&f0, Value::Fixnum(-1)));
 }
 
 #[test]
@@ -6762,19 +6520,19 @@ fn diff_jit_fl_arith_compare_predicates() {
     let n_t = rt.eval_str_via_vm("<diff>", "(n -0.5)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match &add {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 4.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 4.0).abs() < 1e-9),
         other => panic!("expected 4.0, got {:?}", other),
     }
     match &sub {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 3.5).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 3.5).abs() < 1e-9),
         other => panic!("expected 3.5, got {:?}", other),
     }
     match &mul {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 10.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 10.0).abs() < 1e-9),
         other => panic!("expected 10.0, got {:?}", other),
     }
     match &div {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.5).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 2.5).abs() < 1e-9),
         other => panic!("expected 2.5, got {:?}", other),
     }
     assert!(matches!(&eq_t, Value::Boolean(true)));
@@ -6847,36 +6605,36 @@ fn diff_jit_fl_trig_round_predicates() {
     let nan_f = rt.eval_str_via_vm("<diff>", "(nn 1.0)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match &sin0 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!(f.abs() < 1e-9),
+        Value::Flonum(f) => assert!(f.abs() < 1e-9),
         other => panic!("expected 0.0, got {:?}", other),
     }
     match &cos0 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 1.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 1.0).abs() < 1e-9),
         other => panic!("expected 1.0, got {:?}", other),
     }
     match &exp0 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 1.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 1.0).abs() < 1e-9),
         other => panic!("expected 1.0, got {:?}", other),
     }
     match &log1 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!(f.abs() < 1e-9),
+        Value::Flonum(f) => assert!(f.abs() < 1e-9),
         other => panic!("expected 0.0, got {:?}", other),
     }
     match &f15 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 1.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 1.0).abs() < 1e-9),
         other => panic!("expected 1.0, got {:?}", other),
     }
     match &c15 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 2.0).abs() < 1e-9),
         other => panic!("expected 2.0, got {:?}", other),
     }
     match &t_neg {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - -1.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - -1.0).abs() < 1e-9),
         other => panic!("expected -1.0, got {:?}", other),
     }
     // banker's rounding: 2.5 -> 2
     match &r_half {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 2.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 2.0).abs() < 1e-9),
         other => panic!("expected 2.0, got {:?}", other),
     }
     assert!(matches!(&fin_t, Value::Boolean(true)));
@@ -6918,7 +6676,7 @@ fn diff_jit_flexpt_parity_and_fixnum_to_flonum() {
     let _ = cs_vm::vm::jit_call_count();
     // 2^8 = 256
     match &p {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 256.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 256.0).abs() < 1e-9),
         other => panic!("expected 256.0, got {:?}", other),
     }
     assert!(matches!(&e_t, Value::Boolean(true)));
@@ -6927,7 +6685,7 @@ fn diff_jit_flexpt_parity_and_fixnum_to_flonum() {
     assert!(matches!(&o_t, Value::Boolean(true)));
     assert!(matches!(&o_f, Value::Boolean(false)));
     match &f42 {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!((f - 42.0).abs() < 1e-9),
+        Value::Flonum(f) => assert!((f - 42.0).abs() < 1e-9),
         other => panic!("expected 42.0, got {:?}", other),
     }
 }
@@ -6966,22 +6724,22 @@ fn diff_jit_string_titlecase_and_hashes() {
     }
     // string-hash should be non-zero Fixnum
     let sh_val = match &sh {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected Fixnum, got {:?}", other),
     };
     let sh_val2 = match &sh_consistent {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected Fixnum, got {:?}", other),
     };
     let sh_diff_val = match &sh_diff {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected Fixnum, got {:?}", other),
     };
     assert_eq!(sh_val, sh_val2, "string-hash deterministic");
     assert_ne!(sh_val, sh_diff_val, "different strings hash differently");
     assert!(sh_val >= 0, "string-hash positive");
     match &yh {
-        Value::Number(cs_core::Number::Fixnum(v)) => assert!(*v >= 0),
+        Value::Fixnum(v) => assert!(*v >= 0),
         other => panic!("expected Fixnum, got {:?}", other),
     }
 }
@@ -7041,10 +6799,7 @@ fn diff_jit_port_subtype_predicates_and_list_head() {
     // list-head of 5-element list, n=3 => (10 20 30)
     match &lh {
         Value::Pair(p) => {
-            assert!(matches!(
-                p.car.borrow().clone(),
-                Value::Number(cs_core::Number::Fixnum(10))
-            ));
+            assert!(matches!(p.car.borrow().clone(), Value::Fixnum(10)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
@@ -7116,16 +6871,16 @@ fn diff_jit_div_mod_euclid() {
     let fm = rt.eval_str_via_vm("<diff>", "(fm 17 5)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     // 10 div 3 = 3 (rounds toward -inf)
-    assert!(matches!(&dpos, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&dpos, Value::Fixnum(3)));
     // -7 div 2 = -4 (rounds toward -inf: -3.5 → -4)
-    assert!(matches!(&dneg, Value::Number(cs_core::Number::Fixnum(-4))));
+    assert!(matches!(&dneg, Value::Fixnum(-4)));
     // 10 mod 3 = 1
-    assert!(matches!(&mpos, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&mpos, Value::Fixnum(1)));
     // -7 mod 2 = 1 (non-negative remainder)
-    assert!(matches!(&mneg, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&mneg, Value::Fixnum(1)));
     // 17 fxdiv 5 = 3, fxmod = 2
-    assert!(matches!(&fd, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&fm, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&fd, Value::Fixnum(3)));
+    assert!(matches!(&fm, Value::Fixnum(2)));
 }
 
 #[test]
@@ -7205,8 +6960,8 @@ fn diff_jit_hashtable_size_and_mutable() {
         .eval_str_via_vm("<diff>", "(mu (make-eqv-hashtable))")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&empty, Value::Number(cs_core::Number::Fixnum(0))));
-    assert!(matches!(&pop, Value::Number(cs_core::Number::Fixnum(3))));
+    assert!(matches!(&empty, Value::Fixnum(0)));
+    assert!(matches!(&pop, Value::Fixnum(3)));
     assert!(matches!(&mutable, Value::Boolean(true)));
 }
 
@@ -7251,7 +7006,7 @@ fn diff_jit_hashtable_keys_values() {
                 .borrow()
                 .iter()
                 .filter_map(|x| match x {
-                    Value::Number(cs_core::Number::Fixnum(n)) => Some(*n),
+                    Value::Fixnum(n) => Some(*n),
                     _ => None,
                 })
                 .collect();
@@ -7304,16 +7059,10 @@ fn diff_jit_numerator_denominator_and_clear() {
         .unwrap();
     let cleared = rt.eval_str_via_vm("<diff>", "(sz-after-clear ht)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&num42, Value::Number(cs_core::Number::Fixnum(42))));
-    assert!(matches!(
-        &num_neg,
-        Value::Number(cs_core::Number::Fixnum(-7))
-    ));
-    assert!(matches!(&den42, Value::Number(cs_core::Number::Fixnum(1))));
-    assert!(matches!(
-        &cleared,
-        Value::Number(cs_core::Number::Fixnum(0))
-    ));
+    assert!(matches!(&num42, Value::Fixnum(42)));
+    assert!(matches!(&num_neg, Value::Fixnum(-7)));
+    assert!(matches!(&den42, Value::Fixnum(1)));
+    assert!(matches!(&cleared, Value::Fixnum(0)));
 }
 
 #[test]
@@ -7348,21 +7097,21 @@ fn diff_jit_equal_hash_and_hashtable_to_alist() {
     let alist = rt.eval_str_via_vm("<diff>", "(h2a ht)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     let h1 = match &h_str {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected fixnum, got {:?}", other),
     };
     let h2 = match &h_str2 {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected fixnum, got {:?}", other),
     };
     let h3 = match &h_diff {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected fixnum, got {:?}", other),
     };
     assert_eq!(h1, h2, "equal-hash deterministic");
     assert_ne!(h1, h3, "different strings hash differently");
     assert!(h1 >= 0);
-    assert!(matches!(&h_list, Value::Number(cs_core::Number::Fixnum(v)) if *v >= 0));
+    assert!(matches!(&h_list, Value::Fixnum(v) if *v >= 0));
     match &alist {
         Value::Pair(p) => match p.car.borrow().clone() {
             Value::Pair(_) => (),
@@ -7398,10 +7147,7 @@ fn diff_jit_file_exists_and_jiffies_per_second() {
     let _ = cs_vm::vm::jit_call_count();
     assert!(matches!(&missing, Value::Boolean(false)));
     assert!(matches!(&exists, Value::Boolean(true)));
-    assert!(matches!(
-        &jps,
-        Value::Number(cs_core::Number::Fixnum(1_000_000_000))
-    ));
+    assert!(matches!(&jps, Value::Fixnum(1_000_000_000)));
 }
 
 #[test]
@@ -7427,16 +7173,16 @@ fn diff_jit_current_second_and_current_jiffy() {
     let _ = cs_vm::vm::jit_call_count();
     // current-second returns a positive flonum (Unix epoch seconds)
     match &s {
-        Value::Number(cs_core::Number::Flonum(f)) => assert!(*f > 1_700_000_000.0),
+        Value::Flonum(f) => assert!(*f > 1_700_000_000.0),
         other => panic!("expected positive flonum, got {:?}", other),
     }
     // current-jiffy returns non-negative Fixnum that's monotonically increasing
     let jv1 = match &j1 {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected fixnum, got {:?}", other),
     };
     let jv2 = match &j2 {
-        Value::Number(cs_core::Number::Fixnum(v)) => *v,
+        Value::Fixnum(v) => *v,
         other => panic!("expected fixnum, got {:?}", other),
     };
     assert!(jv1 >= 0);
@@ -7470,10 +7216,7 @@ fn diff_jit_bytevector_list_r7rs_aliases() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match &lst {
-        Value::Pair(p) => assert!(matches!(
-            p.car.borrow().clone(),
-            Value::Number(cs_core::Number::Fixnum(10))
-        )),
+        Value::Pair(p) => assert!(matches!(p.car.borrow().clone(), Value::Fixnum(10))),
         other => panic!("expected pair, got {:?}", other),
     }
     match &bv {
@@ -7507,10 +7250,7 @@ fn diff_jit_append_reverse() {
     match &r {
         Value::Pair(p) => {
             // First element should be 3
-            assert!(matches!(
-                p.car.borrow().clone(),
-                Value::Number(cs_core::Number::Fixnum(3))
-            ));
+            assert!(matches!(p.car.borrow().clone(), Value::Fixnum(3)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
@@ -7665,14 +7405,8 @@ fn diff_jit_port_position() {
         .eval_str_via_vm("<diff>", "(pp (open-output-string))")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(
-        &initial,
-        Value::Number(cs_core::Number::Fixnum(0))
-    ));
-    assert!(matches!(
-        &out_empty,
-        Value::Number(cs_core::Number::Fixnum(0))
-    ));
+    assert!(matches!(&initial, Value::Fixnum(0)));
+    assert!(matches!(&out_empty, Value::Fixnum(0)));
 }
 
 #[test]
@@ -7707,7 +7441,7 @@ fn diff_jit_delete_and_delete_duplicates() {
         loop {
             match cur {
                 Value::Pair(p) => {
-                    if let Value::Number(cs_core::Number::Fixnum(n)) = p.car.borrow().clone() {
+                    if let Value::Fixnum(n) = p.car.borrow().clone() {
                         out.push(n);
                     }
                     cur = p.cdr.borrow().clone();
@@ -7742,10 +7476,7 @@ fn diff_jit_make_promise() {
     let _ = cs_vm::vm::jit_call_count();
     assert!(matches!(&p_int, Value::Promise(_)));
     assert!(matches!(&p_str, Value::Promise(_)));
-    assert!(matches!(
-        &forced,
-        Value::Number(cs_core::Number::Fixnum(99))
-    ));
+    assert!(matches!(&forced, Value::Fixnum(99)));
 }
 
 #[test]
@@ -7771,15 +7502,12 @@ fn diff_jit_force_forced() {
     let v_str = rt.eval_str_via_vm("<diff>", "(fp p2)").unwrap();
     let v_passthrough = rt.eval_str_via_vm("<diff>", "(fp 7)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&v_int, Value::Number(cs_core::Number::Fixnum(42))));
+    assert!(matches!(&v_int, Value::Fixnum(42)));
     match &v_str {
         Value::String(sg) => assert_eq!(&*sg.borrow(), "hi"),
         other => panic!("expected string, got {:?}", other),
     }
-    assert!(matches!(
-        &v_passthrough,
-        Value::Number(cs_core::Number::Fixnum(7))
-    ));
+    assert!(matches!(&v_passthrough, Value::Fixnum(7)));
 }
 
 #[test]
@@ -7862,11 +7590,11 @@ fn diff_jit_hashtable_delete() {
     rt.eval_str_via_vm("<diff>", "(hd ht 'z)").unwrap();
     let sz2 = rt.eval_str_via_vm("<diff>", "(hashtable-size ht)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&sz, Value::Fixnum(2)));
     assert!(matches!(&has_a, Value::Boolean(true)));
     assert!(matches!(&has_b, Value::Boolean(false)));
     assert!(matches!(&has_c, Value::Boolean(true)));
-    assert!(matches!(&sz2, Value::Number(cs_core::Number::Fixnum(2))));
+    assert!(matches!(&sz2, Value::Fixnum(2)));
 }
 
 #[test]
@@ -7921,14 +7649,14 @@ fn diff_jit_hashtable_set() {
         .eval_str_via_vm("<diff>", "(hashtable-size eqht)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&va, Value::Number(cs_core::Number::Fixnum(1))));
-    assert!(matches!(&vb, Value::Number(cs_core::Number::Fixnum(2))));
-    assert!(matches!(&vc, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&vb2, Value::Number(cs_core::Number::Fixnum(42))));
-    assert!(matches!(&sz2, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&eq_v, Value::Number(cs_core::Number::Fixnum(200))));
-    assert!(matches!(&eq_sz, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&sz, Value::Fixnum(3)));
+    assert!(matches!(&va, Value::Fixnum(1)));
+    assert!(matches!(&vb, Value::Fixnum(2)));
+    assert!(matches!(&vc, Value::Fixnum(3)));
+    assert!(matches!(&vb2, Value::Fixnum(42)));
+    assert!(matches!(&sz2, Value::Fixnum(3)));
+    assert!(matches!(&eq_v, Value::Fixnum(200)));
+    assert!(matches!(&eq_sz, Value::Fixnum(1)));
 }
 
 #[test]
@@ -7975,21 +7703,15 @@ fn diff_jit_hashtable_ref() {
         .eval_str_via_vm("<diff>", "(hr eqht (list 'y 2) -1)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&hit, Value::Number(cs_core::Number::Fixnum(10))));
-    assert!(matches!(&hit2, Value::Number(cs_core::Number::Fixnum(20))));
-    assert!(matches!(&miss, Value::Number(cs_core::Number::Fixnum(-1))));
+    assert!(matches!(&hit, Value::Fixnum(10)));
+    assert!(matches!(&hit2, Value::Fixnum(20)));
+    assert!(matches!(&miss, Value::Fixnum(-1)));
     match &str_def {
         Value::String(sg) => assert_eq!(&*sg.borrow(), "fallback"),
         other => panic!("expected string fallback, got {:?}", other),
     }
-    assert!(matches!(
-        &eq_hit,
-        Value::Number(cs_core::Number::Fixnum(99))
-    ));
-    assert!(matches!(
-        &eq_miss,
-        Value::Number(cs_core::Number::Fixnum(-1))
-    ));
+    assert!(matches!(&eq_hit, Value::Fixnum(99)));
+    assert!(matches!(&eq_miss, Value::Fixnum(-1)));
 }
 
 #[test]
@@ -8048,22 +7770,10 @@ fn diff_jit_hashtable_copy() {
         .eval_str_via_vm("<diff>", "(hashtable-contains? ht2 'x)")
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(
-        &sz_orig,
-        Value::Number(cs_core::Number::Fixnum(2))
-    ));
-    assert!(matches!(
-        &sz_copy,
-        Value::Number(cs_core::Number::Fixnum(2))
-    ));
-    assert!(matches!(
-        &copy_has_x,
-        Value::Number(cs_core::Number::Fixnum(10))
-    ));
-    assert!(matches!(
-        &copy_has_y,
-        Value::Number(cs_core::Number::Fixnum(20))
-    ));
+    assert!(matches!(&sz_orig, Value::Fixnum(2)));
+    assert!(matches!(&sz_copy, Value::Fixnum(2)));
+    assert!(matches!(&copy_has_x, Value::Fixnum(10)));
+    assert!(matches!(&copy_has_y, Value::Fixnum(20)));
     // Original unchanged after copy mutation
     assert!(matches!(&orig_z, Value::Boolean(false)));
     assert!(matches!(&orig_x, Value::Boolean(true)));
@@ -8101,7 +7811,7 @@ fn diff_jit_vector_copy_slice() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("unexpected element: {:?}", other),
                 })
                 .collect(),
@@ -8345,7 +8055,7 @@ fn diff_jit_vector_fill_slice() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("unexpected element: {:?}", other),
                 })
                 .collect(),
@@ -8630,17 +8340,14 @@ fn diff_jit_div0_mod0() {
     let d0_5 = rt.eval_str_via_vm("<diff>", "(d 0 5)").unwrap();
     let m0_5 = rt.eval_str_via_vm("<diff>", "(m 0 5)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&d13_4, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&m13_4, Value::Number(cs_core::Number::Fixnum(1))));
-    assert!(matches!(&d14_4, Value::Number(cs_core::Number::Fixnum(4))));
-    assert!(matches!(&m14_4, Value::Number(cs_core::Number::Fixnum(-2))));
-    assert!(matches!(
-        &d13_n4,
-        Value::Number(cs_core::Number::Fixnum(-3))
-    ));
-    assert!(matches!(&m13_n4, Value::Number(cs_core::Number::Fixnum(1))));
-    assert!(matches!(&d0_5, Value::Number(cs_core::Number::Fixnum(0))));
-    assert!(matches!(&m0_5, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&d13_4, Value::Fixnum(3)));
+    assert!(matches!(&m13_4, Value::Fixnum(1)));
+    assert!(matches!(&d14_4, Value::Fixnum(4)));
+    assert!(matches!(&m14_4, Value::Fixnum(-2)));
+    assert!(matches!(&d13_n4, Value::Fixnum(-3)));
+    assert!(matches!(&m13_n4, Value::Fixnum(1)));
+    assert!(matches!(&d0_5, Value::Fixnum(0)));
+    assert!(matches!(&m0_5, Value::Fixnum(0)));
 }
 
 #[test]
@@ -8665,10 +8372,10 @@ fn diff_jit_fxdiv0_fxmod0() {
     let d14_4 = rt.eval_str_via_vm("<diff>", "(d 14 4)").unwrap();
     let m14_4 = rt.eval_str_via_vm("<diff>", "(m 14 4)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&d13_4, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&m13_4, Value::Number(cs_core::Number::Fixnum(1))));
-    assert!(matches!(&d14_4, Value::Number(cs_core::Number::Fixnum(4))));
-    assert!(matches!(&m14_4, Value::Number(cs_core::Number::Fixnum(-2))));
+    assert!(matches!(&d13_4, Value::Fixnum(3)));
+    assert!(matches!(&m13_4, Value::Fixnum(1)));
+    assert!(matches!(&d14_4, Value::Fixnum(4)));
+    assert!(matches!(&m14_4, Value::Fixnum(-2)));
 }
 
 #[test]
@@ -8732,7 +8439,7 @@ fn diff_jit_make_hashtable_zero_arg() {
     let _ = cs_vm::vm::jit_call_count();
     assert!(matches!(&h, Value::Hashtable(_)));
     assert!(matches!(&is_ht, Value::Boolean(true)));
-    assert!(matches!(&sz, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&sz, Value::Fixnum(0)));
 }
 
 #[test]
@@ -8764,7 +8471,7 @@ fn diff_jit_make_hashtable_eq_eqv() {
     let v = rt
         .eval_str_via_vm("<diff>", "(hashtable-ref h1 'a #f)")
         .unwrap();
-    assert!(matches!(&v, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&v, Value::Fixnum(1)));
 }
 
 #[test]
@@ -8794,7 +8501,7 @@ fn diff_jit_vector_copy_from() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("unexpected element: {:?}", other),
                 })
                 .collect(),
@@ -8905,8 +8612,8 @@ fn diff_jit_hashtable_clear_with_hint() {
     rt.eval_str_via_vm("<diff>", "(hc h 16)").unwrap();
     let after = rt.eval_str_via_vm("<diff>", "(hashtable-size h)").unwrap();
     let _ = cs_vm::vm::jit_call_count();
-    assert!(matches!(&before, Value::Number(cs_core::Number::Fixnum(3))));
-    assert!(matches!(&after, Value::Number(cs_core::Number::Fixnum(0))));
+    assert!(matches!(&before, Value::Fixnum(3)));
+    assert!(matches!(&after, Value::Fixnum(0)));
 }
 
 #[test]
@@ -8948,14 +8655,8 @@ fn diff_jit_hashtable_copy_with_flag() {
     let copy_a = rt
         .eval_str_via_vm("<diff>", "(hashtable-ref c 'a -1)")
         .unwrap();
-    assert!(matches!(
-        &orig_a,
-        Value::Number(cs_core::Number::Fixnum(10))
-    ));
-    assert!(matches!(
-        &copy_a,
-        Value::Number(cs_core::Number::Fixnum(99))
-    ));
+    assert!(matches!(&orig_a, Value::Fixnum(10)));
+    assert!(matches!(&copy_a, Value::Fixnum(99)));
 }
 
 #[test]
@@ -8987,7 +8688,7 @@ fn diff_jit_make_hashtable_with_capacity() {
     let v = rt
         .eval_str_via_vm("<diff>", "(hashtable-ref h 'a #f)")
         .unwrap();
-    assert!(matches!(&v, Value::Number(cs_core::Number::Fixnum(1))));
+    assert!(matches!(&v, Value::Fixnum(1)));
 }
 
 #[test]
@@ -9032,7 +8733,7 @@ fn diff_jit_hashtable_keys_values_custom() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("unexpected value element: {:?}", other),
                 })
                 .collect();
@@ -9124,7 +8825,7 @@ fn diff_jit_vector_fill_from() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("unexpected element: {:?}", other),
                 })
                 .collect(),
@@ -9304,7 +9005,7 @@ fn diff_jit_vector_to_list_slice() {
                     let car = p.car.borrow().clone();
                     let cdr = p.cdr.borrow().clone();
                     match car {
-                        Value::Number(cs_core::Number::Fixnum(n)) => out.push(n),
+                        Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
                     }
                     v = cdr;
@@ -9405,7 +9106,7 @@ fn diff_jit_bytevector_to_list_slice() {
                     let car = p.car.borrow().clone();
                     let cdr = p.cdr.borrow().clone();
                     match car {
-                        Value::Number(cs_core::Number::Fixnum(n)) => out.push(n),
+                        Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
                     }
                     v = cdr;
@@ -9481,7 +9182,7 @@ fn diff_jit_string_to_number_radix() {
     let _ = cs_vm::vm::jit_call_count();
     fn fix_of(v: Value) -> i64 {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            Value::Fixnum(n) => n,
             other => panic!("expected fixnum, got {:?}", other),
         }
     }
@@ -9579,7 +9280,7 @@ fn diff_jit_vector_to_list_slice_from() {
                     let car = p.car.borrow().clone();
                     let cdr = p.cdr.borrow().clone();
                     match car {
-                        Value::Number(cs_core::Number::Fixnum(n)) => out.push(n),
+                        Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
                     }
                     v = cdr;
@@ -9680,7 +9381,7 @@ fn diff_jit_bytevector_to_list_slice_from() {
                     let car = p.car.borrow().clone();
                     let cdr = p.cdr.borrow().clone();
                     match car {
-                        Value::Number(cs_core::Number::Fixnum(n)) => out.push(n),
+                        Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
                     }
                     v = cdr;
@@ -9810,7 +9511,7 @@ fn diff_jit_vector_copy_bang_from() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("expected fixnum, got {:?}", other),
                 })
                 .collect(),
@@ -9934,7 +9635,7 @@ fn diff_jit_vector_copy_bang_slice() {
                 .borrow()
                 .iter()
                 .map(|e| match e {
-                    Value::Number(cs_core::Number::Fixnum(n)) => *n,
+                    Value::Fixnum(n) => *n,
                     other => panic!("expected fixnum, got {:?}", other),
                 })
                 .collect(),
@@ -10055,7 +9756,7 @@ fn diff_jit_inexact_alias() {
     let _ = cs_vm::vm::jit_call_count();
     fn flo_of(v: Value) -> f64 {
         match v {
-            Value::Number(cs_core::Number::Flonum(f)) => f,
+            Value::Flonum(f) => f,
             other => panic!("expected flonum, got {:?}", other),
         }
     }
@@ -10092,7 +9793,7 @@ fn diff_jit_variadic_fxminmax() {
     let _ = cs_vm::vm::jit_call_count();
     fn fix_of(v: Value) -> i64 {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            Value::Fixnum(n) => n,
             other => panic!("expected fixnum, got {:?}", other),
         }
     }
@@ -10147,7 +9848,7 @@ fn diff_jit_variadic_eq_predicates() {
     let _ = cs_vm::vm::jit_call_count();
     fn fix_of(v: Value) -> i64 {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            Value::Fixnum(n) => n,
             other => panic!("expected fixnum, got {:?}", other),
         }
     }
@@ -10200,7 +9901,7 @@ fn diff_jit_variadic_char_compares() {
     let _ = cs_vm::vm::jit_call_count();
     fn fix_of(v: Value) -> i64 {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            Value::Fixnum(n) => n,
             other => panic!("expected fixnum, got {:?}", other),
         }
     }
@@ -10263,7 +9964,7 @@ fn diff_jit_variadic_char_ci_compares() {
     let _ = cs_vm::vm::jit_call_count();
     fn fix_of(v: Value) -> i64 {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            Value::Fixnum(n) => n,
             other => panic!("expected fixnum, got {:?}", other),
         }
     }
@@ -10328,7 +10029,7 @@ fn diff_jit_variadic_string_compares() {
     let _ = cs_vm::vm::jit_call_count();
     fn fix_of(v: Value) -> i64 {
         match v {
-            Value::Number(cs_core::Number::Fixnum(n)) => n,
+            Value::Fixnum(n) => n,
             other => panic!("expected fixnum, got {:?}", other),
         }
     }
@@ -10408,7 +10109,7 @@ fn diff_jit_variadic_flminmax() {
     let _ = cs_vm::vm::jit_call_count();
     fn flo_of(v: Value) -> f64 {
         match v {
-            Value::Number(cs_core::Number::Flonum(f)) => f,
+            Value::Flonum(f) => f,
             other => panic!("expected flonum, got {:?}", other),
         }
     }
@@ -10503,7 +10204,7 @@ fn diff_jit_ic_hof_soundness() {
     // The last (caller inc 3999) returns (inc 3999) = 4000.
     let result = rt.eval_str_via_vm("<diff>", "(caller inc 41)").unwrap();
     match result {
-        Value::Number(cs_core::Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected (caller inc 41) = 42, got {:?}", other),
     }
 }
@@ -10542,11 +10243,7 @@ fn diff_jit_env_lookup_non_fixnum_deopts() {
             let v = v.borrow();
             assert_eq!(v.len(), 3);
             match (&v[0], &v[1], &v[2]) {
-                (
-                    Value::Number(cs_core::Number::Fixnum(7)),
-                    Value::Number(cs_core::Number::Fixnum(8)),
-                    Value::Number(cs_core::Number::Fixnum(9)),
-                ) => {}
+                (Value::Fixnum(7), Value::Fixnum(8), Value::Fixnum(9)) => {}
                 other => panic!("expected #(7 8 9), got {:?}", other),
             }
         }
@@ -10799,7 +10496,7 @@ fn diff_jit_nested_closure_captures_params() {
     // lambda via vm_make_closure; the frame env must carry `n`.
     let result = rt.eval_str_via_vm("<diff>", "(apply-captured 7)").unwrap();
     match result {
-        Value::Number(cs_core::Number::Fixnum(1007)) => {}
+        Value::Fixnum(1007) => {}
         other => panic!("expected (apply-captured 7) = 1007, got {:?}", other),
     }
     // Cross-check against the walker tier.
@@ -10810,7 +10507,7 @@ fn diff_jit_nested_closure_captures_params() {
         "(apply-captured 7)",
     );
     match walker {
-        Value::Number(cs_core::Number::Fixnum(1007)) => {}
+        Value::Fixnum(1007) => {}
         other => panic!("walker disagreed: {:?}", other),
     }
 }
@@ -10850,7 +10547,10 @@ fn diff_inner_closure_captures_outer_loop_var() {
     rt.eval_str_via_vm("<diff>", defines[0]).unwrap();
     rt.eval_str_via_vm("<diff>", "(f 1500)").unwrap();
     match rt.eval_str_via_vm("<diff>", "(f 1500)").unwrap() {
-        Value::Number(n) => assert_eq!(n.to_f64(), 1686375000.0),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            assert_eq!(n.to_f64(), 1686375000.0)
+        }
         other => panic!("expected number, got {:?}", other),
     }
 }

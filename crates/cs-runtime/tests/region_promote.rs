@@ -13,7 +13,7 @@ use cs_core::{Hashtable, HtEqKind, Number, Pair, Promote, Symbol, Value};
 use cs_gc::{Gc, Region};
 
 fn n(v: i64) -> Value {
-    Value::Number(Number::Fixnum(v))
+    Value::Fixnum(v)
 }
 
 /// Helper: build a region-allocated Pair. The caller can then
@@ -39,16 +39,28 @@ fn single_level_pair_promotion_survives_region_drop() {
     };
     // Touch v after region drop — must succeed.
     if let Value::Pair(p) = &v {
-        assert!(matches!(p.car(), Value::Number(_)));
-        assert!(matches!(p.cdr(), Value::Number(_)));
+        assert!(matches!(
+            p.car(),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+        ));
+        assert!(matches!(
+            p.cdr(),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+        ));
     } else {
         panic!("expected Pair");
     }
     // Run promote_deep again — idempotent no-op.
     v.promote_deep();
     if let Value::Pair(p) = &v {
-        assert!(matches!(p.car(), Value::Number(_)));
-        assert!(matches!(p.cdr(), Value::Number(_)));
+        assert!(matches!(
+            p.car(),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+        ));
+        assert!(matches!(
+            p.cdr(),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+        ));
     } else {
         unreachable!();
     }
@@ -77,10 +89,19 @@ fn two_level_pair_promotion_descends() {
     };
     // Walk the tree post-region-drop.
     if let Value::Pair(p_outer) = &v {
-        assert!(matches!(p_outer.car(), Value::Number(_)));
+        assert!(matches!(
+            p_outer.car(),
+            Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+        ));
         if let Value::Pair(p_inner) = p_outer.cdr() {
-            assert!(matches!(p_inner.car(), Value::Number(_)));
-            assert!(matches!(p_inner.cdr(), Value::Number(_)));
+            assert!(matches!(
+                p_inner.car(),
+                Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+            ));
+            assert!(matches!(
+                p_inner.cdr(),
+                Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+            ));
         } else {
             panic!();
         }
@@ -111,7 +132,10 @@ fn mixed_region_and_rc_handled() {
             // distinct allocations (promote always re-alloc's
             // the outer; inner was cloned for the new outer's
             // car). Identity isn't preserved across promote.
-            assert!(matches!(inner.car(), Value::Number(_)));
+            assert!(matches!(
+                inner.car(),
+                Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+            ));
         }
     }
 }
@@ -135,8 +159,14 @@ fn vector_promotion_descends_into_elements() {
         assert_eq!(borrowed.len(), 3);
         if let Value::Pair(p) = &borrowed[1] {
             assert!(!Gc::is_region(p));
-            assert!(matches!(p.car(), Value::Number(_)));
-            assert!(matches!(p.cdr(), Value::Number(_)));
+            assert!(matches!(
+                p.car(),
+                Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+            ));
+            assert!(matches!(
+                p.cdr(),
+                Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+            ));
         } else {
             panic!("expected Pair at index 1");
         }
@@ -188,7 +218,10 @@ fn hashtable_promotion_descends_into_items() {
         assert_eq!(items.len(), 2);
         if let Value::Pair(p) = &items[0].1 {
             assert!(!Gc::is_region(p));
-            assert!(matches!(p.car(), Value::Number(_)));
+            assert!(matches!(
+                p.car(),
+                Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)
+            ));
         } else {
             panic!();
         }

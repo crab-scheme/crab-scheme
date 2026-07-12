@@ -174,7 +174,13 @@ fn binary_pack(args: &[Value]) -> Result<Value, FfiError> {
     for (field, val) in fields.iter().zip(values) {
         if is_float(field.code) {
             let f = match val {
-                Value::Number(n) => n.to_f64(),
+                nv @ (Value::Fixnum(_)
+                | Value::Flonum(_)
+                | Value::BigNumber(_)
+                | Value::Rational(_)) => {
+                    let n = nv.as_number().unwrap();
+                    n.to_f64()
+                }
                 other => {
                     return Err(FfiError::TypeMismatch {
                         expected: "number (float field)",
@@ -185,7 +191,7 @@ fn binary_pack(args: &[Value]) -> Result<Value, FfiError> {
             write_float(&mut out, f, field.code, field.endian);
         } else {
             let v = match val {
-                Value::Number(cs_core::Number::Fixnum(v)) => *v,
+                Value::Fixnum(v) => *v,
                 other => {
                     return Err(FfiError::TypeMismatch {
                         expected: "fixnum (integer field)",

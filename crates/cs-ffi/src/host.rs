@@ -95,7 +95,7 @@ mod tests {
                 });
             }
             match &args[0] {
-                Value::Number(Number::Fixnum(n)) => Ok((n + 1).into_value()),
+                Value::Fixnum(n) => Ok((n + 1).into_value()),
                 _ => Err(FfiError::TypeMismatch {
                     expected: "i64",
                     got: args[0].type_name().to_string(),
@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(p.name(), "inc");
         let r = p.call(&[Value::fixnum(41)]).unwrap();
         match r {
-            Value::Number(Number::Fixnum(42)) => {}
+            Value::Fixnum(42) => {}
             other => panic!("expected 42, got {:?}", other),
         }
     }

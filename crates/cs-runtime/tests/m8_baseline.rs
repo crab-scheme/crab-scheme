@@ -45,7 +45,7 @@ fn after_extent_invocation_emits_clear_diagnostic() {
 fn baseline_escape_returns_directly() {
     let r = run("(call/cc (lambda (k) 42))").unwrap();
     match r {
-        Value::Number(Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected 42, got {:?}", other),
     }
 }
@@ -54,7 +54,7 @@ fn baseline_escape_returns_directly() {
 fn baseline_escape_invoked_inside_extent() {
     let r = run("(+ 1 (call/cc (lambda (k) (k 10))))").unwrap();
     match r {
-        Value::Number(Number::Fixnum(11)) => {}
+        Value::Fixnum(11) => {}
         other => panic!("expected 11, got {:?}", other),
     }
 }
@@ -63,7 +63,7 @@ fn baseline_escape_invoked_inside_extent() {
 fn baseline_escape_bypasses_outer_arithmetic() {
     let r = run("(call/cc (lambda (k) (+ 1 (k 99))))").unwrap();
     match r {
-        Value::Number(Number::Fixnum(99)) => {}
+        Value::Fixnum(99) => {}
         other => panic!("expected 99, got {:?}", other),
     }
 }
@@ -125,7 +125,7 @@ fn m8_multiple_invocations_vm() {
         )
         .unwrap();
     match r {
-        Value::Number(Number::Fixnum(3)) => {}
+        Value::Fixnum(3) => {}
         other => panic!("expected 3, got {:?}", other),
     }
 }
@@ -149,7 +149,7 @@ fn m8_continuation_stored_in_data_structure_vm() {
         )
         .unwrap();
     match r {
-        Value::Number(Number::Fixnum(3)) => {}
+        Value::Fixnum(3) => {}
         other => panic!("expected 3, got {:?}", other),
     }
 }
@@ -194,7 +194,7 @@ fn m8_continuation_one_arg_vm() {
         )
         .unwrap();
     match r {
-        Value::Number(Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected 42 (1+41), got {:?}", other),
     }
 }
@@ -209,7 +209,7 @@ fn m8_multiple_invocations_walker() {
          (if (< count 3) (saved #f) count)")
     .unwrap();
     match r {
-        Value::Number(Number::Fixnum(3)) => {}
+        Value::Fixnum(3) => {}
         other => panic!("expected 3, got {:?}", other),
     }
 }

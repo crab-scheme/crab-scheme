@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use cs_core::{Number, Symbol, Value};
+use cs_core::{Symbol, Value};
 use cs_diag::Span;
 use cs_ir::{CoreExpr, Params};
 
@@ -498,7 +498,7 @@ fn remap_targets(insts: &mut [Inst], old_to_new: &[usize]) {
 fn as_fixnum_const(inst: &Inst, consts: &[Value]) -> Option<i64> {
     match inst {
         Inst::Const(idx) => match &consts[*idx as usize] {
-            Value::Number(Number::Fixnum(v)) => Some(*v),
+            Value::Fixnum(v) => Some(*v),
             _ => None,
         },
         _ => None,
@@ -511,9 +511,9 @@ fn as_fixnum_const(inst: &Inst, consts: &[Value]) -> Option<i64> {
 /// runtime's generic bignum-promoting path).
 fn fold_fixnum_op(op: &Inst, a: i64, b: i64) -> Option<Value> {
     match op {
-        Inst::AddFx2 => a.checked_add(b).map(|v| Value::Number(Number::Fixnum(v))),
-        Inst::SubFx2 => a.checked_sub(b).map(|v| Value::Number(Number::Fixnum(v))),
-        Inst::MulFx2 => a.checked_mul(b).map(|v| Value::Number(Number::Fixnum(v))),
+        Inst::AddFx2 => a.checked_add(b).map(|v| Value::Fixnum(v)),
+        Inst::SubFx2 => a.checked_sub(b).map(|v| Value::Fixnum(v)),
+        Inst::MulFx2 => a.checked_mul(b).map(|v| Value::Fixnum(v)),
         Inst::LtFx2 => Some(Value::Boolean(a < b)),
         Inst::LeFx2 => Some(Value::Boolean(a <= b)),
         Inst::GtFx2 => Some(Value::Boolean(a > b)),

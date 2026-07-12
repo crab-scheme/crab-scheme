@@ -56,7 +56,7 @@ fn uniform_nb_add_two_fixnums() {
     let r = func(a, b);
     let v = unsafe { NanboxValue(r).to_value() };
     match v {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 42),
         other => panic!("expected Fixnum(42), got {:?}", other),
     }
 }
@@ -88,7 +88,7 @@ fn uniform_nb_loadconst_plus_param() {
     let r = func(x);
     let v = unsafe { NanboxValue(r).to_value() };
     match v {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 42),
         other => panic!("expected Fixnum(42), got {:?}", other),
     }
 }
@@ -122,7 +122,7 @@ fn uniform_nb_sub_two_fixnums() {
         NanboxValue::fixnum(58).into_raw(),
     );
     match unsafe { NanboxValue(r).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 42),
         other => panic!("expected Fixnum(42), got {:?}", other),
     }
 }
@@ -156,7 +156,7 @@ fn uniform_nb_mul_two_fixnums() {
         NanboxValue::fixnum(7).into_raw(),
     );
     match unsafe { NanboxValue(r).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 42),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 42),
         other => panic!("expected Fixnum(42), got {:?}", other),
     }
 }
@@ -244,13 +244,13 @@ fn uniform_nb_branch_clamp() {
     // x=5 < 10 → return x = 5.
     let r5 = func(NanboxValue::fixnum(5).into_raw());
     match unsafe { NanboxValue(r5).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 5),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 5),
         other => panic!("expected Fixnum(5), got {:?}", other),
     }
     // x=15 ≥ 10 → return x*2 = 30.
     let r15 = func(NanboxValue::fixnum(15).into_raw());
     match unsafe { NanboxValue(r15).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 30),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 30),
         other => panic!("expected Fixnum(30), got {:?}", other),
     }
 }
@@ -304,17 +304,17 @@ fn uniform_nb_jump_with_block_param() {
 
     let r_neg = func(NanboxValue::fixnum(-7).into_raw());
     match unsafe { NanboxValue(r_neg).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 7),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 7),
         other => panic!("expected Fixnum(7), got {:?}", other),
     }
     let r_pos = func(NanboxValue::fixnum(5).into_raw());
     match unsafe { NanboxValue(r_pos).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 5),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 5),
         other => panic!("expected Fixnum(5), got {:?}", other),
     }
     let r_zero = func(NanboxValue::fixnum(0).into_raw());
     match unsafe { NanboxValue(r_zero).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 0),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 0),
         other => panic!("expected Fixnum(0), got {:?}", other),
     }
 }
@@ -353,7 +353,8 @@ fn uniform_nb_mul_overflow_falls_to_helper() {
     );
     // Result is a Number — Fixnum (oversized, wrapped) or Big.
     match unsafe { NanboxValue(r).to_value() } {
-        cs_core::Value::Number(_) => { /* ok */ }
+        cs_core::Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_) => { /* ok */
+        }
         other => panic!("expected Number, got {:?}", other),
     }
 }
@@ -394,7 +395,7 @@ fn uniform_nb_cons_car_cdr_roundtrip() {
     let b_nb = NanboxValue::fixnum(13).into_raw();
     let r = func(a_nb, b_nb);
     match unsafe { NanboxValue(r).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 7),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 7),
         other => panic!("expected Fixnum(7) from (car (cons 7 13)), got {:?}", other),
     }
 }
@@ -433,7 +434,7 @@ fn uniform_nb_cdr_returns_cdr() {
         NanboxValue::fixnum(13).into_raw(),
     );
     match unsafe { NanboxValue(r).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 13),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 13),
         other => panic!("expected Fixnum(13), got {:?}", other),
     }
 }
@@ -548,7 +549,7 @@ fn uniform_nb_any_clone_preserves_pair() {
     };
     let r = func(pair_nb);
     match unsafe { NanboxValue(r).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 99),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 99),
         other => panic!("expected Fixnum(99), got {:?}", other),
     }
 }
@@ -599,13 +600,13 @@ fn uniform_nb_call_self_countdown() {
     // n = 0 returns 0 (base case immediately).
     let r0 = func(NanboxValue::fixnum(0).into_raw());
     match unsafe { NanboxValue(r0).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 0),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 0),
         other => panic!("expected Fixnum(0), got {:?}", other),
     }
     // n = 10 recurses 10× and returns 0.
     let r10 = func(NanboxValue::fixnum(10).into_raw());
     match unsafe { NanboxValue(r10).to_value() } {
-        cs_core::Value::Number(cs_core::Number::Fixnum(n)) => assert_eq!(n, 0),
+        cs_core::Value::Fixnum(n) => assert_eq!(n, 0),
         other => panic!("expected Fixnum(0), got {:?}", other),
     }
 }
@@ -665,7 +666,7 @@ fn uniform_nb_admits_nontail_callself_via_systemv() {
     for (n, expected) in [(0i64, 0i64), (1, 1), (2, 1), (7, 13), (10, 55)] {
         let r = func(NanboxValue::fixnum(n).into_raw());
         match unsafe { NanboxValue(r).to_value() } {
-            cs_core::Value::Number(cs_core::Number::Fixnum(v)) => {
+            cs_core::Value::Fixnum(v) => {
                 assert_eq!(v, expected, "fib({n})")
             }
             other => panic!("fib({n}): expected Fixnum({expected}), got {other:?}"),
@@ -704,7 +705,7 @@ fn uniform_nb_add_mixed_fixnum_flonum_slow_path() {
     let r = func(a, b);
     let v = unsafe { NanboxValue(r).to_value() };
     match v {
-        cs_core::Value::Number(cs_core::Number::Flonum(f)) => {
+        cs_core::Value::Flonum(f) => {
             assert!((f - 3.5).abs() < 1e-9);
         }
         other => panic!("expected Flonum(3.5), got {:?}", other),

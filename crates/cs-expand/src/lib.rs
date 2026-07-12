@@ -1968,7 +1968,7 @@ impl<'a> Expander<'a> {
                 span: *span,
             }),
             Datum::Number(n, span) => Ok(CoreExpr::Const {
-                value: Value::Number(n.clone()),
+                value: Value::from_number(n.clone()),
                 span: *span,
             }),
             Datum::Character(c, span) => Ok(CoreExpr::Const {
@@ -7790,10 +7790,10 @@ mod tests {
         match e {
             CoreExpr::Begin { exprs, .. } => match &exprs[0] {
                 CoreExpr::Const {
-                    value: Value::Number(n),
+                    value: Value::Fixnum(n),
                     ..
                 } => {
-                    assert!(matches!(n, cs_core::Number::Fixnum(42)));
+                    assert_eq!(*n, 42);
                 }
                 _ => panic!("expected const"),
             },

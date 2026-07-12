@@ -156,7 +156,10 @@ fn decode_id(v: &Value) -> Option<u32> {
         return None;
     }
     match &items[1] {
-        Value::Number(n) => u32::try_from(n.to_f64() as i64).ok(),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            u32::try_from(n.to_f64() as i64).ok()
+        }
         _ => None,
     }
 }
@@ -188,7 +191,8 @@ fn to_sql(name: &str, v: &Value) -> Result<SqlValue, FfiError> {
     Ok(match v {
         Value::Null | Value::Unspecified => SqlValue::Null,
         Value::Boolean(b) => SqlValue::Integer(i64::from(*b)),
-        Value::Number(n) => {
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
             let f = n.to_f64();
             if n.is_exact() && n.is_integer() && f.is_finite() && f.abs() < MAX_EXACT_F64_INT {
                 SqlValue::Integer(f as i64)

@@ -86,7 +86,8 @@ fn toml_to_value(t: &T) -> Value {
 fn value_to_toml(v: &Value) -> Result<T, FfiError> {
     match v {
         Value::Boolean(b) => Ok(T::Boolean(*b)),
-        Value::Number(n) => {
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
             let f = n.to_f64();
             if f.fract() == 0.0 && f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
                 Ok(T::Integer(f as i64))

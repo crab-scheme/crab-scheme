@@ -91,7 +91,7 @@ fn block_on<F: std::future::Future>(who: &str, fut: F) -> Result<F::Output, Stri
 
 fn make_channel_value(id: ChannelId, syms: &mut SymbolTable) -> Value {
     let tag = Value::Symbol(syms.intern("channel"));
-    let id_v = Value::Number(Number::Fixnum(id.0 as i64));
+    let id_v = Value::Fixnum(id.0 as i64);
     Value::Pair(Pair::new(tag, Value::Pair(Pair::new(id_v, Value::Null))))
 }
 
@@ -117,7 +117,7 @@ fn channel_value_to_id(v: &Value, syms: &SymbolTable, who: &str) -> Result<Chann
         _ => return Err(format!("{}: malformed channel value (no id slot)", who)),
     };
     match (&*id, &*rest) {
-        (Value::Number(Number::Fixnum(n)), Value::Null) => {
+        (Value::Fixnum(n), Value::Null) => {
             if *n < 0 {
                 Err(format!(
                     "{}: channel id must be non-negative, got {}",
@@ -162,7 +162,7 @@ fn check_arity(who: &str, args: &[Value], expected: usize) -> Result<(), String>
 
 fn value_to_i64(v: &Value, who: &str) -> Result<i64, String> {
     match v {
-        Value::Number(Number::Fixnum(n)) => Ok(*n),
+        Value::Fixnum(n) => Ok(*n),
         other => Err(format!(
             "{}: expected fixnum, got {}",
             who,
@@ -279,7 +279,7 @@ pub fn b_channel_len(args: &[Value], syms: &mut SymbolTable) -> Result<Value, St
     check_arity("channel-len", args, 1)?;
     let id = channel_value_to_id(&args[0], syms, "channel-len")?;
     let ch = fetch(id, "channel-len")?;
-    Ok(Value::Number(Number::Fixnum(ch.len() as i64)))
+    Ok(Value::Fixnum(ch.len() as i64))
 }
 
 pub fn b_channel_capacity(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -287,7 +287,7 @@ pub fn b_channel_capacity(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     let id = channel_value_to_id(&args[0], syms, "channel-capacity")?;
     let ch = fetch(id, "channel-capacity")?;
     Ok(match ch.capacity() {
-        Some(n) => Value::Number(Number::Fixnum(n as i64)),
+        Some(n) => Value::Fixnum(n as i64),
         None => Value::Boolean(false),
     })
 }
@@ -351,7 +351,7 @@ pub fn b_channel_select(args: &[Value], syms: &mut SymbolTable) -> Result<Value,
         SelectKind::SendClosed => Value::Symbol(syms.intern("*send-closed*")),
     };
 
-    let idx_v = Value::Number(Number::Fixnum(outcome.index as i64));
+    let idx_v = Value::Fixnum(outcome.index as i64);
     Ok(Value::Pair(Pair::new(idx_v, value_v)))
 }
 
@@ -478,13 +478,13 @@ pub fn broadcast_registry() -> &'static BroadcastRegistry {
 
 fn make_broadcast_value(id: ChannelId, syms: &mut SymbolTable) -> Value {
     let tag = Value::Symbol(syms.intern("broadcast"));
-    let id_v = Value::Number(Number::Fixnum(id.0 as i64));
+    let id_v = Value::Fixnum(id.0 as i64);
     Value::Pair(Pair::new(tag, Value::Pair(Pair::new(id_v, Value::Null))))
 }
 
 fn make_sub_value(id: SubscriptionId, syms: &mut SymbolTable) -> Value {
     let tag = Value::Symbol(syms.intern("broadcast-sub"));
-    let id_v = Value::Number(Number::Fixnum(id.0 as i64));
+    let id_v = Value::Fixnum(id.0 as i64);
     Value::Pair(Pair::new(tag, Value::Pair(Pair::new(id_v, Value::Null))))
 }
 
@@ -519,7 +519,7 @@ fn value_to_tagged_id(
         }
     };
     match (&*id, &*rest) {
-        (Value::Number(Number::Fixnum(n)), Value::Null) if *n >= 0 => Ok(*n as u64),
+        (Value::Fixnum(n), Value::Null) if *n >= 0 => Ok(*n as u64),
         _ => Err(format!(
             "{}: malformed {} value (bad id)",
             who, expected_tag
@@ -583,7 +583,7 @@ pub fn b_broadcast_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value,
     let n = ch
         .send(payload)
         .map_err(|e| format!("broadcast-send!: {}", e))?;
-    Ok(Value::Number(Number::Fixnum(n as i64)))
+    Ok(Value::Fixnum(n as i64))
 }
 
 fn broadcast_recv_to_value(r: BroadcastRecv, syms: &mut SymbolTable) -> Value {

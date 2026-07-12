@@ -70,7 +70,12 @@ fn arity(name: &str, want: &str, got: usize) -> FfiError {
 
 fn expect_number(name: &str, args: &[Value], idx: usize) -> Result<f64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(n)) => Ok(n.to_f64()),
+        Some(
+            nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let n = nv.as_number().unwrap();
+            Ok(n.to_f64())
+        }
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "number",
             got: other.type_name().to_string(),
@@ -90,7 +95,13 @@ fn expect_list_of_numbers(name: &str, args: &[Value], idx: usize) -> Result<Vec<
             Value::Null => return Ok(out),
             Value::Pair(p) => {
                 match p.car() {
-                    Value::Number(n) => out.push(n.to_f64()),
+                    nv @ (Value::Fixnum(_)
+                    | Value::Flonum(_)
+                    | Value::BigNumber(_)
+                    | Value::Rational(_)) => {
+                        let n = nv.as_number().unwrap();
+                        out.push(n.to_f64())
+                    }
                     other => {
                         return Err(FfiError::HostFailure(format!(
                             "{}: list contains non-number ({})",

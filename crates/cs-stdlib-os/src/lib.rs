@@ -200,7 +200,12 @@ fn architecture(args: &[Value]) -> Result<Value, FfiError> {
 fn exit_proc(args: &[Value]) -> Result<Value, FfiError> {
     let code = match args.first() {
         None => 0,
-        Some(Value::Number(n)) => n.to_f64() as i32,
+        Some(
+            nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)),
+        ) => {
+            let n = nv.as_number().unwrap();
+            n.to_f64() as i32
+        }
         Some(other) => {
             return Err(FfiError::TypeMismatch {
                 expected: "fixnum or no args".into(),

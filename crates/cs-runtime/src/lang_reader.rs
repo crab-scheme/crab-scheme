@@ -82,7 +82,10 @@ pub(crate) fn value_to_datum(v: &Value, span: Span) -> Result<Datum, String> {
     }
     match v {
         Value::Boolean(b) => Ok(Datum::Boolean(*b, span)),
-        Value::Number(n) => Ok(Datum::Number(n.clone(), span)),
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            Ok(Datum::Number(n.clone(), span))
+        }
         Value::Character(c) => Ok(Datum::Character(*c, span)),
         Value::String(s) => Ok(Datum::String(Rc::new(s.borrow().clone()), span)),
         Value::Symbol(s) => Ok(Datum::Symbol(*s, span)),

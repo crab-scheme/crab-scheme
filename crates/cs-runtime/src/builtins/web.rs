@@ -189,7 +189,7 @@ fn value_to_str(v: &Value, syms: &SymbolTable, who: &str) -> Result<String, Stri
 
 fn value_to_i64(v: &Value, who: &str) -> Result<i64, String> {
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => Ok(*n),
+        Value::Fixnum(n) => Ok(*n),
         other => Err(format!(
             "{}: expected fixnum, got {}",
             who,
@@ -455,7 +455,7 @@ pub fn b_web_server_create(args: &[Value], syms: &mut SymbolTable) -> Result<Val
     check_arity("web-server-create", args, 1)?;
     let addr = value_to_str(&args[0], syms, "web-server-create")?;
     let id = primop_server_create(&addr)?;
-    Ok(Value::Number(cs_core::Number::Fixnum(id)))
+    Ok(Value::Fixnum(id))
 }
 
 pub fn b_web_route_static(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
@@ -486,7 +486,7 @@ pub fn b_web_route_module(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     let sid = value_to_i64(&args[0], "web-route-module!")?;
     let path = value_to_str(&args[1], syms, "web-route-module!")?;
     let n = primop_route_module(sid, path)?;
-    Ok(Value::Number(cs_core::Number::Fixnum(n as i64)))
+    Ok(Value::Fixnum(n as i64))
 }
 
 pub fn b_web_layer_trace(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {

@@ -119,7 +119,7 @@ fn yaml_parse(args: &[Value]) -> Result<Value, FfiError> {
 fn value_to_yaml_key(v: &Value) -> Yaml {
     match v {
         Value::String(s) => Yaml::String(s.borrow().clone()),
-        Value::Number(cs_core::Number::Fixnum(i)) => Yaml::Integer(*i),
+        Value::Fixnum(i) => Yaml::Integer(*i),
         Value::Boolean(b) => Yaml::Boolean(*b),
         _ => Yaml::String("?".to_string()),
     }
@@ -128,8 +128,11 @@ fn value_to_yaml_key(v: &Value) -> Yaml {
 fn value_to_yaml(v: &Value) -> Yaml {
     match v {
         Value::Boolean(b) => Yaml::Boolean(*b),
-        Value::Number(cs_core::Number::Fixnum(i)) => Yaml::Integer(*i),
-        Value::Number(n) => Yaml::Real(format!("{}", n.to_f64())),
+        Value::Fixnum(i) => Yaml::Integer(*i),
+        nv @ (Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            let n = nv.as_number().unwrap();
+            Yaml::Real(format!("{}", n.to_f64()))
+        }
         Value::String(s) => Yaml::String(s.borrow().clone()),
         Value::Null => Yaml::Null,
         Value::Pair(_) => {

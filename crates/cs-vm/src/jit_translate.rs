@@ -8734,8 +8734,8 @@ fn emit_cmp_binop(
 fn value_to_const(v: &cs_core::Value) -> Result<Const, TranslateError> {
     use cs_core::Value;
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) => Ok(Const::Fixnum(*n)),
-        Value::Number(cs_core::Number::Flonum(f)) => Ok(Const::Flonum(*f)),
+        Value::Fixnum(n) => Ok(Const::Fixnum(*n)),
+        Value::Flonum(f) => Ok(Const::Flonum(*f)),
         Value::Boolean(b) => Ok(Const::Boolean(*b)),
         Value::Character(c) => Ok(Const::Character(*c)),
         Value::Null => Ok(Const::Null),
@@ -8790,11 +8790,7 @@ mod tests {
         //  15: Call 1
         //  16: AddFx2
         //  17: Return
-        let consts = test_pool(vec![
-            Value::Number(Number::Fixnum(2)),
-            Value::Number(Number::Fixnum(1)),
-            Value::Number(Number::Fixnum(2)),
-        ]);
+        let consts = test_pool(vec![Value::Fixnum(2), Value::Fixnum(1), Value::Fixnum(2)]);
         let body = vec![
             Inst::LoadVar(n),
             Inst::Const(0),
@@ -8858,7 +8854,7 @@ mod tests {
         // f(x) = x + 1
         let mut syms = SymbolTable::new();
         let x = syms.intern("x");
-        let consts = test_pool(vec![Value::Number(Number::Fixnum(1))]);
+        let consts = test_pool(vec![Value::Fixnum(1)]);
         let body = vec![Inst::LoadVar(x), Inst::Const(0), Inst::AddFx2, Inst::Return];
         let len = body.len();
         let lam = CompiledLambda {
@@ -8923,7 +8919,7 @@ mod tests {
         // (g 1) — calls non-self. The LoadVar(g) for a free var
         // is promoted to `EnvLookupAny` inline so the callee
         // arrives as an Any-tagged Gc handle for vm_call_general.
-        let consts = test_pool(vec![Value::Number(Number::Fixnum(1))]);
+        let consts = test_pool(vec![Value::Fixnum(1)]);
         let body = vec![
             Inst::LoadVar(g),
             Inst::Const(0),

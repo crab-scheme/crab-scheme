@@ -511,7 +511,7 @@ pub fn b_node_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
 
 fn chan_of(v: &Value, who: &str) -> Result<u8, String> {
     match v {
-        Value::Number(cs_core::Number::Fixnum(n)) if (0..=5).contains(n) => Ok(*n as u8),
+        Value::Fixnum(n) if (0..=5).contains(n) => Ok(*n as u8),
         _ => Err(format!("{who}: channel must be an integer 0..5")),
     }
 }
@@ -633,9 +633,7 @@ pub fn b_node_peer_count(args: &[Value], syms: &mut SymbolTable) -> Result<Value
         return Err("node-peer-count: expected (node-peer-count NODE)".into());
     }
     let node = name_of(&args[0], syms, "node-peer-count")?;
-    Ok(Value::Number(cs_core::Number::Fixnum(
-        primop_node_peer_count(&node)? as i64,
-    )))
+    Ok(Value::Fixnum(primop_node_peer_count(&node)? as i64))
 }
 
 /// `(node-detect-disconnects NODE)` — drop peers whose link has closed and
@@ -646,9 +644,7 @@ pub fn b_node_detect_disconnects(args: &[Value], syms: &mut SymbolTable) -> Resu
         return Err("node-detect-disconnects: expected (node-detect-disconnects NODE)".into());
     }
     let node = name_of(&args[0], syms, "node-detect-disconnects")?;
-    Ok(Value::Number(cs_core::Number::Fixnum(
-        primop_node_detect_disconnects(&node)? as i64,
-    )))
+    Ok(Value::Fixnum(primop_node_detect_disconnects(&node)? as i64))
 }
 
 /// The Scheme-facing distrib builtins, in the `(name, fn)` shape the
@@ -768,23 +764,25 @@ pub fn encode_value_in(v: &Value, syms: &SymbolTable, out: &mut Vec<u8>) -> Resu
             out.push(4);
             out.extend_from_slice(&(*c as u32).to_be_bytes());
         }
-        Value::Number(n) => match n {
-            cs_core::Number::Fixnum(i) => {
-                out.push(5);
-                out.extend_from_slice(&i.to_be_bytes());
+        nv @ (Value::Fixnum(_) | Value::Flonum(_) | Value::BigNumber(_) | Value::Rational(_)) => {
+            match nv.as_number().unwrap() {
+                cs_core::Number::Fixnum(i) => {
+                    out.push(5);
+                    out.extend_from_slice(&i.to_be_bytes());
+                }
+                cs_core::Number::Flonum(f) => {
+                    out.push(6);
+                    out.extend_from_slice(&f.to_bits().to_be_bytes());
+                }
+                cs_core::Number::Big(b) => {
+                    out.push(7);
+                    put_bytes(out, b.to_str_radix(10).as_bytes());
+                }
+                cs_core::Number::Rat(_) => {
+                    return Err("node-send: rationals not yet supported across actors".into());
+                }
             }
-            cs_core::Number::Flonum(f) => {
-                out.push(6);
-                out.extend_from_slice(&f.to_bits().to_be_bytes());
-            }
-            cs_core::Number::Big(b) => {
-                out.push(7);
-                put_bytes(out, b.to_str_radix(10).as_bytes());
-            }
-            cs_core::Number::Rat(_) => {
-                return Err("node-send: rationals not yet supported across actors".into());
-            }
-        },
+        }
         Value::String(s) => {
             out.push(8);
             put_bytes(out, s.borrow().as_bytes());
@@ -931,13 +929,13 @@ fn decode_value(c: &mut Dec, syms: &mut SymbolTable) -> Result<Value, String> {
                 char::from_u32(n).ok_or_else(|| format!("decode: bad char {n}"))?,
             ))
         }
-        5 => Ok(Value::Number(cs_core::Number::Fixnum(c.i64()?))),
-        6 => Ok(Value::Number(cs_core::Number::from_f64(f64::from_bits(
-            c.u64()?,
-        )))),
+        5 => Ok(Value::Fixnum(c.i64()?)),
+        6 => Ok(Value::from_number(cs_core::Number::from_f64(
+            f64::from_bits(c.u64()?),
+        ))),
         7 => {
             let s = c.string()?;
-            Ok(Value::Number(
+            Ok(Value::from_number(
                 cs_core::Number::parse_decimal_integer(&s).expect("bigint round-trip"),
             ))
         }

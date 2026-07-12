@@ -27,10 +27,7 @@ fn collected_addrs<T: CycleChildren + ?Sized>(node: &T) -> Vec<usize> {
 fn pair_with_two_leaves_yields_nothing() {
     // (cons 1 2) — neither slot is a heap container, so the
     // BR walk should see no children.
-    let p = Pair::new(
-        Value::Number(cs_core::Number::Fixnum(1)),
-        Value::Number(cs_core::Number::Fixnum(2)),
-    );
+    let p = Pair::new(Value::Fixnum(1), Value::Fixnum(2));
     assert_eq!(collected_addrs(&*p), Vec::<usize>::new());
 }
 
@@ -38,14 +35,8 @@ fn pair_with_two_leaves_yields_nothing() {
 fn pair_with_two_heap_children_yields_both() {
     // (cons (cons 1 2) (cons 3 4)) — both car and cdr point at
     // heap pairs.
-    let a = Pair::new(
-        Value::Number(cs_core::Number::Fixnum(1)),
-        Value::Number(cs_core::Number::Fixnum(2)),
-    );
-    let b = Pair::new(
-        Value::Number(cs_core::Number::Fixnum(3)),
-        Value::Number(cs_core::Number::Fixnum(4)),
-    );
+    let a = Pair::new(Value::Fixnum(1), Value::Fixnum(2));
+    let b = Pair::new(Value::Fixnum(3), Value::Fixnum(4));
     let outer = Pair::new(Value::Pair(a.clone()), Value::Pair(b.clone()));
 
     let got = collected_addrs(&*outer);
@@ -78,7 +69,7 @@ fn vector_emits_each_heap_element_once() {
 
     let v: Gc<RefCell<Vec<Value>>> = Gc::new(RefCell::new(vec![
         Value::Pair(p1.clone()),
-        Value::Number(cs_core::Number::Fixnum(7)),
+        Value::Fixnum(7),
         Value::Pair(p2.clone()),
         Value::Boolean(true),
         Value::Pair(p3.clone()),
@@ -97,8 +88,8 @@ fn hashtable_walks_keys_values_and_custom_fns() {
     // emit all six heap addrs (2 keys + 2 vals + 2 custom).
     let kp1 = Pair::new(Value::Boolean(true), Value::Null);
     let vp1 = Pair::new(Value::Boolean(false), Value::Null);
-    let kp2 = Pair::new(Value::Number(cs_core::Number::Fixnum(1)), Value::Null);
-    let vp2 = Pair::new(Value::Number(cs_core::Number::Fixnum(2)), Value::Null);
+    let kp2 = Pair::new(Value::Fixnum(1), Value::Null);
+    let vp2 = Pair::new(Value::Fixnum(2), Value::Null);
 
     // Custom hash/equiv slots — point at heap pairs as stand-ins
     // for procedures (the trait emits the Value heap_addr; what
@@ -158,7 +149,7 @@ fn promise_pending_walks_its_thunk() {
 #[test]
 fn promise_forced_walks_its_value() {
     // Build a promise then mutate state to Forced.
-    let inner = Pair::new(Value::Number(cs_core::Number::Fixnum(99)), Value::Null);
+    let inner = Pair::new(Value::Fixnum(99), Value::Null);
     let p = Promise::pending(Value::Unspecified);
     *p.state.borrow_mut() = cs_core::PromiseState::Forced(Value::Pair(inner.clone()));
     assert_eq!(collected_addrs(&*p), vec![Gc::as_addr(&inner)]);
@@ -166,7 +157,7 @@ fn promise_forced_walks_its_value() {
 
 #[test]
 fn promise_with_leaf_payload_emits_nothing() {
-    let p = Promise::pending(Value::Number(cs_core::Number::Fixnum(0)));
+    let p = Promise::pending(Value::Fixnum(0));
     assert_eq!(collected_addrs(&*p), Vec::<usize>::new());
 }
 
@@ -187,9 +178,7 @@ fn heap_addr_distinguishes_heap_vs_leaf() {
     assert!(Value::Eof.heap_addr().is_none());
     assert!(Value::Boolean(true).heap_addr().is_none());
     assert!(Value::Character('a').heap_addr().is_none());
-    assert!(Value::Number(cs_core::Number::Fixnum(0))
-        .heap_addr()
-        .is_none());
+    assert!(Value::Fixnum(0).heap_addr().is_none());
 }
 
 /// `RefCell<T>` and `Vec<T>` blanket impls in cs-gc let

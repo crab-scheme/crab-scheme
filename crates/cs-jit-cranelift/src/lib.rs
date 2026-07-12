@@ -153,7 +153,7 @@ mod tests {
         let c = cs_vm::vm::NanboxValue::fixnum(2).into_raw();
         let r = func(a, c);
         match unsafe { cs_vm::vm::NanboxValue(r).to_value() } {
-            cs_core::Value::Number(cs_core::Number::Fixnum(v)) => assert_eq!(v, 42),
+            cs_core::Value::Fixnum(v) => assert_eq!(v, 42),
             other => panic!("expected Fixnum(42), got {other:?}"),
         }
     }
@@ -203,7 +203,7 @@ mod tests {
         let call = |n: i64| -> i64 {
             let r = func(cs_vm::vm::NanboxValue::fixnum(n).into_raw());
             match unsafe { cs_vm::vm::NanboxValue(r).to_value() } {
-                cs_core::Value::Number(cs_core::Number::Fixnum(v)) => v,
+                cs_core::Value::Fixnum(v) => v,
                 other => panic!("expected Fixnum, got {other:?}"),
             }
         };

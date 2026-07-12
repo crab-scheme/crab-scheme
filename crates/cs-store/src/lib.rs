@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cs_core::{Gc, Number, Value};
+use cs_core::{Gc, Value};
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
 
@@ -159,7 +159,7 @@ fn arity_err(name: &str, expected: &str, got: usize) -> FfiError {
 
 fn expect_fixnum(name: &str, args: &[Value], idx: usize) -> Result<i64, FfiError> {
     match args.get(idx) {
-        Some(Value::Number(Number::Fixnum(v))) => Ok(*v),
+        Some(Value::Fixnum(v)) => Ok(*v),
         Some(other) => Err(FfiError::TypeMismatch {
             expected: "fixnum",
             got: other.type_name().to_string(),
@@ -786,7 +786,7 @@ mod tests {
 
     fn as_fixnum(v: &Value) -> i64 {
         match v {
-            Value::Number(Number::Fixnum(n)) => *n,
+            Value::Fixnum(n) => *n,
             _ => panic!("expected fixnum, got {:?}", v),
         }
     }

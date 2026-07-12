@@ -50,7 +50,7 @@ fn hot_arithmetic_closure_dispatches_through_jit() {
     // value when called fresh.
     let r = rt.eval_str_via_vm("<test>", "(addone 41)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected 42, got {:?}", other),
     }
 
@@ -75,7 +75,7 @@ fn cold_closure_runs_correctly_without_jit() {
         .unwrap();
     let r = rt.eval_str_via_vm("<test>", "(f 21)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(42)) => {}
+        Value::Fixnum(42) => {}
         other => panic!("expected 42, got {:?}", other),
     }
     assert_eq!(cs_vm::vm::jit_call_count(), 0);
@@ -105,7 +105,7 @@ fn recursive_fib_jits_after_warmup() {
     // past the threshold, triggering JIT compilation.
     let warmup = rt.eval_str_via_vm("<test>", "(fib 15)").unwrap();
     match warmup {
-        Value::Number(Number::Fixnum(610)) => {}
+        Value::Fixnum(610) => {}
         other => panic!("fib(15): expected 610, got {:?}", other),
     }
 
@@ -122,7 +122,7 @@ fn recursive_fib_jits_after_warmup() {
     // Post-warmup: fib(20) runs entirely on JIT. Verify the value.
     let r = rt.eval_str_via_vm("<test>", "(fib 20)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(6765)) => {}
+        Value::Fixnum(6765) => {}
         other => panic!("fib(20): expected 6765, got {:?}", other),
     }
 
@@ -189,18 +189,18 @@ fn jit_handles_fixnum_builtin_calls() {
 
     let r = rt.eval_str_via_vm("<jit>", "(div2 100)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(50)) => {}
+        Value::Fixnum(50) => {}
         other => panic!("expected 50, got {:?}", other),
     }
     let r = rt.eval_str_via_vm("<jit>", "(mod3 100)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(1)) => {}
+        Value::Fixnum(1) => {}
         other => panic!("expected 1 (100 mod 3), got {:?}", other),
     }
     let r = rt.eval_str_via_vm("<jit>", "(mask 13)").unwrap();
     match r {
         // 13 & 7 = 5
-        Value::Number(Number::Fixnum(5)) => {}
+        Value::Fixnum(5) => {}
         other => panic!("expected 5, got {:?}", other),
     }
 }
@@ -235,7 +235,7 @@ fn jit_handles_fixnum_predicates() {
             .eval_str_via_vm("<jit>", &format!("(classify {})", input))
             .unwrap();
         match r {
-            Value::Number(Number::Fixnum(n)) => {
+            Value::Fixnum(n) => {
                 assert_eq!(n, *expected, "classify({}) = {}", input, n);
             }
             other => panic!("classify {}: not a fixnum, got {:?}", input, other),
@@ -264,17 +264,17 @@ fn jit_handles_abs_min_max() {
 
     let r = rt.eval_str_via_vm("<jit>", "(dist 5 -3)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(8)) => {}
+        Value::Fixnum(8) => {}
         other => panic!("dist 5 -3: expected 8, got {:?}", other),
     }
     let r = rt.eval_str_via_vm("<jit>", "(clamp-low -2 0)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(0)) => {}
+        Value::Fixnum(0) => {}
         other => panic!("clamp-low -2 0: expected 0, got {:?}", other),
     }
     let r = rt.eval_str_via_vm("<jit>", "(clamp-hi 9999 1000)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(1000)) => {}
+        Value::Fixnum(1000) => {}
         other => panic!("clamp-hi 9999 1000: expected 1000, got {:?}", other),
     }
 }
@@ -305,7 +305,7 @@ fn jit_handles_free_var_env_lookup() {
     // the captured env via Inst::EnvLookup.
     let r = rt.eval_str_via_vm("<jit>", "(add-base 42)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(142)) => {}
+        Value::Fixnum(142) => {}
         other => panic!("expected 142, got {:?}", other),
     }
 
@@ -314,7 +314,7 @@ fn jit_handles_free_var_env_lookup() {
     rt.eval_str_via_vm("<jit>", "(set! base 1000)").unwrap();
     let r = rt.eval_str_via_vm("<jit>", "(add-base 5)").unwrap();
     match r {
-        Value::Number(Number::Fixnum(1005)) => {}
+        Value::Fixnum(1005) => {}
         other => panic!("expected 1005 after set!, got {:?}", other),
     }
 }
@@ -343,13 +343,13 @@ fn jit_handles_free_var_set_bang() {
     // wrote back through the JIT).
     let snap = rt.eval_str_via_vm("<jit>", "c").unwrap();
     let snap_n = match snap {
-        Value::Number(Number::Fixnum(n)) => n,
+        Value::Fixnum(n) => n,
         other => panic!("c not a fixnum: {:?}", other),
     };
     rt.eval_str_via_vm("<jit>", "(bump)").unwrap();
     let after = rt.eval_str_via_vm("<jit>", "c").unwrap();
     let after_n = match after {
-        Value::Number(Number::Fixnum(n)) => n,
+        Value::Fixnum(n) => n,
         other => panic!("c not a fixnum after bump: {:?}", other),
     };
     assert_eq!(after_n, snap_n + 1, "set! should have incremented c");

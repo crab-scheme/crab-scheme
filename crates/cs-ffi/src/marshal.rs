@@ -7,7 +7,7 @@
 //! implement these by hand or via a future derive macro.
 
 use crate::error::FfiError;
-use cs_core::{Number, Value};
+use cs_core::Value;
 
 /// Convert a Scheme `Value` into a Rust type. Returns
 /// `FfiError::TypeMismatch` when the value's runtime type doesn't
@@ -27,7 +27,7 @@ pub trait IntoValue {
 impl FromValue for i64 {
     fn from_value(v: &Value) -> Result<Self, FfiError> {
         match v {
-            Value::Number(Number::Fixnum(n)) => Ok(*n),
+            Value::Fixnum(n) => Ok(*n),
             other => Err(FfiError::TypeMismatch {
                 expected: "i64",
                 got: other.type_name().to_string(),
@@ -39,7 +39,13 @@ impl FromValue for i64 {
 impl FromValue for f64 {
     fn from_value(v: &Value) -> Result<Self, FfiError> {
         match v {
-            Value::Number(n) => Ok(n.to_f64()),
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => {
+                let n = nv.as_number().unwrap();
+                Ok(n.to_f64())
+            }
             other => Err(FfiError::TypeMismatch {
                 expected: "f64",
                 got: other.type_name().to_string(),
@@ -216,7 +222,7 @@ mod tests {
         assert_eq!(n, 42);
         let back = n.into_value();
         match back {
-            Value::Number(Number::Fixnum(42)) => {}
+            Value::Fixnum(42) => {}
             other => panic!("expected fixnum 42, got {:?}", other),
         }
     }
@@ -280,7 +286,7 @@ mod tests {
     fn option_some_unwraps() {
         let some: Option<i64> = Some(7);
         match some.into_value() {
-            Value::Number(Number::Fixnum(7)) => {}
+            Value::Fixnum(7) => {}
             other => panic!("expected 7, got {:?}", other),
         }
     }
@@ -308,7 +314,7 @@ mod tests {
     fn value_passthrough() {
         let v = Value::fixnum(99);
         let same: Value = Value::from_value(&v).unwrap();
-        assert!(matches!(same, Value::Number(Number::Fixnum(99))));
+        assert!(matches!(same, Value::Fixnum(99)));
     }
 
     #[test]

@@ -41,14 +41,26 @@ fn parse_summary(rt: &Runtime, v: &Value) -> (u64, u64, String) {
     let pass = iter
         .next()
         .and_then(|v| match v {
-            Value::Number(n) => n.to_f64().to_u64(),
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => {
+                let n = nv.as_number().unwrap();
+                n.to_f64().to_u64()
+            }
             _ => None,
         })
         .unwrap_or(0);
     let fail = iter
         .next()
         .and_then(|v| match v {
-            Value::Number(n) => n.to_f64().to_u64(),
+            nv @ (Value::Fixnum(_)
+            | Value::Flonum(_)
+            | Value::BigNumber(_)
+            | Value::Rational(_)) => {
+                let n = nv.as_number().unwrap();
+                n.to_f64().to_u64()
+            }
             _ => None,
         })
         .unwrap_or(0);
