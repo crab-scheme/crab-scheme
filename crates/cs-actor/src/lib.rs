@@ -1046,6 +1046,14 @@ impl ActorSystem {
             .worker_threads(workers)
             .max_blocking_threads(4096)
             .thread_name("cs-actor-blk")
+            // Tokio's default (2 MiB) is too small for a dedicated actor
+            // thread (`block_in_place`, no coroutine of its own — it runs
+            // directly on this OS thread's stack) that needs to `(send)` a
+            // large flat list: `to_sendable_in` (beam.rs) recurses one Rust
+            // stack frame per cons cell. Found via cw-m9c (G1 reads-off-
+            // thread): a dedicated range-worker thread overflowed its 2 MiB
+            // stack building the reply for a ~5-6k row LIST.
+            .thread_stack_size(64 * 1024 * 1024)
             .enable_all()
             .build()
             .expect("build tokio runtime");

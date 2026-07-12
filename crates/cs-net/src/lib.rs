@@ -126,6 +126,12 @@ pub enum TransportError {
 
 /// Per-peer transport handle. Implementations multiplex the six
 /// `Channel`s over their underlying byte stream.
+/// Callback fired by a transport whenever an inbound frame is queued (on any
+/// channel). Lets a consumer (cs-distrib's Router) block on "any inbound
+/// frame arrived" instead of sleep-polling `try_recv` — polling granularity
+/// otherwise becomes the mesh hop latency (crab-watchstore cw-xq9).
+pub type InboundWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 pub trait Transport: Send + Sync + std::fmt::Debug {
     /// Send a framed message on the given logical channel. Returns
     /// `Backpressure` if the per-channel queue is at its high
@@ -150,6 +156,12 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     /// Initiate a graceful close. Subsequent `send`s fail with
     /// `PeerClosed`.
     fn close(&self) -> Result<(), TransportError>;
+
+    /// Register a callback fired whenever an inbound frame is queued (any
+    /// channel). At most one waker per transport; a later call replaces the
+    /// earlier one. Default: no-op (the transport doesn't support wakeups
+    /// and consumers must poll).
+    fn set_inbound_waker(&self, _waker: InboundWaker) {}
 }
 
 /// Constructor knobs for opening a transport. Shared by all concrete
@@ -202,9 +214,19 @@ pub mod sim {
     }
 
     /// The six per-channel inbound queues for one direction.
-    #[derive(Debug)]
     struct SimQueues {
         channels: [SimChannelQueue; Channel::ALL.len()],
+        /// Waker of the endpoint that READS these queues (set via its
+        /// `set_inbound_waker`); fired by the peer's `send`.
+        waker: Mutex<Option<super::InboundWaker>>,
+    }
+
+    impl std::fmt::Debug for SimQueues {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SimQueues")
+                .field("channels", &self.channels)
+                .finish_non_exhaustive()
+        }
     }
 
     impl SimQueues {
@@ -219,6 +241,7 @@ pub mod sim {
                     deque: Mutex::new(VecDeque::new()),
                     high_watermark: hwm(c),
                 }),
+                waker: Mutex::new(None),
             })
         }
     }
@@ -251,6 +274,16 @@ pub mod sim {
                 });
             }
             deque.push_back(payload.to_vec());
+            drop(deque);
+            if let Some(w) = self
+                .outbound
+                .waker
+                .lock()
+                .expect("sim waker poisoned")
+                .as_ref()
+            {
+                w();
+            }
             Ok(())
         }
 
@@ -276,6 +309,10 @@ pub mod sim {
         fn close(&self) -> Result<(), TransportError> {
             self.closed.store(true, Ordering::Release);
             Ok(())
+        }
+
+        fn set_inbound_waker(&self, waker: super::InboundWaker) {
+            *self.inbound.waker.lock().expect("sim waker poisoned") = Some(waker);
         }
     }
 
@@ -380,6 +417,8 @@ pub mod tcp {
         /// Wakes the writer task when a frame is enqueued (or on close).
         outbound_wake: Arc<Notify>,
         inbound: Inbound,
+        /// Consumer waker fired by the reader task per queued inbound frame.
+        inbound_waker: Arc<Mutex<Option<super::InboundWaker>>>,
         closed: Arc<AtomicBool>,
         /// Abort handles for the reader + writer tasks, fired on `Drop` so
         /// the socket closes deterministically.
@@ -496,11 +535,18 @@ pub mod tcp {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            let inbound_waker: Arc<Mutex<Option<super::InboundWaker>>> = Arc::new(Mutex::new(None));
+            let wake_inbound = |slot: &Arc<Mutex<Option<super::InboundWaker>>>| {
+                if let Some(w) = slot.lock().expect("tcp waker poisoned").as_ref() {
+                    w();
+                }
+            };
             let delay_tx = if delay_ms > 0 {
                 let (tx, mut rx) =
                     tokio::sync::mpsc::unbounded_channel::<(usize, Vec<u8>, tokio::time::Instant)>(
                     );
                 let inbound_d = inbound.clone();
+                let waker_d = inbound_waker.clone();
                 tokio::spawn(async move {
                     while let Some((chi, payload, ready)) = rx.recv().await {
                         tokio::time::sleep_until(ready).await;
@@ -508,6 +554,7 @@ pub mod tcp {
                             .lock()
                             .expect("tcp inbound poisoned")
                             .push_back(payload);
+                        wake_inbound(&waker_d);
                     }
                 });
                 Some(tx)
@@ -517,6 +564,7 @@ pub mod tcp {
 
             // Reader: read, reassemble frames, fan out per channel.
             let inbound_r = inbound.clone();
+            let waker_r = inbound_waker.clone();
             let closed_r = closed.clone();
             let max_frame = cfg.max_frame_bytes;
             let delay = std::time::Duration::from_millis(delay_ms);
@@ -528,6 +576,7 @@ pub mod tcp {
                         Ok(0) | Err(_) => break, // EOF or socket error
                         Ok(n) => {
                             decoder.push(&buf[..n]);
+                            let mut queued = false;
                             loop {
                                 match decoder.next_frame() {
                                     Ok(Some((ch, payload))) => match &delay_tx {
@@ -538,14 +587,21 @@ pub mod tcp {
                                                 break 'read;
                                             }
                                         }
-                                        None => inbound_r[ch as usize]
-                                            .lock()
-                                            .expect("tcp inbound poisoned")
-                                            .push_back(payload),
+                                        None => {
+                                            inbound_r[ch as usize]
+                                                .lock()
+                                                .expect("tcp inbound poisoned")
+                                                .push_back(payload);
+                                            queued = true;
+                                        }
                                     },
                                     Ok(None) => break,
                                     Err(_) => break 'read, // malformed framing → drop
                                 }
+                            }
+                            // one wake per read() batch, not per frame
+                            if queued {
+                                wake_inbound(&waker_r);
                             }
                         }
                     }
@@ -558,6 +614,7 @@ pub mod tcp {
                 outbound,
                 outbound_wake,
                 inbound,
+                inbound_waker,
                 closed,
                 tasks: [writer.abort_handle(), reader.abort_handle()],
             }
@@ -660,6 +717,10 @@ pub mod tcp {
             self.outbound_wake.notify_one();
             Ok(())
         }
+
+        fn set_inbound_waker(&self, waker: super::InboundWaker) {
+            *self.inbound_waker.lock().expect("tcp waker poisoned") = Some(waker);
+        }
     }
 }
 
@@ -706,6 +767,8 @@ pub mod quic {
         /// control can't stall `Control` behind it in a shared queue.
         outbound: [mpsc::UnboundedSender<Vec<u8>>; Channel::ALL.len()],
         inbound: Inbound,
+        /// Consumer waker fired by the stream readers per queued inbound frame.
+        inbound_waker: Arc<Mutex<Option<super::InboundWaker>>>,
         closed: Arc<AtomicBool>,
         conn: Connection,
         tasks: Vec<tokio::task::AbortHandle>,
@@ -774,6 +837,7 @@ pub mod quic {
             single_stream: bool,
         ) -> Self {
             let inbound: Inbound = Arc::new(std::array::from_fn(|_| Mutex::new(VecDeque::new())));
+            let inbound_waker: Arc<Mutex<Option<super::InboundWaker>>> = Arc::new(Mutex::new(None));
             let closed = Arc::new(AtomicBool::new(false));
             let max_frame = cfg.max_frame_bytes;
             let mut tasks: Vec<tokio::task::AbortHandle> =
@@ -852,12 +916,14 @@ pub mod quic {
             // them (one stream may carry several channels in single-stream mode).
             let conn_r = conn.clone();
             let inbound_r = inbound.clone();
+            let waker_r = inbound_waker.clone();
             let closed_r = closed.clone();
             let acceptor = tokio::spawn(async move {
                 // One reader task per incoming uni stream; loop ends when the
                 // connection closes (`accept_uni` errors).
                 while let Ok(mut recv) = conn_r.accept_uni().await {
                     let inb = inbound_r.clone();
+                    let waker_s = waker_r.clone();
                     tokio::spawn(async move {
                         loop {
                             let mut hdr = [0u8; 5];
@@ -880,6 +946,9 @@ pub mod quic {
                                 .lock()
                                 .expect("quic inbound poisoned")
                                 .push_back(payload);
+                            if let Some(w) = waker_s.lock().expect("quic waker poisoned").as_ref() {
+                                w();
+                            }
                         }
                     });
                 }
@@ -891,6 +960,7 @@ pub mod quic {
                 peer_label,
                 outbound,
                 inbound,
+                inbound_waker,
                 closed,
                 conn,
                 tasks,
@@ -956,6 +1026,10 @@ pub mod quic {
             self.closed.store(true, Ordering::Release);
             self.conn.close(0u32.into(), b"closed");
             Ok(())
+        }
+
+        fn set_inbound_waker(&self, waker: super::InboundWaker) {
+            *self.inbound_waker.lock().expect("quic waker poisoned") = Some(waker);
         }
     }
 

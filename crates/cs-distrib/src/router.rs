@@ -97,6 +97,10 @@ pub struct Router {
     monitors: Mutex<Vec<Monitor>>,
     /// DOWN notices ready for local delivery.
     down_inbox: Mutex<VecDeque<DownNotice>>,
+    /// Signaled (via each peer transport's inbound waker) whenever an inbound
+    /// frame is queued on ANY peer/channel: a monotonically bumped counter +
+    /// condvar that `poll_channel_wait` blocks on instead of sleep-polling.
+    inbound_signal: Arc<(Mutex<u64>, std::sync::Condvar)>,
 }
 
 /// cw-gx4: the cs-net channels usable for per-group Raft traffic (NOT Control=0,
@@ -116,6 +120,7 @@ impl Router {
             chan_inboxes: std::array::from_fn(|_| Mutex::new(VecDeque::new())),
             monitors: Mutex::new(Vec::new()),
             down_inbox: Mutex::new(VecDeque::new()),
+            inbound_signal: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
         }
     }
 
@@ -145,6 +150,11 @@ impl Router {
 
     /// Register (or replace) the transport to `peer`.
     pub fn add_peer(&self, peer: NodeId, transport: Box<dyn Transport>) {
+        let sig = self.inbound_signal.clone();
+        transport.set_inbound_waker(Arc::new(move || {
+            *sig.0.lock().expect("inbound signal poisoned") += 1;
+            sig.1.notify_all();
+        }));
         self.peers.lock().expect("peers poisoned").insert(
             peer.label(),
             Peer {
@@ -277,6 +287,43 @@ impl Router {
             self.deliver_local_ch(ch, pid, payload);
         }
         Ok(delivered)
+    }
+
+    /// Like [`poll_channel`](Self::poll_channel), but when nothing is queued,
+    /// BLOCK (up to `timeout_ms`) on the inbound signal instead of returning —
+    /// the caller's poll loop needs no sleep, so mesh hop latency is delivery
+    /// latency, not polling granularity (crab-watchstore cw-xq9). Returns the
+    /// number of messages delivered (0 on timeout). The signal fires for ANY
+    /// channel's traffic, so a wake may re-poll and deliver 0; callers loop.
+    /// Blocking: call only from a dedicated thread, never a shared worker.
+    pub fn poll_channel_wait(&self, ch: u8, timeout_ms: u64) -> Result<usize, DistribError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let (lock, cv) = &*self.inbound_signal;
+        // Snapshot the counter BEFORE polling: a frame that lands between the
+        // poll and the wait bumps it, so the wait wakes immediately (no lost
+        // wakeup).
+        let mut seen = *lock.lock().expect("inbound signal poisoned");
+        loop {
+            let n = self.poll_channel(ch)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let mut g = lock.lock().expect("inbound signal poisoned");
+            if *g == seen {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Ok(0);
+                }
+                let (g2, timed_out) = cv
+                    .wait_timeout(g, deadline - now)
+                    .expect("inbound signal poisoned");
+                g = g2;
+                if timed_out.timed_out() && *g == seen {
+                    return Ok(0);
+                }
+            }
+            seen = *g;
+        }
     }
 
     fn deliver_local(&self, pid: DistPid, payload: Vec<u8>) {
@@ -436,6 +483,31 @@ mod tests {
         assert_eq!(b.recv_local(), None);
         assert_eq!(b.poll().unwrap(), 1);
         assert_eq!(b.recv_local(), Some((pid_on_b, b"ping".to_vec())));
+    }
+
+    #[test]
+    fn poll_channel_wait_wakes_on_send_and_times_out_when_idle() {
+        let a = Router::new(node("a"));
+        let b = Router::new(node("b"));
+        connect(&a, &b);
+        // Idle: times out with 0 delivered, without spinning.
+        let t0 = std::time::Instant::now();
+        assert_eq!(b.poll_channel_wait(1, 30).unwrap(), 0);
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(25));
+        // A send from another thread wakes the blocked wait well before the
+        // timeout (waker fires through the sim transport).
+        let pid_on_b = DistPid::new(node("b"), 42);
+        let a = std::sync::Arc::new(a);
+        let a2 = a.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            a2.send_ch(&pid_on_b, b"ping", 1).unwrap();
+        });
+        let t0 = std::time::Instant::now();
+        assert_eq!(b.poll_channel_wait(1, 5_000).unwrap(), 1);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(1_000));
+        assert!(b.recv_local_channel(1).is_some());
+        sender.join().unwrap();
     }
 
     #[test]

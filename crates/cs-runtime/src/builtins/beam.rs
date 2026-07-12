@@ -1359,7 +1359,16 @@ const ACTOR_STACK_BYTES: usize = 2 * 1024 * 1024;
 /// pages; the per-actor `Runtime` dominates at scale — see the green-threads
 /// P5.2 measurement). 1 MiB keeps generous non-tail headroom while halving the
 /// per-conn reservation.
-const GREEN_STACK_BYTES: usize = 1024 * 1024;
+///
+/// cw-m9c (G1): `to_sendable_in`/`from_sendable` (this file) recurse one Rust
+/// stack frame per cons cell, so a green actor `(receive)`-ing a large flat
+/// list — e.g. a gRPC conn actor receiving a `kv-range-ok` reply for a
+/// >=5k-row LIST — needs stack proportional to the list length; 1 MiB
+/// overflowed at ~4-5k rows. Bumped 64x (still a lazily-committed *virtual*
+/// reservation — no RSS cost until touched, so this is headroom, not a new
+/// steady-state memory cost per idle conn) to cover a full 100k-row LIST
+/// reply with margin.
+const GREEN_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cap on recycled stacks retained per worker, per pool. Past this, checked-in
 /// stacks are dropped — so a transient burst can't permanently pin many

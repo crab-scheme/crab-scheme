@@ -70,6 +70,15 @@ impl LocalWorkerPool {
             let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
             let handle = std::thread::Builder::new()
                 .name(format!("cs-actor-local-{i}"))
+                // cw-m9c (G1): a green actor body runs inside its own
+                // corosensei coroutine stack (GREEN_STACK_BYTES, beam.rs —
+                // that's the real lever for a `(receive)`-ing a large flat
+                // list, since `to_sendable_in`/`from_sendable` recurse one
+                // Rust stack frame per cons cell). This is just the shallow
+                // outer OS-thread stack the LocalSet dispatch loop itself
+                // runs on; a small bump over the 2 MiB default is cheap
+                // (lazily-committed virtual) defense-in-depth.
+                .stack_size(16 * 1024 * 1024)
                 .spawn(move || worker_main(job_rx))
                 .expect("spawn cs-actor local worker thread");
             workers.push(Worker {
