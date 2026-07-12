@@ -111,7 +111,8 @@ time. Allocation-adjacent cost (a+b+c, i.e. everything except NaN-box transcodin
 
 Across all three benches, `vm_value_clone_gc`/`vm_value_drop_gc` — the generic
 clone/drop helper pair that every out-of-line pair access, closure capture, and
-environment write routes through — are consistently in the top 5, and they in turn
+environment write routes through — dominate: `vm_value_clone_gc` is consistently
+top-5, with `vm_value_drop_gc` close behind (top 10 in all three benches), and they in turn
 bottom out in `Rc`-refcount traffic ((c)) and, for anything crossing the
 allocate-a-cons boundary, straight into `libsystem_malloc`/`cs_gc::rc_only::Gc::new`
 ((a)). binary-trees is the clearest case: it is dominated end-to-end by
@@ -134,7 +135,7 @@ with **nursery regions** as a close second for the allocation-heavy benches
 (alloc-stress, binary-trees) specifically, since a bump-allocated nursery would cut
 into the `libsystem_malloc` slice ((a), 21–33%) directly. A raw **allocator swap**
 alone would only address the (a) slice (21–33%) and leave the larger (b)+(c)
-helper-call/refcount overhead (27–48%) untouched, so it ranks last of the three
+helper-call/refcount overhead (27–39%) untouched, so it ranks last of the three
 options based on this data.
 
 ## Tool-availability caveats
