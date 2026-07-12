@@ -549,7 +549,7 @@ fn bytevector_value(bytes: Vec<u8>) -> Value {
 }
 
 fn string_value(s: String) -> Value {
-    Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s)))
+    Value::String(cs_gc::Gc::new(std::cell::RefCell::new(s.into())))
 }
 
 pub fn b_grpc_serve(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {

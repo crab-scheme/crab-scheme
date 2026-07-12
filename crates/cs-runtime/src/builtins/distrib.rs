@@ -555,7 +555,7 @@ pub fn b_node_poll_ch_wait(args: &[Value], syms: &mut SymbolTable) -> Result<Val
     let node = name_of(&args[0], syms, "node-poll-ch-wait")?;
     let ch = chan_of(&args[1], "node-poll-ch-wait")?;
     let timeout_ms = match &args[2] {
-        Value::Number(cs_core::Number::Fixnum(n)) if *n >= 0 => *n as u64,
+        Value::Fixnum(n) if *n >= 0 => *n as u64,
         _ => return Err("node-poll-ch-wait: TIMEOUT-MS must be a non-negative integer".into()),
     };
     let msgs = primop_node_poll_ch_wait_value(&node, ch, timeout_ms, syms)?;
