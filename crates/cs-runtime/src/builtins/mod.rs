@@ -13756,18 +13756,28 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
 /// ```
 ///
 /// Under `feature = "countable-memory"` (default): the tracing
-/// heap is retired. The integer counters report cycle-detector
-/// activity from `countable_memory_cycle` (allocations aren't
-/// tracked at the GC layer — Rc::new doesn't have a hook —
-/// so bytes-allocated-total + alloc-count-total + live-slots
-/// stay 0). Timings stay 0.0. collect-count reports
+/// heap is retired. Timings stay 0.0. collect-count reports
 /// `cycle_broken_count()`. The alist shape is preserved so
 /// benchmark scripts portable across Chez/CrabScheme don't
 /// fail-fast on missing keys.
+///
+/// `bytes-allocated-total` / `alloc-count-total` come from
+/// `cs_gc::alloc_telemetry` (Gap A-1). `live-slots` (cs-i6p.1)
+/// is that module's `live_count()` — `alloc_count_total -
+/// dealloc_count_total`, i.e. `Gc<T>` handles whose last strong
+/// reference hasn't dropped yet. It only covers Rc-backed
+/// `Gc<T>` (the default heap arm); region-backed allocations
+/// were never counted on the alloc side either, so they don't
+/// skew this number — see the module doc on
+/// `cs_gc::alloc_telemetry` for why.
 fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats", "0", args.len()));
     }
+    // Built ahead of the `pair` closure below: it needs its own
+    // `&mut SymbolTable` borrow, which can't interleave with
+    // `pair`'s borrow for the rest of the function.
+    let histogram_val = gc_stats_histogram_value(syms);
     let mut pair = |k: &str, v: Value| -> Value {
         let key_sym = syms.intern(k);
         Value::Pair(cs_core::Pair::new(Value::Symbol(key_sym), v))
@@ -13781,6 +13791,12 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
         // always-zero stub.
         let bytes = cs_gc::alloc_telemetry::bytes_allocated_total();
         let allocs = cs_gc::alloc_telemetry::alloc_count_total();
+        // cs-i6p.1: live = alloc - dealloc (Rc-arm only; see
+        // the alloc_telemetry module doc).
+        let live = cs_gc::alloc_telemetry::live_count();
+        let live_b = cs_gc::alloc_telemetry::live_bytes();
+        let dealloc_bytes = cs_gc::alloc_telemetry::bytes_deallocated_total();
+        let dealloc_count = cs_gc::alloc_telemetry::dealloc_count_total();
         // parallel-runtime C4.4: surface the layer-4 BR sweep
         // counters from `cs_gc::cycle_registry`. Three keys:
         //
@@ -13818,7 +13834,7 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
             pair("bytes-allocated-total", fixnum_or_bigint(bytes)),
             pair("alloc-count-total", fixnum_or_bigint(allocs)),
             pair("collect-count", Value::fixnum(cycles_broken as i64)),
-            pair("live-slots", Value::fixnum(0)),
+            pair("live-slots", fixnum_or_bigint(live)),
             pair("collect-time-ms", Value::flonum(0.0)),
             pair("last-pause-ms", Value::flonum(0.0)),
             pair("max-pause-ms", Value::flonum(0.0)),
@@ -13836,8 +13852,45 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
             pair("sweep-cycles-collected", Value::fixnum(sweep_cycles as i64)),
             pair("sweep-time-us", fixnum_or_bigint(sweep_time_us)),
             pair("sweep-broken-total", fixnum_or_bigint(sweep_total)),
+            // cs-i6p.1: deallocation + live-byte telemetry,
+            // symmetric with the alloc-side keys above.
+            pair("bytes-deallocated-total", fixnum_or_bigint(dealloc_bytes)),
+            pair("dealloc-count-total", fixnum_or_bigint(dealloc_count)),
+            pair("live-bytes", fixnum_or_bigint(live_b)),
+            // cs-i6p.1: per-type histogram, only populated
+            // under `feature = "alloc-histogram"` (off by
+            // default). Shape: a list of (type count bytes)
+            // triples, one per bucket. Empty list when the
+            // feature is off, so callers that don't care can
+            // just ignore the key.
+            pair("alloc-histogram", histogram_val),
         ]))
     }
+}
+
+/// Build the `alloc-histogram` value for [`b_gc_stats`]: a list
+/// of `(type count bytes)` triples under `feature =
+/// "alloc-histogram"`, or `'()` when the feature is off (the
+/// histogram module isn't compiled in at all in that case).
+#[cfg(feature = "alloc-histogram")]
+fn gc_stats_histogram_value(syms: &mut SymbolTable) -> Value {
+    Value::list(
+        cs_gc::alloc_telemetry::histogram::snapshot()
+            .into_iter()
+            .map(|(name, count, bytes)| {
+                Value::list(vec![
+                    Value::Symbol(syms.intern(name)),
+                    fixnum_or_bigint(count),
+                    fixnum_or_bigint(bytes),
+                ])
+            })
+            .collect(),
+    )
+}
+
+#[cfg(not(feature = "alloc-histogram"))]
+fn gc_stats_histogram_value(_syms: &mut SymbolTable) -> Value {
+    Value::Null
 }
 
 /// `(gc-allocator v)` — parallel-runtime C5.2. Returns a
