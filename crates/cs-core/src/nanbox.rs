@@ -258,6 +258,12 @@ pub fn nb_encode_flonum(f: f64) -> i64 {
 // to restore the original crate-private encapsulation for its own
 // downstream consumers (e.g. cs-jit-cranelift never saw this before
 // and shouldn't now either).
+//
+// SAFETY-ADJACENT: this is a thread-local refcounted slot table; a
+// `take`/`decref` from outside the NanboxValue lifecycle can free a
+// slot a live NB_TAG_PROCEDURE payload still indexes (index-checked
+// panic, not UB). Hidden from docs — not a public API.
+#[doc(hidden)]
 pub mod proc_table {
     use std::cell::RefCell;
     use std::rc::Rc;

@@ -66,11 +66,11 @@ const CATCH_AND_REPORT: &str = r#"
 fn caught_pair_message(v: &Value, label: &str) -> String {
     match v {
         Value::Pair(p) => {
-            match &*p.car.borrow() {
+            match &p.car() {
                 Value::Symbol(_) => {}
                 other => panic!("{label}: expected symbol in car, got {:?}", other),
             }
-            match &*p.cdr.borrow() {
+            match &p.cdr() {
                 Value::String(s) => s.borrow().clone(),
                 other => panic!("{label}: expected string in cdr, got {:?}", other),
             }
@@ -85,7 +85,7 @@ fn assert_caught_recognized_as_error_object(v: &Value, label: &str) {
         // template encoded the predicate result as 'is-error-object.
         // We just verify the shape (Symbol) here and rely on the
         // message check to verify the variant.
-        if !matches!(&*p.car.borrow(), Value::Symbol(_)) {
+        if !matches!(&p.car(), Value::Symbol(_)) {
             panic!("{label}: car is not a symbol");
         }
     } else {
@@ -212,11 +212,11 @@ fn eval_continues_after_caught_ffi_error() {
     let (walker, vm) = eval_both_tiers(p, src);
     let check = |v: Value, label: &str| match v {
         Value::Pair(p) => {
-            match &*p.car.borrow() {
+            match &p.car() {
                 Value::Symbol(_) => {}
                 other => panic!("{label}: expected 'caught, got {:?}", other),
             }
-            match &*p.cdr.borrow() {
+            match &p.cdr() {
                 Value::Fixnum(123) => {}
                 other => panic!("{label}: expected 123 in cdr, got {:?}", other),
             }
