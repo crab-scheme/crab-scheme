@@ -357,7 +357,7 @@ mod tests {
     #[ignore = "run only via run_isolated, in its own subprocess"]
     fn allocation_size_includes_payload_size_isolated() {
         reset();
-        let _g: Gc<[u8; 1024]> = Gc::new([0u8; 1024]);
+        let _g: Gc<[u64; 128]> = Gc::new([0u64; 128]); // align 8: Gc::new debug_asserts align >= 2
         let bytes = bytes_allocated_total();
         // 1024-byte payload + 16-byte header = 1040 on
         // 64-bit. Allow any value ≥ 1024.
