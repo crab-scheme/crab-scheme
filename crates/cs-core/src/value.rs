@@ -392,6 +392,12 @@ impl Pair {
             "Pair::car_raw_nb: use-after-region-drop — see the matching \
              debug_assert in car() for the full rationale."
         );
+        // Release-mode counterpart of the debug_assert above: mirrors
+        // peek_car's dead-region degrade so a freed-arena payload
+        // doesn't get increfed (UB) in release builds.
+        if !unsafe { nb_owning_payload_is_live(self.car.get() as i64) } {
+            return NanboxValue::UNSPECIFIED.into_raw() as u64;
+        }
         unsafe { nb_clone_owned(self.car.get() as i64) as u64 }
     }
 
@@ -414,6 +420,12 @@ impl Pair {
             "Pair::cdr_raw_nb: use-after-region-drop — see the matching \
              debug_assert in cdr() for the full rationale."
         );
+        // Release-mode counterpart of the debug_assert above: mirrors
+        // peek_cdr's dead-region degrade so a freed-arena payload
+        // doesn't get increfed (UB) in release builds.
+        if !unsafe { nb_owning_payload_is_live(self.cdr.get() as i64) } {
+            return NanboxValue::UNSPECIFIED.into_raw() as u64;
+        }
         unsafe { nb_clone_owned(self.cdr.get() as i64) as u64 }
     }
 
