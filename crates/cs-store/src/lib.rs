@@ -61,6 +61,7 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("store-cf-create", store_cf_create),
         UntypedProc::new("store-get", store_get),
         UntypedProc::new("store-put", store_put),
+        UntypedProc::new("store-put-many", store_put_many),
         UntypedProc::new("store-delete", store_delete),
         UntypedProc::new("store-write-batch", store_write_batch),
         UntypedProc::new("store-iter", store_iter),
@@ -316,6 +317,63 @@ fn store_put(args: &[Value]) -> Result<Value, FfiError> {
     }
     .map_err(|e| FfiError::HostFailure(format!("store-put: {}", e)))?;
     Ok(Value::Unspecified)
+}
+
+
+/// (store-put-many ID CF ((K . V) ...) [SYNC]) — cw-65x: write a whole
+/// apply-batch as ONE RocksDB WriteBatch + one write. The hot consensus
+/// apply path writes 2 rows per PUT; per-row store-put paid a WriteBatch
+/// alloc + write + FFI round-trip each.
+fn store_put_many(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(arity_err("store-put-many", "3 or 4", args.len()));
+    }
+    let id = expect_fixnum("store-put-many", args, 0)?;
+    let cf_name = expect_string("store-put-many", args, 1)?;
+    let sync = opt_bool(args, 3);
+    let db = db_get(id, "store-put-many")?;
+    let mut batch = WriteBatch::default();
+    let cf = if cf_name == "default" {
+        None
+    } else {
+        Some(db.cf_handle(&cf_name).ok_or_else(|| {
+            FfiError::HostFailure(format!("store-put-many: unknown CF {:?}", cf_name))
+        })?)
+    };
+    let mut cur = args[2].clone();
+    let mut n: i64 = 0;
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let (head, tail) = (p.car(), p.cdr());
+                match &head {
+                    Value::Pair(kv) => {
+                        let k = match &kv.car() {
+                            Value::ByteVector(b) => b.borrow().clone(),
+                            v => return Err(FfiError::HostFailure(format!(
+                                "store-put-many: key not a bytevector: {:?}", v.type_name()))),
+                        };
+                        let v = match &kv.cdr() {
+                            Value::ByteVector(b) => b.borrow().clone(),
+                            v => return Err(FfiError::HostFailure(format!(
+                                "store-put-many: value not a bytevector: {:?}", v.type_name()))),
+                        };
+                        match &cf { Some(cf) => batch.put_cf(cf, &k, &v), None => batch.put(&k, &v) }
+                        n += 1;
+                    }
+                    _ => return Err(FfiError::HostFailure(
+                        "store-put-many: entry not a (K . V) pair".into())),
+                }
+                cur = tail;
+            }
+            _ => return Err(FfiError::HostFailure(
+                "store-put-many: entries must be a proper list".into())),
+        }
+    }
+    db.write_opt(batch, &write_opts(sync))
+        .map_err(|e| FfiError::HostFailure(format!("store-put-many: {}", e)))?;
+    Ok(Value::Fixnum(n))
 }
 
 fn store_delete(args: &[Value]) -> Result<Value, FfiError> {
