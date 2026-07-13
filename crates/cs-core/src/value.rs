@@ -681,7 +681,10 @@ thread_local! {
 /// JIT's `vm_vector_set_gc`, …) and overwrite the raw slot directly
 /// without knowing about the tombstone table; if the slot no longer
 /// reads `Unspecified`, the tombstone is stale and is dropped here
-/// instead of shadowing the real value.
+/// instead of shadowing the real value. Known edge: a raw writer that
+/// stores the literal unspecified value (e.g. `(vector-fill! v (if #f #f))`)
+/// over a demoted slot is indistinguishable from the placeholder, so the
+/// tombstone stays honored — inherent to the sentinel design.
 pub fn vector_get(v: &cs_gc::Gc<RefCell<Vec<Value>>>, i: usize) -> Option<Value> {
     let raw = {
         let vb = v.borrow();
