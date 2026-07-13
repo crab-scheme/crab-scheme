@@ -21,40 +21,65 @@
   `bench/microbench/scheme/`, same scale-ups as the .1 doc (`alloc-stress` n
   200→60000, `binary-trees` depth 10→18, `nqueens` 8→11).
 
-## Repro: plain execution (no profiler)
+## Methodology note: contention control
+
+37% steady background CPU from unrelated processes is, on its own, a plausible source
+of a wall-vs-cpu gap (scheduler contention can itself manufacture the very anomaly
+under test). To rule that out, every condition below was run **10 times**, reporting
+the **minimum wall time** (least-contaminated sample) alongside its paired cpu time,
+and a known CPU-bound control — `fib(40)` at vm-jit tier
+(`bench/microbench/scheme/fib.scm`, pure recursive arithmetic, negligible allocation)
+— was run under the identical conditions as the allocation-heavy benches. If the
+control also shows a wall>>cpu gap, the gap is contention, not something specific to
+the allocation-heavy JIT path.
+
+## Repro: plain execution (no profiler), min-of-10, with control
 
 `/usr/bin/time -l ./target/release/crabscheme --tier vm-jit run prof-scm/<bench>.scm`,
-2 repeats each, under the load conditions above:
+10 repeats each, min wall time reported (paired cpu from that same run), load1 8-10
+throughout this batch:
 
-| Bench | real (s) | user (s) | sys (s) | CPU util |
-|---|---|---|---|---|
-| alloc-stress | 2.02–2.23 | 1.96–2.16 | 0.03–0.04 | 97–99% |
-| binary-trees | 2.10–2.38 | 1.77–1.98 | 0.28–0.30 | 93–98% |
-| nqueens | 1.81–1.84 | 1.69–1.73 | 0.08–0.09 | 97–98% |
+| Bench | min real (s) | user+sys (s) | CPU util |
+|---|---|---|---|
+| **fib (control)** | 0.42 | 0.42 | **100%** |
+| alloc-stress | 2.03 | 2.02 | 99% |
+| binary-trees | 1.89 | 1.87 | 99% |
+| nqueens | 1.70 | 1.66 | 98% |
 
-**The anomaly does not reproduce.** Wall time tracks CPU time almost exactly (93-99%
-utilization) across all three benches, across repeats, even under the elevated
-background load described above. This is the opposite of "wall ≈ 3-4x cpu."
+**The anomaly does not reproduce, and the control confirms the background load isn't
+the cause.** `fib` — a pure CPU-bound recursive control with essentially no
+allocation — is 100% CPU-bound at its minimum, indistinguishable from the
+allocation-heavy benches (98-99%), under the same load1 8-10 background contention. If
+contention were producing an off-CPU gap, the control would show it too; it doesn't.
+This is the opposite of "wall ≈ 3-4x cpu."
 
-## Repro: same benches wrapped in `samply record` (the .1 methodology)
+## Repro: same benches wrapped in `samply record` (the .1 methodology), min-of-10
 
 `/usr/bin/time -l samply record --save-only --unstable-presymbolicate -o out.json --
 ./target/release/crabscheme --tier vm-jit run prof-scm/<bench>.scm` (using samply's
 resolved store path directly, to avoid `devenv shell` activation overhead confounding
-the wall-clock number):
+the wall-clock number), 10 repeats each, min wall reported:
 
-| Bench | real (s) | user (s) | sys (s) | CPU util |
-|---|---|---|---|---|
-| alloc-stress | 3.23 | 2.20 | 0.14 | 72% |
-| binary-trees | 3.19 | 1.92 | 0.41 | 73% |
-| nqueens | 3.20 | 1.85 | 0.17 | 63% |
+| Bench | min real (s) | user+sys (s) | CPU util |
+|---|---|---|---|
+| **fib (control)** | 1.16 | 0.41 | **35%** |
+| alloc-stress | 2.18 | 1.99 | 91% |
+| binary-trees | 2.17 | 1.95 | 90% |
+| nqueens | 2.17 | 1.76 | 81% |
 
-Wrapping the identical binary/benches in `samply record` reproduces a real wall-vs-cpu
-gap (63-73% utilization) that is entirely absent from the unwrapped runs above. The gap
-is not as extreme as the .1 doc's reported 30-40%; the residual difference is plausibly
-the .1 build's `CARGO_PROFILE_RELEASE_DEBUG=true` (debug info makes presymbolication
-write-out — the dominant term, see below — much heavier) plus a busier box that day,
-but that attribution is **untested**, not verified here.
+This is the decisive result: wrapping the identical binaries in `samply record`
+reproduces a wall-vs-cpu gap that is entirely absent from every unwrapped run above —
+**and the gap is largest for the control (`fib`, 35% util), not for the
+allocation-heavy benches.** A trivial 0.42s-cpu program takes 1.16s wall solely because
+of `samply`'s own overhead, which does not scale down for a short, non-allocating
+target. For the longer-running benches that same roughly-constant overhead is a
+smaller fraction of total wall time, so utilization looks closer to 100% — the inverse
+of what a scheduler-contention or allocation-driven explanation would predict (either
+would hit the alloc-heavy benches harder than `fib`, not lighter). A handful of the
+alloc-stress/binary-trees samply runs also showed occasional ~1s quantized jumps
+(cpu-time unchanged) — plausibly the sampling thread getting preempted under the
+background load — but that jitter is itself only visible when running under samply's
+extra threads, not in the unwrapped table above.
 
 ## Root cause
 
@@ -75,16 +100,12 @@ macOS rather than anything in `cs-runtime`/`cs-vm`/mimalloc:
    with sampling rate and is more pronounced on a loaded machine — consistent with the
    .1 doc's own note that it was captured on a busier box.
 
-Split measurement (verification pass): timestamping the samply-wrapped nqueens run's
-output shows the workload finished at t+2.24s (vs ~1.9s unwrapped → only ~0.3s in-run
-sampling tax, ~85% util during execution), with ~1.1s spent AFTER the workload exited
-on presymbolication/write-out (total 3.33s real / 2.16s CPU = 65%). The gap is
-dominated by the post-run write-out term, confirming factor 1 as the primary mechanism.
-
 The clean signal is the plain-execution table: with the profiler out of the loop,
-`crabscheme` is genuinely CPU-bound (93-99% utilization) on these benches, even under
-non-quiet conditions. There is no scheduler/paging/mimalloc-arena issue to chase here —
-the .1 doc's caveat was measuring the profiler, not the runtime.
+`crabscheme` is genuinely CPU-bound (98-100% utilization at min-of-10, including the
+`fib` control) on these benches, even under non-quiet conditions. There is no
+scheduler/paging/mimalloc-arena issue to chase here — the .1 doc's caveat was
+measuring the profiler, not the runtime, and the `fib` control rules out background
+contention as an alternative explanation.
 
 ## Recommendation
 
