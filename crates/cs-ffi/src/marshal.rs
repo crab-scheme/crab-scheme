@@ -110,9 +110,9 @@ impl<T: FromValue> FromValue for Vec<T> {
             match cur {
                 Value::Null => return Ok(out),
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
+                    let car = p.car();
                     out.push(T::from_value(&car)?);
-                    cur = p.cdr.borrow().clone();
+                    cur = p.cdr();
                 }
                 other => {
                     return Err(FfiError::TypeMismatch {

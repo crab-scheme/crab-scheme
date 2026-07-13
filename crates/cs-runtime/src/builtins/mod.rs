@@ -2768,8 +2768,8 @@ fn strip_identifier_marks(v: &Value) -> Value {
     match v {
         Value::Identifier { name, .. } => Value::Symbol(*name),
         Value::Pair(p) => {
-            let car_new = strip_identifier_marks(&p.car.borrow());
-            let cdr_new = strip_identifier_marks(&p.cdr.borrow());
+            let car_new = strip_identifier_marks(&p.car());
+            let cdr_new = strip_identifier_marks(&p.cdr());
             Value::Pair(Pair::new(car_new, cdr_new))
         }
         Value::Vector(vec_) => {
@@ -2812,8 +2812,8 @@ fn stamp_datum_with_mark(v: &Value, mark: u64) -> Value {
     match v {
         Value::Symbol(name) => Value::Identifier { name: *name, mark },
         Value::Pair(p) => {
-            let car_new = stamp_datum_with_mark(&p.car.borrow(), mark);
-            let cdr_new = stamp_datum_with_mark(&p.cdr.borrow(), mark);
+            let car_new = stamp_datum_with_mark(&p.car(), mark);
+            let cdr_new = stamp_datum_with_mark(&p.cdr(), mark);
             Value::Pair(Pair::new(car_new, cdr_new))
         }
         Value::Vector(vec_) => {
@@ -2979,7 +2979,7 @@ fn b_generate_temporaries_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value,
             Value::Null => break,
             Value::Pair(p) => {
                 n += 1;
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             _ => return Err(type_err("generate-temporaries", "list", &args[0])),
         }
@@ -11364,11 +11364,11 @@ pub(crate) fn decode_environment(
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
-                let tail = p.cdr.borrow().clone();
+                let head = p.car();
+                let tail = p.cdr();
                 if let Value::Pair(kv) = head {
-                    if let Value::Symbol(s) = kv.car.borrow().clone() {
-                        map.insert(s, kv.cdr.borrow().clone());
+                    if let Value::Symbol(s) = kv.car() {
+                        map.insert(s, kv.cdr());
                     }
                 }
                 cur = tail;
@@ -11506,13 +11506,13 @@ fn namespace_update(
     loop {
         match cur {
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 if let Value::Pair(kv) = head {
-                    if let Value::Symbol(s) = kv.car.borrow().clone() {
-                        entries.push((s, kv.cdr.borrow().clone()));
+                    if let Value::Symbol(s) = kv.car() {
+                        entries.push((s, kv.cdr()));
                     }
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             _ => break,
         }

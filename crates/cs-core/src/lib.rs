@@ -7,6 +7,7 @@
 //! - Equality predicates [`eq::eq`], [`eq::eqv`], [`eq::equal`]
 
 pub mod eq;
+pub mod nanbox;
 pub mod number;
 pub mod symbol;
 pub mod value;

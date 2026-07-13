@@ -361,8 +361,8 @@ fn list_to_vec(v: &Value) -> Result<Vec<Value>, FfiError> {
         match cur {
             Value::Null => return Ok(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             _ => {
                 return Err(FfiError::TypeMismatch {
