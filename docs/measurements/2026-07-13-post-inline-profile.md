@@ -43,11 +43,11 @@ The bead's stated gate: "if malloc+free share is now under ~10-12% on the alloc
 benches, a nursery cannot pay for its complexity — skip." Two of three benches
 (alloc-stress 18.3%, binary-trees 24.9%) are **above** that threshold — on a naive
 read of the gate alone, that's a GO signal, not skip. binary-trees in particular
-barely moved (27.8% → 24.9%) despite mimalloc + inline cons landing, because NB pairs
-made `car`/`cdr` free (no more helper-call/RC-clone overhead) — which shrank the
-*denominator* (total on-CPU time for the bench dropped ~24% per cs-vnf.4's own
-measurement) faster than it shrank the *numerator* (each `cons` still costs one
-mimalloc allocation). Only nqueens (7.2%, few cons-heavy hot loops relative to env
+barely moved (27.8% → 24.9%) despite mimalloc + inline cons landing: total bench
+time dropped ~24% (cs-vnf.4) and, since the share also fell slightly, absolute
+malloc time dropped even faster (~32% — mimalloc cut per-cons cost too); both
+numerator and denominator shrank together, leaving the *share* nearly flat because
+each `cons` still costs one mimalloc allocation. Only nqueens (7.2%, few cons-heavy hot loops relative to env
 lookup / NaN-box transcode / IC dispatch) clears the skip bar on its own.
 
 **But the malloc-share number alone is the wrong test here**, and the bead names the
@@ -66,12 +66,12 @@ skip finding."* Checking that:
   "requires the programmer's own discipline" otherwise). A cross-call, returned-value
   cons is exactly the case SRA cannot currently prove safe.
 - `binary-trees`'s hot allocation site is `make-tree`: every `cons` there builds a
-  tree node that's stored in the *caller's* recursive structure and lives for the
-  entire tree's lifetime (summed over the whole `check`/traversal pass) — that's a
-  genuinely escaping, long-lived allocation. No nursery/region scheme (bump-allocate,
-  promote-on-escape) helps this case; it needs real heap allocation regardless, and a
-  nursery would only add a promotion-copy tax on top for values that were never going
-  to die young.
+  tree node that's stored in the *caller's* recursive structure and lives across the
+  entire `check`/traversal pass (each tree dies right after its check, but every node
+  escapes `make-tree` via the return value). Exploiting that shape needs
+  interprocedural return-value promotion — the deferred #51b/#51c wall — and a
+  promote-on-escape nursery would pay a promotion-copy tax on every node, since all
+  of them escape their allocating frame.
 - So the residual malloc share splits into two buckets neither of which a *new*
   nursery mechanism profitably attacks: (1) truly-escaping, long-lived conses
   (binary-trees, most of nqueens' minimal residual) — a nursery can't help these,
@@ -89,7 +89,9 @@ skip finding."* Checking that:
 
 No new nursery is being built. The malloc share that remains after cs-vnf.2/.3/.4 is
 concentrated in exactly the two categories a bump-nursery-with-promotion cannot
-profitably improve on an RC heap: (1) genuinely-escaping, long-lived allocations,
+profitably improve on an RC heap (an *evacuating* nursery is off the table entirely:
+raw `Rc` pointers are embedded in NaN-boxed `u64` payloads with no read barrier or
+forwarding support, so the heap is non-moving by construction): (1) genuinely-escaping, long-lived allocations,
 where a nursery only adds a promotion-copy cost; and (2) cross-call short-lived
 allocations, where the *only* profitable mechanism (interprocedural escape-to-region
 promotion) is the one `#51b`/`#51c` already prototyped and deferred for
