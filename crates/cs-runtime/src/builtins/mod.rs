@@ -565,6 +565,8 @@ pub fn pure_builtins() -> Vec<PureEntry> {
         ("bytevector-copy!", b_bytevector_copy_bang),
         ("string-copy!", b_string_copy_bang),
         ("bytevector-nul-unescape", b_bytevector_nul_unescape),
+        ("bytevector-nul-escape", b_bytevector_nul_escape),
+        ("bytevector-not", b_bytevector_not),
         // bytevectors
         ("make-bytevector", b_make_bytevector),
         ("bytevector", b_bytevector),
@@ -10602,6 +10604,51 @@ fn b_bytevector_nul_unescape(args: &[Value]) -> Result<Value, String> {
         }
     }
     drop(bytes);
+    Ok(Value::ByteVector(cs_core::Gc::new(
+        std::cell::RefCell::new(out),
+    )))
+}
+
+/// `(bytevector-nul-escape bv)` — cw-65x. Native mirror of
+/// bytevector-nul-unescape's encode side: each 0x00 byte becomes 0x00 0xFF
+/// (order-preserving escape used by KEY-CF key schemas). One native pass
+/// instead of an interpreted per-byte loop on the hot apply path.
+fn b_bytevector_nul_escape(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("bytevector-nul-escape", "1", args.len()));
+    }
+    let bv = match &args[0] {
+        Value::ByteVector(bv) => bv,
+        v => return Err(type_err("bytevector-nul-escape", "bytevector", v)),
+    };
+    let bytes = bv.borrow();
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    for &b in bytes.iter() {
+        if b == 0 {
+            out.push(0);
+            out.push(0xFF);
+        } else {
+            out.push(b);
+        }
+    }
+    drop(bytes);
+    Ok(Value::ByteVector(cs_core::Gc::new(
+        std::cell::RefCell::new(out),
+    )))
+}
+
+/// `(bytevector-not bv)` — cw-65x. Bitwise complement of every byte into a
+/// fresh bytevector (order-inverting transform for descending on-disk sort
+/// keys). Replaces an interpreted per-byte XOR loop.
+fn b_bytevector_not(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(arity_err("bytevector-not", "1", args.len()));
+    }
+    let bv = match &args[0] {
+        Value::ByteVector(bv) => bv,
+        v => return Err(type_err("bytevector-not", "bytevector", v)),
+    };
+    let out: Vec<u8> = bv.borrow().iter().map(|b| !b).collect();
     Ok(Value::ByteVector(cs_core::Gc::new(
         std::cell::RefCell::new(out),
     )))
