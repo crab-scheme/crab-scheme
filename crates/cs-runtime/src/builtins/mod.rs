@@ -4588,10 +4588,11 @@ fn b_vector_ref(args: &[Value]) -> Result<Value, String> {
         return Err("vector-ref: negative index".into());
     }
     match &args[0] {
-        Value::Vector(v) => v
-            .borrow()
-            .get(i as usize)
-            .cloned()
+        // cs-i6p.2: `vector_get` transparently upgrades a weak
+        // slot-cycle tombstone (see cs_core::value's vector
+        // tombstone doc) — the canonical `vector-ref` observation
+        // channel for a demoted self-referential slot.
+        Value::Vector(v) => cs_core::value::vector_get(v, i as usize)
             .ok_or_else(|| "vector-ref: index out of range".into()),
         v => Err(type_err("vector-ref", "vector", v)),
     }
@@ -4607,13 +4608,12 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Vector(v) => {
-            {
-                let mut vw = v.borrow_mut();
-                if (i as usize) >= vw.len() {
-                    return Err("vector-set!: index out of range".into());
-                }
-                vw[i as usize] = args[2].clone();
+            if (i as usize) >= v.borrow().len() {
+                return Err("vector-set!: index out of range".into());
             }
+            // cs-i6p.2: `vector_set` clears any stale tombstone on
+            // this slot before writing the fresh strong value.
+            cs_core::value::vector_set(v, i as usize, args[2].clone());
             // Region-memory iter 5 (FR-8): see b_set_car.
             #[cfg(feature = "regions")]
             if cs_gc::Gc::is_region(v) {
@@ -4624,6 +4624,12 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
             if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
                 cs_gc::cycle::check_and_break(v, |v| {
                     crate::countable_memory_cycle::record_cycle_with_candidate(v);
+                    // cs-i6p.2: baseline=3, same reasoning as
+                    // b_set_car's `(set-car! p p)` case — see
+                    // `vector_break_slot_cycle`'s doc.
+                    if cs_core::value::vector_break_slot_cycle(v, i as usize, 3) {
+                        crate::countable_memory_cycle::record_cycle_broken();
+                    }
                 });
             }
             Ok(Value::Unspecified)
@@ -6974,9 +6980,15 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Err(arity_err("hashtable-set!", "3", args.len()));
     }
     let h = as_ht("hashtable-set!", &args[0])?.clone();
+    // cs-i6p.2: track the just-written index so the cycle-break
+    // callback below knows which slot to demote.
+    let written_idx;
     match ht_find_index(&h, &args[1], ctx)? {
         Some(i) => {
-            h.items.borrow_mut()[i].1 = args[2].clone();
+            // `set_value_at` clears any stale tombstone on this
+            // slot before writing the fresh strong value.
+            h.set_value_at(i, args[2].clone());
+            written_idx = i;
         }
         None => {
             let hash = ht_hash_ctx(&h, &args[1], ctx)?;
@@ -6985,6 +6997,7 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                 .borrow_mut()
                 .push((args[1].clone(), args[2].clone()));
             h.index_insert(hash, idx);
+            written_idx = idx as usize;
         }
     }
     // Region-memory iter 5 (FR-8): see b_set_car.
@@ -6997,6 +7010,14 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
         cs_gc::cycle::check_and_break(&h, |h| {
             crate::countable_memory_cycle::record_cycle_with_candidate(h);
+            // cs-i6p.2: baseline=3, same reasoning as b_set_car's
+            // `(set-car! p p)` case — see
+            // `Hashtable::break_value_cycle`'s doc. Values only;
+            // keys are never tombstoned (see
+            // HASHTABLE_VALUE_TOMBSTONES's doc for why).
+            if h.break_value_cycle(written_idx, 3) {
+                crate::countable_memory_cycle::record_cycle_broken();
+            }
         });
     }
     Ok(Value::Unspecified)
@@ -7008,7 +7029,10 @@ fn b_hashtable_ref(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     }
     let h = as_ht("hashtable-ref", &args[0])?.clone();
     match ht_find_index(&h, &args[1], ctx)? {
-        Some(i) => Ok(h.items.borrow()[i].1.clone()),
+        // cs-i6p.2: `value_at` transparently upgrades a weak
+        // value-cycle tombstone — the canonical `hashtable-ref`
+        // observation channel for a demoted self-referential value.
+        Some(i) => Ok(h.value_at(i).unwrap_or(Value::Unspecified)),
         None => Ok(args[2].clone()),
     }
 }
@@ -7027,7 +7051,10 @@ fn b_hashtable_delete(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String
     }
     let h = as_ht("hashtable-delete!", &args[0])?.clone();
     if let Some(idx) = ht_find_index(&h, &args[1], ctx)? {
-        h.items.borrow_mut().swap_remove(idx);
+        // cs-i6p.2: `swap_remove_item` also migrates/clears any
+        // value tombstone affected by the swap-remove's index
+        // shift (see its doc).
+        h.swap_remove_item(idx);
         // Delete is rare; a full reindex is simpler and cheaper to keep
         // correct than fixing up the swap_remove's moved element by hand.
         ht_reindex_all(&h, ctx)?;
@@ -7156,7 +7183,9 @@ fn b_hashtable_clear(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("hashtable-clear!", "1 or 2", args.len()));
     }
     let h = as_ht("hashtable-clear!", &args[0])?;
-    h.items.borrow_mut().clear();
+    // cs-i6p.2: `clear_items` also drops any value tombstones for
+    // this table.
+    h.clear_items();
     h.index.borrow_mut().clear();
     Ok(Value::Unspecified)
 }
@@ -7172,7 +7201,9 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     // user's equiv proc instead of routing through ht_eq (which panics on
     // the Custom kind) — matches set!/ref/contains!/delete!.
     let current = match ht_find_index(&h, &args[1], ctx)? {
-        Some(i) => h.items.borrow()[i].1.clone(),
+        // cs-i6p.2: read through `value_at` so a previously-demoted
+        // slot's tombstone upgrades transparently here too.
+        Some(i) => h.value_at(i).unwrap_or(Value::Unspecified),
         None => args[3].clone(),
     };
     let new_val =
@@ -7180,7 +7211,8 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     // Re-locate after the update proc runs — it may have mutated the table.
     match ht_find_index(&h, &args[1], ctx)? {
         Some(i) => {
-            h.items.borrow_mut()[i].1 = new_val;
+            // cs-i6p.2: clears any stale tombstone on this slot.
+            h.set_value_at(i, new_val);
         }
         None => {
             let hash = ht_hash_ctx(&h, &args[1], ctx)?;

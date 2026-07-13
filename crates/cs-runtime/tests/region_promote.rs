@@ -197,15 +197,15 @@ fn hashtable_promotion_descends_into_items() {
     let v = {
         let region = Region::new();
         let inner = alloc_pair_in_region(&region, n(42), n(43));
-        let ht = Hashtable {
-            items: RefCell::new(vec![
+        let ht = Hashtable::from_parts(
+            vec![
                 (Value::Symbol(Symbol(1)), Value::Pair(inner)),
                 (n(0), Value::Boolean(false)),
-            ]),
-            eq_kind: HtEqKind::Eqv,
-            custom: None,
-            index: RefCell::new(std::collections::HashMap::new()),
-        };
+            ],
+            HtEqKind::Eqv,
+            None,
+            std::collections::HashMap::new(),
+        );
         let h: Gc<Hashtable> = Gc::new_in(&region, ht);
         assert!(Gc::is_region(&h));
         let mut v = Value::Hashtable(h);

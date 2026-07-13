@@ -439,32 +439,34 @@ impl cs_gc::cycle::BreakCycle for Pair {
 /// trait impl lets the layer-4 sweep also reclaim them.
 impl cs_gc::cycle::BreakCycle for Hashtable {
     fn try_break_cycle(&self) -> bool {
-        // Take a borrow; iterate looking for the first
-        // value slot that's heap-bearing (could close a
-        // cycle). Replace it with Unspecified.
-        let Ok(mut items) = self.items.try_borrow_mut() else {
-            // Borrow failed (mutating elsewhere); skip this
-            // sweep round, the next one will retry.
-            return false;
+        // Find the first heap-bearing value slot (the only kind
+        // that could close a cycle through the hashtable), then
+        // demote it via `break_value_cycle` (cs-i6p.2) so the
+        // sweep path shares the same weak-tombstone/observability
+        // guarantees as the mutation-site path instead of the
+        // previous lossy direct zero-out.
+        let idx = {
+            let Ok(items) = self.items.try_borrow() else {
+                // Borrow failed (mutating elsewhere); skip this
+                // sweep round, the next one will retry.
+                return false;
+            };
+            items.iter().position(|(_k, v)| {
+                matches!(
+                    v,
+                    Value::Pair(_)
+                        | Value::Vector(_)
+                        | Value::Hashtable(_)
+                        | Value::Promise(_)
+                        | Value::String(_)
+                        | Value::ByteVector(_)
+                )
+            })
         };
-        for (_k, v) in items.iter_mut() {
-            // Heap-bearing variants are exactly the ones
-            // that could form a cycle through the hashtable.
-            let demote = matches!(
-                v,
-                Value::Pair(_)
-                    | Value::Vector(_)
-                    | Value::Hashtable(_)
-                    | Value::Promise(_)
-                    | Value::String(_)
-                    | Value::ByteVector(_)
-            );
-            if demote {
-                *v = Value::Unspecified;
-                return true;
-            }
+        match idx {
+            Some(i) => self.break_value_cycle(i, 0),
+            None => false,
         }
-        false
     }
 }
 
@@ -600,6 +602,152 @@ impl WeakValue {
             WeakValue::Procedure(w) => w.upgrade().map(Value::Procedure),
         }
     }
+}
+
+/// # Vector cycle-break tombstones (cs-i6p.2)
+///
+/// Extends the [`Pair`] tombstone scheme (see its struct docs) to
+/// `Value::Vector` slots. `Vector` has no first-party wrapper struct
+/// — it's `Gc<RefCell<Vec<Value>>>>` over a foreign `RefCell` — so
+/// there's nowhere to hang a `flags: Cell<u8>` field or a `Drop`
+/// impl the way `Pair` does. That has two consequences vs. Pair's
+/// design:
+///
+/// 1. **No per-slot presence bit.** [`VECTOR_ANY_TOMBSTONE`] is a
+///    single global gate (not per-vector) so the overwhelmingly
+///    common "no vector has ever been tombstoned" case costs one
+///    `Cell::get` before any hashing.
+/// 2. **No drop hook to evict stale entries.** Each
+///    [`VectorTombstone`] additionally pins the *container's*
+///    allocation via a `cs_gc::Weak<RefCell<Vec<Value>>>>` — as long
+///    as that pin is alive, the container's control block can't be
+///    freed and its address can't be handed to an unrelated
+///    allocation, which is what would otherwise let a stale entry
+///    alias onto a different vector at the same address. The
+///    trade-off: once a vector slot is tombstoned, that small
+///    fixed-size control block (not the vector's data — that drops
+///    normally) leaks for the process lifetime if the vector itself
+///    is never read again after being fully dropped. This is a
+///    bounded, documented leak of one allocation header per
+///    reclaimed cycle — categorically smaller than the unbounded
+///    subgraph leak it replaces.
+///
+/// Only [`vector_get`] / [`vector_set`] (used by `vector-ref` /
+/// `vector-set!`) go through the tombstone-aware funnel. Bulk
+/// operations (`vector-map`, `vector-copy`, `vector->list`, the
+/// printer, …) still read `Vec<Value>` slots directly and will see
+/// `Value::Unspecified` rather than the transparently-upgraded
+/// cyclic value for a demoted slot — the same category of residual
+/// gap the pre-existing Hashtable `BreakCycle` sweep documents.
+/// Closing that fully would require a first-party `Vector` wrapper
+/// type and migrating on the order of 160 call sites across
+/// cs-runtime/cs-vm/cs-jit-cranelift — the cost the
+/// countable-memory exit report (iter 7.1.y) already priced and
+/// deferred; out of scope here.
+struct VectorTombstone {
+    weak: WeakValue,
+    /// See point 2 above — exists purely to keep the container's
+    /// allocation (and thus its address) alive for as long as this
+    /// tombstone entry exists. Never read.
+    #[allow(dead_code)]
+    container_pin: cs_gc::Weak<RefCell<Vec<Value>>>,
+}
+
+thread_local! {
+    /// Out-of-line vector slot-cycle-break tombstone table, keyed by
+    /// (vector address, slot index). See the module doc above.
+    static VECTOR_TOMBSTONES: RefCell<HashMap<(usize, usize), VectorTombstone>> =
+        RefCell::new(HashMap::new());
+
+    /// `true` once any vector slot anywhere has ever been
+    /// tombstoned. Lets [`vector_get`] / [`vector_set`] skip the
+    /// `VECTOR_TOMBSTONES` lookup entirely in the common case.
+    static VECTOR_ANY_TOMBSTONE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read `v[i]`, upgrading a weak slot tombstone if present. Returns
+/// `None` if `i` is out of bounds. See the module doc above for
+/// which call sites this funnel actually covers.
+pub fn vector_get(v: &cs_gc::Gc<RefCell<Vec<Value>>>, i: usize) -> Option<Value> {
+    if i >= v.borrow().len() {
+        return None;
+    }
+    if VECTOR_ANY_TOMBSTONE.with(Cell::get) {
+        let addr = cs_gc::Gc::as_addr(v);
+        let entry = VECTOR_TOMBSTONES
+            .try_with(|t| t.borrow().get(&(addr, i)).map(|ts| ts.weak.clone()))
+            .ok()
+            .flatten();
+        if let Some(weak) = entry {
+            return Some(weak.upgrade().unwrap_or(Value::Unspecified));
+        }
+    }
+    Some(v.borrow()[i].clone())
+}
+
+/// Write `val` into `v[i]`, clearing any weak tombstone (the new
+/// value is unambiguously strong). Panics if `i` is out of bounds —
+/// callers are expected to bounds-check first, matching the
+/// pre-existing direct-index-write call sites this replaces.
+pub fn vector_set(v: &cs_gc::Gc<RefCell<Vec<Value>>>, i: usize, val: Value) {
+    if VECTOR_ANY_TOMBSTONE.with(Cell::get) {
+        let addr = cs_gc::Gc::as_addr(v);
+        let _ = VECTOR_TOMBSTONES.try_with(|t| {
+            t.borrow_mut().remove(&(addr, i));
+        });
+    }
+    v.borrow_mut()[i] = val;
+}
+
+/// Cycle-break action for `v[i]`. See `Pair::break_car_cycle` for
+/// the `baseline` convention — the same reasoning applies here:
+/// `(vector-set! v i v)`'s worst-case self-reference contributes
+/// slot(1) + `args[2]`(1) + `args[0]`(1) = 3 transient strong refs.
+///
+/// Returns `false` (no-op) for region-allocated vectors — mirrors
+/// `WeakValue::from_value`'s region guard; region drop reclaims
+/// region cycles regardless.
+pub fn vector_break_slot_cycle(
+    v: &cs_gc::Gc<RefCell<Vec<Value>>>,
+    i: usize,
+    baseline: usize,
+) -> bool {
+    if cs_gc::Gc::is_region(v) {
+        return false;
+    }
+    let current = {
+        let vw = v.borrow();
+        if i >= vw.len() {
+            return false;
+        }
+        vw[i].clone()
+    };
+    let total = current.heap_strong_count().unwrap_or(0);
+    if total <= baseline {
+        return false;
+    }
+    let Some(weak) = WeakValue::from_value(&current) else {
+        return false;
+    };
+    let addr = cs_gc::Gc::as_addr(v);
+    let container_pin = cs_gc::Gc::downgrade(v);
+    if VECTOR_TOMBSTONES
+        .try_with(|t| {
+            t.borrow_mut().insert(
+                (addr, i),
+                VectorTombstone {
+                    weak,
+                    container_pin,
+                },
+            );
+        })
+        .is_err()
+    {
+        return false;
+    }
+    VECTOR_ANY_TOMBSTONE.with(|f| f.set(true));
+    v.borrow_mut()[i] = Value::Unspecified;
+    true
 }
 
 // ---- parallel-runtime spec C4.2: CycleChildren impls ----
@@ -739,6 +887,36 @@ pub struct Hashtable {
     pub custom: Option<CustomHashFns>,
     /// Hash -> indices into `items`. See struct docs for the invariant.
     pub index: RefCell<HashMap<u64, Vec<u32>>>,
+    /// Cold-metadata presence bit: see [`HAS_VALUE_TOMBSTONE`]. `Cell`
+    /// so the tombstone helpers don't need `&mut Hashtable`.
+    flags: Cell<u8>,
+}
+
+/// Bit of [`Hashtable::flags`] set when this hashtable has at least
+/// one entry in [`HASHTABLE_VALUE_TOMBSTONES`] keyed by its own
+/// address. See [`Hashtable::value_at`] / [`Hashtable::break_value_cycle`].
+const HAS_VALUE_TOMBSTONE: u8 = 0b001;
+
+thread_local! {
+    /// Out-of-line hashtable **value**-cycle-break tombstone table
+    /// (cs-i6p.2), keyed by (hashtable address, `items` index).
+    /// Mirrors [`PAIR_CAR_TOMBSTONES`] — see
+    /// [`Hashtable::break_value_cycle`].
+    ///
+    /// Deliberately values only, never keys: a demoted key would
+    /// desync `index`'s hash-bucket invariant (the bucket was built
+    /// from the key's *original* hash/identity) and corrupt
+    /// `hashtable-keys` / `hashtable->alist` / future lookups.
+    /// Values carry no such invariant, so demoting them is sound.
+    /// `Hashtable` is a first-party struct (unlike `Vector`, which
+    /// is a bare `Gc<RefCell<Vec<Value>>>>` over foreign types), so
+    /// — like `Pair` — it can carry its own `flags` bit and a `Drop`
+    /// impl that evicts this table's entries when the table itself
+    /// is freed, closing the address-reuse hazard `Pair`'s doc
+    /// comment warns about without needing `Vector`'s container-pin
+    /// workaround.
+    static HASHTABLE_VALUE_TOMBSTONES: RefCell<HashMap<(usize, usize), WeakValue>> =
+        RefCell::new(HashMap::new());
 }
 
 impl Hashtable {
@@ -748,6 +926,7 @@ impl Hashtable {
             eq_kind,
             custom: None,
             index: RefCell::new(HashMap::new()),
+            flags: Cell::new(0),
         })
     }
 
@@ -760,7 +939,144 @@ impl Hashtable {
             eq_kind: HtEqKind::Custom,
             custom: Some(CustomHashFns { hash, equiv }),
             index: RefCell::new(HashMap::new()),
+            flags: Cell::new(0),
         })
+    }
+
+    /// Construct a `Hashtable` value (not yet `Gc`-wrapped) from
+    /// pre-populated parts. `flags` is private (cs-i6p.2's
+    /// tombstone-presence bit, mirroring `Pair`), so callers outside
+    /// this module that need to build a `Hashtable` with existing
+    /// `items`/`index`/`custom` data — e.g. lifetime-aware
+    /// constructors that choose their own `Gc::new` vs.
+    /// `Gc::new_in(region, ..)` — go through this instead of struct-
+    /// literal syntax.
+    pub fn from_parts(
+        items: Vec<(Value, Value)>,
+        eq_kind: HtEqKind,
+        custom: Option<CustomHashFns>,
+        index: HashMap<u64, Vec<u32>>,
+    ) -> Self {
+        Hashtable {
+            items: RefCell::new(items),
+            eq_kind,
+            custom,
+            index: RefCell::new(index),
+            flags: Cell::new(0),
+        }
+    }
+
+    /// This hashtable's out-of-line-table key: the same address
+    /// identity `Gc::as_addr` computes, obtained directly from
+    /// `&self` since `Gc<Hashtable>` derefs straight to it.
+    fn addr(&self) -> usize {
+        self as *const Hashtable as usize
+    }
+
+    /// Read `items[i].1`, upgrading a weak value-cycle tombstone if
+    /// present. Returns `None` if `i` is out of bounds. Returns
+    /// `Value::Unspecified` for a tombstone whose target has been
+    /// fully reclaimed — mirrors `Pair::car`.
+    pub fn value_at(&self, i: usize) -> Option<Value> {
+        let items = self.items.borrow();
+        if i >= items.len() {
+            return None;
+        }
+        if self.flags.get() & HAS_VALUE_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let entry = HASHTABLE_VALUE_TOMBSTONES
+                .try_with(|t| t.borrow().get(&(addr, i)).cloned())
+                .ok()
+                .flatten();
+            if let Some(weak) = entry {
+                return Some(weak.upgrade().unwrap_or(Value::Unspecified));
+            }
+        }
+        Some(items[i].1.clone())
+    }
+
+    /// Overwrite `items[i].1` with `v`, clearing any weak tombstone
+    /// on that slot (the new value is unambiguously strong).
+    /// Mirrors `Pair::set_car`. Panics if `i` is out of bounds.
+    pub fn set_value_at(&self, i: usize, v: Value) {
+        if self.flags.get() & HAS_VALUE_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let _ = HASHTABLE_VALUE_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().remove(&(addr, i));
+            });
+        }
+        self.items.borrow_mut()[i].1 = v;
+    }
+
+    /// Cycle-break action for `items[i].1`. See
+    /// `Pair::break_car_cycle` for the `baseline` convention — the
+    /// same reasoning applies here: `(hashtable-set! h k h)`'s
+    /// worst-case self-reference contributes slot(1) + `args[2]`(1)
+    /// + `args[0]`(1) = 3 transient strong refs.
+    pub fn break_value_cycle(&self, i: usize, baseline: usize) -> bool {
+        let current = {
+            let items = self.items.borrow();
+            if i >= items.len() {
+                return false;
+            }
+            items[i].1.clone()
+        };
+        let total = current.heap_strong_count().unwrap_or(0);
+        if total <= baseline {
+            return false;
+        }
+        let Some(weak) = WeakValue::from_value(&current) else {
+            return false;
+        };
+        let addr = self.addr();
+        if HASHTABLE_VALUE_TOMBSTONES
+            .try_with(|t| {
+                t.borrow_mut().insert((addr, i), weak);
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.flags.set(self.flags.get() | HAS_VALUE_TOMBSTONE);
+        self.items.borrow_mut()[i].1 = Value::Unspecified;
+        true
+    }
+
+    /// `Vec::swap_remove` over `items`, fixing up any value
+    /// tombstone so it doesn't silently end up describing whatever
+    /// unrelated entry `swap_remove` moves into slot `i`.
+    /// `hashtable-set!`'s push (new key) and in-place-update (same
+    /// key) paths never shift an existing index, so only the
+    /// delete path needs this.
+    pub fn swap_remove_item(&self, i: usize) -> (Value, Value) {
+        let removed = self.items.borrow_mut().swap_remove(i);
+        if self.flags.get() & HAS_VALUE_TOMBSTONE != 0 {
+            let addr = self.addr();
+            // `swap_remove(i)` moves the old last element (index
+            // `items.len()` *after* removal) into slot `i`. Migrate
+            // that element's tombstone, if any, to its new index.
+            let moved_from = self.items.borrow().len();
+            let _ = HASHTABLE_VALUE_TOMBSTONES.try_with(|t| {
+                let mut t = t.borrow_mut();
+                t.remove(&(addr, i));
+                if let Some(w) = t.remove(&(addr, moved_from)) {
+                    t.insert((addr, i), w);
+                }
+            });
+        }
+        removed
+    }
+
+    /// Clear `items`, dropping any value tombstones for this table.
+    pub fn clear_items(&self) {
+        self.items.borrow_mut().clear();
+        if self.flags.get() & HAS_VALUE_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let _ = HASHTABLE_VALUE_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().retain(|k, _| k.0 != addr);
+            });
+            self.flags.set(self.flags.get() & !HAS_VALUE_TOMBSTONE);
+        }
     }
 
     /// Record that `items[item_idx]` hashes to `hash`.
@@ -780,6 +1096,23 @@ impl Hashtable {
         index.clear();
         for (i, (k, _)) in self.items.borrow().iter().enumerate() {
             index.entry(hash_fn(k)).or_default().push(i as u32);
+        }
+    }
+}
+
+impl Drop for Hashtable {
+    fn drop(&mut self) {
+        // A freed hashtable address CANNOT be left pointing at
+        // stale `HASHTABLE_VALUE_TOMBSTONES` entries — the allocator
+        // may hand that same address to an unrelated `Hashtable`
+        // next. `flags == 0` (no tombstone ever created) is the
+        // overwhelming common case and short-circuits without
+        // touching the table. Mirrors `Pair::drop`.
+        if self.flags.get() & HAS_VALUE_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let _ = HASHTABLE_VALUE_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().retain(|k, _| k.0 != addr);
+            });
         }
     }
 }
@@ -1946,6 +2279,47 @@ mod pair_diet_tests {
         let addr = p.addr();
         let leaked = PAIR_CAR_TOMBSTONES.with(|t| t.borrow().contains_key(&addr));
         assert!(!leaked, "set_car! must clear the tombstone table entry");
+    }
+
+    #[test]
+    fn vector_tombstone_round_trip_and_clear_on_set() {
+        // Mirrors `tombstone_round_trip_and_clear_on_set` above:
+        // a self-referential vector slot with one external anchor
+        // (the `v` binding) beyond the demote's own transient refs.
+        let v = cs_gc::Gc::new(RefCell::new(vec![Value::Null]));
+        vector_set(&v, 0, Value::Vector(v.clone()));
+        // Strong refs to `v` right now: the `v` binding + the slot
+        // = 2. baseline=1 leaves one external anchor, so the
+        // demote should fire.
+        assert!(vector_break_slot_cycle(&v, 0, 1));
+        assert!(VECTOR_ANY_TOMBSTONE.with(Cell::get));
+        // Tombstone upgrade returns the cyclic value transparently.
+        assert!(matches!(vector_get(&v, 0), Some(Value::Vector(_))));
+        // Writing over the demoted slot clears the tombstone.
+        vector_set(&v, 0, Value::Null);
+        let addr = cs_gc::Gc::as_addr(&v);
+        let leaked = VECTOR_TOMBSTONES.with(|t| t.borrow().contains_key(&(addr, 0)));
+        assert!(!leaked, "vector_set must clear the tombstone table entry");
+    }
+
+    #[test]
+    fn hashtable_value_tombstone_round_trip_and_clear_on_set() {
+        let h = Hashtable::new(HtEqKind::Eq);
+        h.items
+            .borrow_mut()
+            .push((Value::Symbol(Symbol(0)), Value::Unspecified));
+        h.set_value_at(0, Value::Hashtable(h.clone()));
+        // Strong refs to `h` right now: the `h` binding + the
+        // value slot = 2. baseline=1 leaves one external anchor.
+        assert!(h.break_value_cycle(0, 1));
+        assert_eq!(h.flags.get() & HAS_VALUE_TOMBSTONE, HAS_VALUE_TOMBSTONE);
+        // Tombstone upgrade returns the cyclic value transparently.
+        assert!(matches!(h.value_at(0), Some(Value::Hashtable(_))));
+        // Writing over the demoted slot clears the tombstone.
+        h.set_value_at(0, Value::Unspecified);
+        let addr = h.addr();
+        let leaked = HASHTABLE_VALUE_TOMBSTONES.with(|t| t.borrow().contains_key(&(addr, 0)));
+        assert!(!leaked, "set_value_at must clear the tombstone table entry");
     }
 }
 
