@@ -1235,6 +1235,33 @@ pub unsafe extern "C" fn vm_alloc_pair_gc(car: i64, car_tag: u8, cdr: i64, cdr_t
     NanboxValue(nb_make(NB_TAG_PAIR, nb_encode_gc_ptr(raw_ptr, false)) as i64).into_raw()
 }
 
+/// NB-native `cons` counterpart to `vm_alloc_pair_gc` (cs-vnf.4 JIT
+/// fast path). The uniform-NB tier (#50's sole surviving tier)
+/// already holds both `cons` operands as raw NB i64s in registers —
+/// `vm_alloc_pair_gc` decodes each through `i64_to_value` (with
+/// `JIT_RT_ANY`, i.e. `gc_i64_to_value`) and `Pair::new` immediately
+/// re-encodes them back via `encode_owned`, a pure round trip with
+/// no useful work in between for this call site. This helper skips
+/// both directions: `car`/`cdr` are stored directly into the fresh
+/// `Pair`'s `Cell<u64>` slots via `Pair::new_raw_nb`, taking
+/// ownership of both (matching `vm_alloc_pair_gc`'s consume
+/// contract) with zero `Value` construction.
+///
+/// Kept 4-arg (car, car_tag, cdr, cdr_tag) to match
+/// `vm_alloc_pair_gc`'s Cranelift-declared signature/call site
+/// unchanged; the tag args are unused (uniform-NB always passes
+/// `JIT_RT_ANY`, i.e. "the i64 is already a full NB payload").
+///
+/// # Safety
+/// `car`/`cdr` must each be a live, owned NB payload (or inline
+/// immediate); each consumed exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn vm_cons_nb_gc(car: i64, _car_tag: i64, cdr: i64, _cdr_tag: i64) -> i64 {
+    let g: cs_gc::Gc<cs_core::Pair> = cs_core::Pair::new_raw_nb(car as u64, cdr as u64);
+    let raw_ptr = cs_gc::Gc::into_raw_jit(g) as u64;
+    NanboxValue(nb_make(NB_TAG_PAIR, nb_encode_gc_ptr(raw_ptr, false)) as i64).into_raw()
+}
+
 /// Gap B-3 cs-aot codegen: region-resolver init API.
 ///
 /// cs-runtime registers a per-thread region-stack accessor
@@ -1336,6 +1363,106 @@ pub unsafe extern "C" fn vm_pair_cdr_gc(pair: i64) -> i64 {
             value_to_gc_i64(Value::Unspecified)
         }
     }
+}
+
+/// NB-native counterpart to `vm_pair_car_gc` (cs-vnf.4 JIT fast
+/// path). Same consume-on-use / deopt-on-type-miss contract as
+/// `vm_pair_car_gc` — still decodes the incoming `pair` i64 via
+/// `gc_i64_to_value` (unavoidable to safely obtain a borrowed
+/// `Gc<Pair>`), but the actual car read goes through
+/// `Pair::car_raw_nb`, which returns the raw NB bit pattern
+/// directly instead of a `Value` — skipping the
+/// `value_to_gc_i64`/`NanboxValue::from_value` re-encode of the
+/// *result* that `vm_pair_car_gc` pays via `p.car()` + `value_to_gc_i64`.
+/// The uniform-NB JIT tier (the sole surviving tier, #50) already
+/// works in raw NB space end to end, so this is a strict subset of
+/// `vm_pair_car_gc`'s work with no behavior change on the pair path.
+///
+/// # Safety
+/// `pair` must be a live, owned NB payload (or inline immediate) —
+/// same contract as `vm_pair_car_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_car_nb_gc(pair: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(pair) };
+    match v {
+        Value::Pair(p) => p.car_raw_nb() as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            NanboxValue::UNSPECIFIED.into_raw()
+        }
+    }
+}
+
+/// NB-native counterpart to `vm_pair_cdr_gc`. See
+/// [`vm_pair_car_nb_gc`] for the full rationale.
+///
+/// # Safety
+/// `pair` must be a live, owned NB payload (or inline immediate) —
+/// same contract as `vm_pair_cdr_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_pair_cdr_nb_gc(pair: i64) -> i64 {
+    let v = unsafe { gc_i64_to_value(pair) };
+    match v {
+        Value::Pair(p) => p.cdr_raw_nb() as i64,
+        _ => {
+            jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+            NanboxValue::UNSPECIFIED.into_raw()
+        }
+    }
+}
+
+/// NB-native `set-car!` counterpart to `vm_set_car_gc` (cs-vnf.4).
+/// `p` is still decoded via `gc_i64_to_value` (needed to safely
+/// obtain a borrowed `Gc<Pair>` on the fast path, and to correctly
+/// consume/drop `p`'s refcount on the type-miss path — same
+/// contract as `vm_set_car_gc`), but the new value `v` stays a raw
+/// NB i64 the whole way through: `Pair::set_car_raw_nb` stores it
+/// directly (after the usual tombstone-clear), skipping the
+/// `Value` decode of `v` AND the `Value` re-encode of the
+/// `Unspecified` return that `vm_set_car_gc` pays on both ends.
+///
+/// # Safety
+/// Both `p` and `v` must be live, owned NB payloads (or inline
+/// immediates) — same contract as `vm_set_car_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_set_car_nb_gc(p: i64, v: i64) -> i64 {
+    let bits = p as u64;
+    if nb_is_tagged(bits) && nb_tag_of(bits) == NB_TAG_PAIR {
+        if let Value::Pair(pp) = unsafe { gc_i64_to_value(p) } {
+            pp.set_car_raw_nb(v as u64);
+            return NanboxValue::UNSPECIFIED.into_raw();
+        }
+        unreachable!("nb_tag_of == NB_TAG_PAIR must decode to Value::Pair");
+    }
+    // Type miss: still consume both operands' refcounts (matching
+    // `vm_set_car_gc`'s contract of decoding both unconditionally)
+    // before requesting the deopt.
+    let _p_v = unsafe { gc_i64_to_value(p) };
+    let _v_v = unsafe { gc_i64_to_value(v) };
+    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+    NanboxValue::UNSPECIFIED.into_raw()
+}
+
+/// NB-native `set-cdr!` counterpart to `vm_set_cdr_gc`. See
+/// [`vm_set_car_nb_gc`] for the full rationale.
+///
+/// # Safety
+/// Both `p` and `v` must be live, owned NB payloads (or inline
+/// immediates) — same contract as `vm_set_cdr_gc`.
+#[no_mangle]
+pub unsafe extern "C" fn vm_set_cdr_nb_gc(p: i64, v: i64) -> i64 {
+    let bits = p as u64;
+    if nb_is_tagged(bits) && nb_tag_of(bits) == NB_TAG_PAIR {
+        if let Value::Pair(pp) = unsafe { gc_i64_to_value(p) } {
+            pp.set_cdr_raw_nb(v as u64);
+            return NanboxValue::UNSPECIFIED.into_raw();
+        }
+        unreachable!("nb_tag_of == NB_TAG_PAIR must decode to Value::Pair");
+    }
+    let _p_v = unsafe { gc_i64_to_value(p) };
+    let _v_v = unsafe { gc_i64_to_value(v) };
+    jit_request_deopt(DEOPT_REASON_PAIR_MISS);
+    NanboxValue::UNSPECIFIED.into_raw()
 }
 
 /// Gc-backed counterpart to `vm_pair_p`. Consume-on-use; 0/1 out.

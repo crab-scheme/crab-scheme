@@ -213,6 +213,27 @@ impl Pair {
         })
     }
 
+    /// Construct a pair directly from two already-owned raw NB
+    /// payloads, skipping the `Value` decode/encode round trip that
+    /// [`new`](Self::new) pays via `encode_owned`. `car_bits`/
+    /// `cdr_bits` must each be a live owning NB payload (or inline
+    /// immediate) that the caller is transferring — exactly the same
+    /// single-consumer contract as `new`'s `Value` arguments, just
+    /// pre-encoded. cs-vnf.4: the uniform-NB JIT tier already holds
+    /// both `cons` operands as raw NB i64s in registers, so this
+    /// lets `Inst::Cons` skip `NanboxValue::to_value`/`from_value`
+    /// entirely instead of decoding-then-re-encoding through `Value`.
+    ///
+    /// No tombstone/span bookkeeping applies to a freshly allocated
+    /// pair (`flags` starts at 0, same as `new`).
+    pub fn new_raw_nb(car_bits: u64, cdr_bits: u64) -> cs_gc::Gc<Self> {
+        cs_gc::Gc::new(Pair {
+            car: Cell::new(car_bits),
+            cdr: Cell::new(cdr_bits),
+            flags: Cell::new(0),
+        })
+    }
+
     /// Construct a pair tagged with its reader-produced source span.
     pub fn with_source(car: Value, cdr: Value, span: cs_diag::Span) -> cs_gc::Gc<Self> {
         let gc = cs_gc::Gc::new(Pair {
@@ -338,6 +359,91 @@ impl Pair {
              instead of being masked by peek_cdr's Drop-context tolerance."
         );
         self.peek_cdr()
+    }
+
+    /// NB-native counterpart to [`car`](Self::car): identical
+    /// tombstone/liveness semantics, but returns the raw owning NB
+    /// bit pattern directly instead of decoding through `Value` —
+    /// skips `NanboxValue::to_value`/`from_value` entirely. cs-vnf.4:
+    /// the uniform-NB JIT tier already works in raw NB space, so
+    /// this is the fast path `Inst::Car`'s lowering calls into.
+    ///
+    /// The untombstoned case is a single `Cell::get` (flags) +
+    /// `nb_clone_owned` (refcount bump only, no `Value` construction
+    /// at all). The tombstoned case still upgrades the weak entry to
+    /// a `Value` (unavoidable — the tombstone table stores
+    /// `WeakValue`, not raw NB bits) and re-encodes it; this is the
+    /// rare path (cycle-detector-demoted slots only), so paying the
+    /// encode there is fine.
+    pub fn car_raw_nb(&self) -> u64 {
+        if self.flags.get() & HAS_CAR_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let upgraded = PAIR_CAR_TOMBSTONES
+                .try_with(|t| t.borrow().get(&addr).and_then(WeakValue::upgrade))
+                .ok()
+                .flatten();
+            return match upgraded {
+                Some(v) => encode_owned(v),
+                None => NanboxValue::UNSPECIFIED.into_raw() as u64,
+            };
+        }
+        debug_assert!(
+            unsafe { nb_owning_payload_is_live(self.car.get() as i64) },
+            "Pair::car_raw_nb: use-after-region-drop — see the matching \
+             debug_assert in car() for the full rationale."
+        );
+        unsafe { nb_clone_owned(self.car.get() as i64) as u64 }
+    }
+
+    /// NB-native counterpart to [`cdr`](Self::cdr). See
+    /// [`car_raw_nb`](Self::car_raw_nb) for the full rationale.
+    pub fn cdr_raw_nb(&self) -> u64 {
+        if self.flags.get() & HAS_CDR_TOMBSTONE != 0 {
+            let addr = self.addr();
+            let upgraded = PAIR_CDR_TOMBSTONES
+                .try_with(|t| t.borrow().get(&addr).and_then(WeakValue::upgrade))
+                .ok()
+                .flatten();
+            return match upgraded {
+                Some(v) => encode_owned(v),
+                None => NanboxValue::UNSPECIFIED.into_raw() as u64,
+            };
+        }
+        debug_assert!(
+            unsafe { nb_owning_payload_is_live(self.cdr.get() as i64) },
+            "Pair::cdr_raw_nb: use-after-region-drop — see the matching \
+             debug_assert in cdr() for the full rationale."
+        );
+        unsafe { nb_clone_owned(self.cdr.get() as i64) as u64 }
+    }
+
+    /// NB-native counterpart to [`set_car`](Self::set_car): `bits`
+    /// is an already-owned raw NB payload (the caller transfers
+    /// ownership, exactly like `set_car`'s `Value` argument), so this
+    /// skips `encode_owned`'s `Value` -> NB re-encode. Clears any
+    /// weak tombstone, same as `set_car`.
+    pub fn set_car_raw_nb(&self, bits: u64) {
+        if self.flags.get() & HAS_CAR_TOMBSTONE != 0 {
+            self.flags.set(self.flags.get() & !HAS_CAR_TOMBSTONE);
+            let addr = self.addr();
+            let _ = PAIR_CAR_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().remove(&addr);
+            });
+        }
+        self.set_car_raw_owned(bits);
+    }
+
+    /// NB-native counterpart to [`set_cdr`](Self::set_cdr). See
+    /// [`set_car_raw_nb`](Self::set_car_raw_nb).
+    pub fn set_cdr_raw_nb(&self, bits: u64) {
+        if self.flags.get() & HAS_CDR_TOMBSTONE != 0 {
+            self.flags.set(self.flags.get() & !HAS_CDR_TOMBSTONE);
+            let addr = self.addr();
+            let _ = PAIR_CDR_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().remove(&addr);
+            });
+        }
+        self.set_cdr_raw_owned(bits);
     }
 
     /// Replace the car slot with `v`. Clears any weak tombstone
