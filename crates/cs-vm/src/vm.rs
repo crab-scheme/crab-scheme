@@ -6761,15 +6761,20 @@ unsafe fn vm_vector_ref_gc_inner(vec: i64, idx: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(vec) };
     match v {
         Value::Vector(vc) => {
-            let storage = vc.borrow();
-            if idx < 0 || (idx as usize) >= storage.len() {
-                panic!(
+            // cs-i6p.2: `vector_get` transparently upgrades a weak
+            // slot-cycle tombstone — a raw indexed read would
+            // return `Unspecified` for a slot the walker/VM
+            // `vector-set!` fast path demoted, even though it's
+            // still live and reachable through the normal
+            // (non-JIT) read path.
+            match cs_core::value::vector_get(&vc, idx as usize) {
+                Some(val) => value_to_gc_i64(val),
+                None => panic!(
                     "vm_vector_ref_gc: index {} out of bounds for vector of length {}",
                     idx,
-                    storage.len()
-                );
+                    vc.borrow().len()
+                ),
             }
-            value_to_gc_i64(storage[idx as usize].clone())
         }
         other => panic!("vm_vector_ref_gc: not a vector ({})", other.type_name()),
     }
@@ -14796,8 +14801,10 @@ fn try_fast_data_primop(op: DataPrimOp, n: usize, stack: &mut ValueStack) -> Opt
             let i_v = stack.pop().expect("arity-checked pop");
             let vec_v = stack.pop().expect("arity-checked pop");
             let result = match (&vec_v, &i_v) {
+                // cs-i6p.2: `vector_get` transparently upgrades a
+                // weak slot-cycle tombstone — mirrors b_vector_ref.
                 (Value::Vector(v), Value::Fixnum(i)) if *i >= 0 => {
-                    v.borrow().get(*i as usize).cloned()
+                    cs_core::value::vector_get(v, *i as usize)
                 }
                 _ => None,
             };
@@ -14830,11 +14837,22 @@ fn try_fast_data_primop(op: DataPrimOp, n: usize, stack: &mut ValueStack) -> Opt
             // Mirrors b_vector_set exactly: region-allocated vectors
             // skip the synchronous cycle detector (bulk region free
             // reclaims regardless), and a leaf write can't close a
-            // cycle so the DFS is skipped.
+            // cycle so the DFS is skipped. cs-i6p.2: `vector_set`
+            // clears any stale tombstone before writing, and the
+            // `check_and_break` callback now actually demotes the
+            // slot (baseline=3, see `vector_break_slot_cycle`'s
+            // doc) instead of the previous no-op closure. No
+            // telemetry recording here — `countable_memory_cycle`
+            // lives in cs-runtime, which depends on cs-vm (not the
+            // other way), same as the pre-existing no-op closure
+            // this replaces.
             let is_leaf = cs_core::value::value_is_acyclic_leaf(&x);
-            v.borrow_mut()[*i as usize] = x;
+            let idx = *i as usize;
+            cs_core::value::vector_set(v, idx, x);
             if !cs_gc::Gc::is_region(v) && !is_leaf {
-                cs_gc::cycle::check_and_break(v, |_r| {});
+                cs_gc::cycle::check_and_break(v, |v| {
+                    cs_core::value::vector_break_slot_cycle(v, idx, 3);
+                });
             }
             Some(Value::Unspecified)
         }
@@ -18251,7 +18269,24 @@ mod data_primop_tests {
         let r = try_fast_data_primop(DataPrimOp::VectorSet, 3, &mut stack).unwrap();
         assert!(matches!(r, Value::Unspecified));
         match &v {
-            Value::Vector(vec) => assert!(matches!(vec.borrow()[0], Value::Vector(_))),
+            // cs-i6p.2: the self-cycle is now demoted to a weak
+            // tombstone by `vector_break_slot_cycle` rather than
+            // stored as a strong `Value::Vector` self-reference —
+            // the raw slot reads back `Unspecified`...
+            Value::Vector(vec) => assert!(matches!(vec.borrow()[0], Value::Unspecified)),
+            _ => unreachable!(),
+        }
+        // ...but `vector_get` transparently upgrades the tombstone,
+        // so the cycle is still observable through the normal read
+        // path (R6RS requires `(vector-set! v 0 v)` to be a visible
+        // cyclic vector).
+        match &v {
+            Value::Vector(vec) => {
+                assert!(matches!(
+                    cs_core::value::vector_get(vec, 0),
+                    Some(Value::Vector(_))
+                ));
+            }
             _ => unreachable!(),
         }
     }

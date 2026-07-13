@@ -139,12 +139,12 @@ fn region_hashtable_self_ref_skips_detector() {
     reset_cycle_detection_count();
     let baseline = cycle_detection_count();
     let region = Region::new();
-    let ht = Hashtable {
-        items: RefCell::new(Vec::new()),
-        eq_kind: HtEqKind::Eqv,
-        custom: None,
-        index: RefCell::new(std::collections::HashMap::new()),
-    };
+    let ht = Hashtable::from_parts(
+        Vec::new(),
+        HtEqKind::Eqv,
+        None,
+        std::collections::HashMap::new(),
+    );
     let h: Gc<Hashtable> = Gc::new_in(&region, ht);
     assert!(Gc::is_region(&h));
     h.items

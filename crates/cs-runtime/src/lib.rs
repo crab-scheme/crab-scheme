@@ -1065,7 +1065,14 @@ impl Runtime {
                 for i in 0..len {
                     let k = h.items.borrow()[i].0.clone();
                     if vm_ht_equiv(&h, &k, &args[1], st)? {
-                        h.items.borrow_mut()[i].1 = args[2].clone();
+                        // cs-i6p.2: this VM/actor-tier override
+                        // never runs the cycle detector itself, but
+                        // must still go through `set_value_at` (not
+                        // a raw `items[i].1 = ...` write) so it
+                        // clears any stale tombstone left on this
+                        // slot by the walker-tier funnel instead of
+                        // shadowing the fresh write behind it.
+                        h.set_value_at(i, args[2].clone());
                         return Ok(Value::Unspecified);
                     }
                 }
@@ -1091,7 +1098,12 @@ impl Runtime {
                 for i in 0..len {
                     let k = h.items.borrow()[i].0.clone();
                     if vm_ht_equiv(&h, &k, &args[1], st)? {
-                        return Ok(h.items.borrow()[i].1.clone());
+                        // cs-i6p.2: `value_at` transparently
+                        // upgrades a weak value-cycle tombstone —
+                        // a raw `items[i].1.clone()` read would see
+                        // `Unspecified` for a slot the walker tier
+                        // demoted, even though it's still live.
+                        return Ok(h.value_at(i).unwrap_or(Value::Unspecified));
                     }
                 }
                 Ok(args[2].clone())
@@ -1135,7 +1147,11 @@ impl Runtime {
                 for i in 0..len {
                     let k = h.items.borrow()[i].0.clone();
                     if vm_ht_equiv(&h, &k, &args[1], st)? {
-                        h.items.borrow_mut().swap_remove(i);
+                        // cs-i6p.2: `swap_remove_item` fixes up any
+                        // value tombstone that `Vec::swap_remove`'s
+                        // move-last-into-`i` would otherwise
+                        // misalign onto a different key's slot.
+                        h.swap_remove_item(i);
                         return Ok(Value::Unspecified);
                     }
                 }
@@ -3652,6 +3668,84 @@ mod tests {
     fn add_two_numbers() {
         let v = run("(+ 1 2)");
         assert_eq!(format!("{}", v), "3");
+    }
+
+    /// cs-i6p.2 regression: the VM-tier `hashtable-set!` /
+    /// `hashtable-ref` / `hashtable-delete!` overrides (defined
+    /// into `vm_env` above, distinct from the walker-tier funnel in
+    /// `cs_runtime::builtins`) must go through `Hashtable`'s
+    /// tombstone-aware `set_value_at` / `value_at` /
+    /// `swap_remove_item` rather than raw `items[i].1` reads/writes
+    /// — otherwise a value the walker tier demoted to a weak
+    /// tombstone reads back `Unspecified` on this tier (actor
+    /// bodies run VM-tier), a raw overwrite would leave a stale
+    /// tombstone shadowing the fresh value, and a raw
+    /// `Vec::swap_remove` could misalign a tombstone onto an
+    /// unrelated key.
+    ///
+    /// A walker-tier and a VM-tier `eval_str` call don't share a
+    /// top-level environment (`top` vs. `vm_env` are separate), so
+    /// this builds the demoted hashtable directly in Rust — via the
+    /// same `cs_core::value::Hashtable::break_value_cycle` the
+    /// walker-tier `b_hashtable_set` funnel calls — and defines it
+    /// straight into `vm_env` (this test lives inside the crate, so
+    /// it can reach that private field) before driving it through
+    /// `eval_str_via_vm`.
+    #[test]
+    fn vm_tier_hashtable_builtins_honor_value_tombstones() {
+        use cs_core::{Hashtable, HtEqKind};
+
+        let mut rt = Runtime::new();
+        let h = Hashtable::new(HtEqKind::Eq);
+        let k1 = rt.syms.intern("k1");
+        let k2 = rt.syms.intern("k2");
+        h.items
+            .borrow_mut()
+            .push((Value::Symbol(k1), Value::Hashtable(h.clone())));
+        h.items
+            .borrow_mut()
+            .push((Value::Symbol(k2), Value::fixnum(7)));
+        // Demote slot 0 (self-cycle) exactly as `b_hashtable_set`
+        // would: baseline=1 leaves the `h` local binding itself as
+        // the sole external anchor (h.clone() above bumped the
+        // strong count to 2 total).
+        assert!(
+            Hashtable::break_value_cycle(&h, 0, 1),
+            "setup: expected the self-cycle to demote"
+        );
+        let h_sym = rt.syms.intern("h");
+        rt.vm_env.define(h_sym, Value::Hashtable(h.clone()));
+
+        let vm_ref = rt
+            .eval_str_via_vm("<t>", "(eq? (hashtable-ref h 'k1 #f) h)")
+            .expect("vm ref");
+        assert_eq!(
+            format!("{vm_ref}"),
+            "#t",
+            "VM-tier hashtable-ref must transparently upgrade the tombstone"
+        );
+
+        rt.eval_str_via_vm("<t>", "(hashtable-set! h 'k1 99)")
+            .expect("vm set");
+        let after_set = rt
+            .eval_str_via_vm("<t>", "(hashtable-ref h 'k1 #f)")
+            .expect("vm after set");
+        assert_eq!(
+            format!("{after_set}"),
+            "99",
+            "VM-tier hashtable-set! must clear the stale tombstone, not shadow the fresh write"
+        );
+
+        rt.eval_str_via_vm("<t>", "(hashtable-delete! h 'k2)")
+            .expect("vm delete");
+        let k1_after_del = rt
+            .eval_str_via_vm("<t>", "(hashtable-ref h 'k1 #f)")
+            .expect("vm after del");
+        assert_eq!(
+            format!("{k1_after_del}"),
+            "99",
+            "deleting an unrelated key via the VM-tier override must not disturb k1's value"
+        );
     }
 
     // Phase 5.4: install_typer_hints API round-trip.
