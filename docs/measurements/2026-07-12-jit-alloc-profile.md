@@ -29,6 +29,8 @@
   (scheduling/paging, not busy-looping) — this doesn't affect the on-CPU symbol
   percentages below (samply only samples running threads) but means these are not
   clean single-core-bound compute benchmarks; worth a separate look if it recurs.
+  **Resolved (cs-vnf.6):** the gap was `samply`'s own overhead, not the runtime — see
+  `2026-07-13-offcpu-anomaly.md`.
 - Addresses inside `crabscheme`'s own binary and system libraries resolved to real
   symbol names via the sidecar. A separate class of addresses (`resource == -1`, no
   owning library) could **not** be resolved — these are the Cranelift-JIT-emitted

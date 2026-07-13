@@ -15,8 +15,8 @@
   src/node-cluster.scm` processes from an unrelated workspace (~12% CPU each, ~36%
   combined, confirmed steady via repeated `ps aux` — not a transient spike, so not
   something waiting out would fix). No local `cargo`/`rustc` builds were running during
-  measurement. This is worse than the .1 run's own claimed "load ~80" condition is
-  ambiguous about, but see below — the anomaly turned out not to depend on it.
+  measurement. This is a heavier load than the .1 run reported for itself, but see
+  below — the anomaly turned out not to depend on background load at all.
 - Bench sources: recreated `prof-scm/{alloc-stress,binary-trees,nqueens}.scm` from
   `bench/microbench/scheme/`, same scale-ups as the .1 doc (`alloc-stress` n
   200→60000, `binary-trees` depth 10→18, `nqueens` 8→11).
@@ -51,8 +51,10 @@ the wall-clock number):
 
 Wrapping the identical binary/benches in `samply record` reproduces a real wall-vs-cpu
 gap (63-73% utilization) that is entirely absent from the unwrapped runs above. The gap
-is not as extreme as the .1 doc's reported 30-40%, but the direction and mechanism are
-unambiguous.
+is not as extreme as the .1 doc's reported 30-40%; the residual difference is plausibly
+the .1 build's `CARGO_PROFILE_RELEASE_DEBUG=true` (debug info makes presymbolication
+write-out — the dominant term, see below — much heavier) plus a busier box that day,
+but that attribution is **untested**, not verified here.
 
 ## Root cause
 
@@ -72,6 +74,12 @@ macOS rather than anything in `cs-runtime`/`cs-vm`/mimalloc:
    thread/register state) adds wall-clock overhead to the sampled process that scales
    with sampling rate and is more pronounced on a loaded machine — consistent with the
    .1 doc's own note that it was captured on a busier box.
+
+Split measurement (verification pass): timestamping the samply-wrapped nqueens run's
+output shows the workload finished at t+2.24s (vs ~1.9s unwrapped → only ~0.3s in-run
+sampling tax, ~85% util during execution), with ~1.1s spent AFTER the workload exited
+on presymbolication/write-out (total 3.33s real / 2.16s CPU = 65%). The gap is
+dominated by the post-run write-out term, confirming factor 1 as the primary mechanism.
 
 The clean signal is the plain-execution table: with the profiler out of the loop,
 `crabscheme` is genuinely CPU-bound (93-99% utilization) on these benches, even under
