@@ -213,6 +213,248 @@ pub unsafe fn decode_gc_handle<T: 'static + Sized>(
     unsafe { cs_gc::Gc::<T>::from_raw_jit(ptr) }
 }
 
+/// Drop-context counterpart to [`decode_gc_handle`]: tolerant of an
+/// already-torn-down owning region instead of panicking (see
+/// `cs_gc::Gc::from_raw_jit_region_for_drop`). Use this — not
+/// [`decode_gc_handle`] — anywhere an owning NB payload is being
+/// released rather than read/mutated (e.g. `nb_drop_owned`,
+/// `Pair`'s `Drop` cdr-walk): a region's bulk-arena free never runs
+/// `T::drop`, so a raw owning payload whose region already dropped
+/// has nothing left to release, and that's not a bug worth
+/// panicking a destructor over.
+///
+/// Returns `None` when the region-tagged payload's owning region is
+/// already gone — there is nothing to release. Returns `Some`
+/// otherwise (transferring the strong count, same as
+/// `decode_gc_handle`).
+///
+/// # Why this asymmetry exists — read before adding a new call site
+///
+/// `cs_gc` deliberately has TWO different answers to "what do I do
+/// when a region-tagged handle's owning region turns out to already
+/// be dead?", and picking the wrong one for a given call site is
+/// exactly the mistake cs-vnf.3 PR2 made (three times, across two
+/// crates) before this fix:
+///
+/// - **Live-code paths** (`Clone`, `downgrade`, `strong_count`, and
+///   [`decode_gc_handle`] itself) stay STRICT — they panic via
+///   `assert_region_live`/`from_raw_jit_region`'s `.expect`. Reaching
+///   a dead region through a handle a caller believes is live is a
+///   genuine use-after-region-drop bug (layer-5 escape analysis is
+///   supposed to make it unreachable in compiled code); panicking
+///   loudly is the correct, intentional behavior there, mirroring
+///   `Vec::index`'s OOB panic.
+/// - **Drop/peek paths** (this function, `nb_owning_payload_is_live`,
+///   and `cs_gc::Gc<T>::drop`'s own region arm) are LENIENT — they
+///   silently no-op instead of panicking. Two reasons this must be
+///   the answer here, not the strict one: (1) a destructor can't
+///   safely panic (a panic-in-Drop during unwind aborts the process
+///   — this is literally how the original bug manifested: "panic in
+///   a function that cannot unwind"); (2) it usually isn't even a
+///   bug at this layer — a stale owning payload surviving its
+///   region's bulk-free is an ordinary, expected side effect of
+///   destructor recursion (dropping one `Pair` can trigger the
+///   layer-4 cycle sweep, which walks OTHER live pairs' slots — see
+///   `Drop for Pair` in `value.rs`), and the region's bulk-free
+///   already reclaimed everything there was to reclaim regardless of
+///   whether every payload pointing at it gets individually visited.
+///
+/// The two paths are NOT interchangeable substitutes for each other:
+/// swapping a live-code read/mutate site to the lenient decoder
+/// would silently mask a real UAF; swapping a Drop/peek site to the
+/// strict decoder is exactly the bug this fix closes. When adding a
+/// new call site that reconstructs a `Gc<T>` from a raw NB payload,
+/// ask "if this fires from inside someone else's destructor, could
+/// panicking here abort the process?" — if yes, it belongs on this
+/// side.
+///
+/// # Safety
+/// Same as [`decode_gc_handle`], except the "region must still be
+/// alive" clause is relaxed — the region may have since dropped.
+#[inline]
+pub unsafe fn decode_gc_handle_for_drop<T: 'static + Sized>(
+    ptr: *const (),
+    is_region: bool,
+) -> Option<cs_gc::Gc<T>> {
+    #[cfg(feature = "regions")]
+    if is_region {
+        return unsafe { cs_gc::Gc::<T>::from_raw_jit_region_for_drop(ptr) };
+    }
+    #[cfg(not(feature = "regions"))]
+    let _ = is_region;
+    Some(unsafe { cs_gc::Gc::<T>::from_raw_jit(ptr) })
+}
+
+/// True iff `bits` is a pointer-typed (owning) NB encoding — i.e. it
+/// owns a `Gc<T>`/`Rc<T>`-equivalent allocation (or a `proc_table`
+/// slot, for `NB_TAG_PROCEDURE`) and needs incref/decref/drop
+/// bookkeeping. The inverse of `cs_vm::vm::any_i64_is_inline`, which
+/// stays defined separately in cs-vm — this is a small pure
+/// predicate, not worth a cross-crate re-export ceremony for.
+#[inline]
+fn nb_is_owning(bits: u64) -> bool {
+    nb_is_tagged(bits) && nb_tag_of(bits) >= NB_TAG_PAIR
+}
+
+/// True iff an owning NB payload's target is still safe to touch —
+/// i.e. either it isn't region-tagged (Rc/proc_table payloads are
+/// always "live" as far as this check is concerned; a genuinely
+/// dangling Rc is a different, pre-existing class of bug this
+/// doesn't attempt to catch), or it is region-tagged and that
+/// region hasn't dropped yet.
+///
+/// For `NB_TAG_PROCEDURE` (proc_table slots, not region-backed at
+/// all) this is always `true`.
+///
+/// Exists so `Pair::peek_car`/`peek_cdr` — the cycle-break/Drop
+/// machinery's non-upgrading slot read, which can run during
+/// TLS-teardown-triggered cycle sweeps well after the payload's
+/// owning region has bulk-freed — can skip the decode entirely
+/// instead of reconstructing (and thereby touching) a handle into
+/// freed arena memory. Doesn't consume or mutate anything: for the
+/// region case it borrows `decode_gc_handle_for_drop`'s liveness
+/// check and immediately `mem::forget`s the temporary handle it
+/// hands back on success, so the slot's strong count is untouched
+/// either way (`None` case never constructed the handle at all).
+///
+/// Belongs on the LENIENT side of the strict-vs-lenient split
+/// documented on [`decode_gc_handle_for_drop`] — read that doc
+/// before adding a new caller of this function or its strict
+/// counterpart [`decode_gc_handle`].
+///
+/// # Safety
+/// `raw` must be a live owning NB payload (or an inline immediate) —
+/// same contract as [`nb_clone_owned`]/[`nb_drop_owned`].
+#[inline]
+pub(crate) unsafe fn nb_owning_payload_is_live(raw: i64) -> bool {
+    let bits = raw as u64;
+    if !nb_is_owning(bits) {
+        return true;
+    }
+    let tag = nb_tag_of(bits);
+    if tag == NB_TAG_PROCEDURE {
+        return true;
+    }
+    let (ptr, is_region) = nb_decode_gc_ptr(nb_payload_of(bits));
+    if !is_region {
+        return true;
+    }
+    #[cfg(feature = "regions")]
+    {
+        // Route through the same tag dispatch `to_value`/
+        // `nb_drop_owned` use, just with a throwaway `T` (the
+        // liveness check itself is untyped — only the leading
+        // `region_id` field of the `RegionSlot<T>` header is read,
+        // regardless of `T`) so this stays a single call site
+        // rather than re-deriving `RegionSlot`'s layout here.
+        let live = unsafe { decode_gc_handle_for_drop::<Value>(ptr, is_region) };
+        if let Some(gc) = live {
+            // Peek-only: undo the (no-op for region handles, but
+            // let's not depend on that) ownership transfer by
+            // forgetting rather than dropping.
+            std::mem::forget(gc);
+            true
+        } else {
+            false
+        }
+    }
+    #[cfg(not(feature = "regions"))]
+    {
+        true
+    }
+}
+
+/// Bump the strong refcount behind an owning NB payload, returning
+/// the same bits as an independent, additional owner of the same
+/// allocation. Immediate/Flonum payloads own nothing — the
+/// identity. Mirrors `cs_vm::vm::vm_value_clone_gc`; introduced in
+/// PR2 (cs-vnf.3) so `Pair`'s raw `Cell<u64>` car/cdr slots can
+/// clone-out their contents without cs-core depending on cs-vm.
+/// `pub(crate)`: only `Pair`'s accessors (in `value.rs`) call this.
+///
+/// # Safety
+/// `raw` must be a live owning NB payload (or an inline immediate).
+#[inline]
+pub(crate) unsafe fn nb_clone_owned(raw: i64) -> i64 {
+    let bits = raw as u64;
+    if !nb_is_owning(bits) {
+        return raw;
+    }
+    let tag = nb_tag_of(bits);
+    let payload = nb_payload_of(bits);
+    if tag == NB_TAG_PROCEDURE {
+        proc_table::incref(payload as u32);
+        return raw;
+    }
+    let (ptr, is_region) = nb_decode_gc_ptr(payload);
+    #[cfg(feature = "regions")]
+    if is_region {
+        unsafe { cs_gc::Gc::<Value>::raw_incref_region(ptr) };
+        return raw;
+    }
+    #[cfg(not(feature = "regions"))]
+    let _ = is_region;
+    unsafe { cs_gc::Gc::<Value>::raw_incref(ptr) };
+    raw
+}
+
+/// Decrement the strong refcount behind an owning NB payload,
+/// running the correct destructor for its tag if this was the last
+/// owner. Immediate/Flonum payloads own nothing — a no-op. Mirrors
+/// `cs_vm::vm::vm_value_drop_gc`; see `nb_clone_owned` for why this
+/// exists separately in cs-core.
+///
+/// # Safety
+/// `raw` must be a live owning NB payload this caller exclusively
+/// owns (or an inline immediate). Calling this twice on the same
+/// owning payload without an intervening `nb_clone_owned` is a
+/// double-free.
+pub(crate) unsafe fn nb_drop_owned(raw: i64) {
+    let bits = raw as u64;
+    if !nb_is_owning(bits) {
+        return;
+    }
+    let tag = nb_tag_of(bits);
+    let payload = nb_payload_of(bits);
+    if tag == NB_TAG_PROCEDURE {
+        proc_table::decref(payload as u32);
+        return;
+    }
+    let (ptr, is_region) = nb_decode_gc_ptr(payload);
+    // `decode_gc_handle_for_drop` (not `decode_gc_handle`): this is
+    // a release, not a read/mutate — an owning region-tagged
+    // payload whose region already tore down has nothing left to
+    // release (region bulk-free never runs `T::drop`), so we must
+    // tolerate that the same way `Gc<T>::drop` does, not panic the
+    // way `decode_gc_handle`/`from_raw_jit_region` do for a
+    // caller that expects a genuinely live handle.
+    match tag {
+        t if t == NB_TAG_PAIR => drop(unsafe { decode_gc_handle_for_drop::<Pair>(ptr, is_region) }),
+        t if t == NB_TAG_VECTOR => drop(unsafe {
+            decode_gc_handle_for_drop::<std::cell::RefCell<Vec<Value>>>(ptr, is_region)
+        }),
+        t if t == NB_TAG_STRING => {
+            drop(unsafe { decode_gc_handle_for_drop::<std::cell::RefCell<CsStr>>(ptr, is_region) })
+        }
+        t if t == NB_TAG_BYTEVECTOR => drop(unsafe {
+            decode_gc_handle_for_drop::<std::cell::RefCell<Vec<u8>>>(ptr, is_region)
+        }),
+        t if t == NB_TAG_HASHTABLE => {
+            drop(unsafe { decode_gc_handle_for_drop::<Hashtable>(ptr, is_region) })
+        }
+        t if t == NB_TAG_PORT => drop(unsafe { decode_gc_handle_for_drop::<Port>(ptr, is_region) }),
+        t if t == NB_TAG_PROMISE => {
+            drop(unsafe { decode_gc_handle_for_drop::<Promise>(ptr, is_region) })
+        }
+        // NB_TAG_GC_VALUE and any other pointer-typed tag — Gc<Value>
+        // wrap (mirrors `vm_value_drop_gc`'s default arm). Never
+        // region-tagged (catchall is only BigInt/Rational/Complex,
+        // none of which are region-allocatable today), so the
+        // plain Rc decode stays here unchanged.
+        _ => drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(ptr) }),
+    }
+}
+
 /// Encode an `f64` as a NaN-boxed `i64`. Real flonums map to their
 /// `to_bits()` directly; bit patterns that would collide with the
 /// tagged range (sign=1 quiet NaN) are canonicalized to the

@@ -572,6 +572,57 @@ impl<T: 'static> Gc<T> {
         Gc::from_region_ptr(slot_ptr)
     }
 
+    /// Drop-context counterpart to [`from_raw_jit_region`]: instead
+    /// of asserting the slot is live (panicking otherwise), this
+    /// mirrors `Gc<T>::drop`'s own tolerance for an
+    /// already-torn-down owning region — a region's bulk-arena free
+    /// does not run any `T::drop`, so a raw owning payload whose
+    /// region already dropped has nothing left to release, and that
+    /// is not a bug worth panicking a destructor over (unlike
+    /// `from_raw_jit_region`'s read/mutate contract, where reaching
+    /// a dead region through a "live" handle IS the bug).
+    ///
+    /// Returns `None` when the slot's `region_id` reads back as `0`
+    /// (freed/reused arena memory) or the region is no longer
+    /// tracked live — in both cases there is nothing to release, the
+    /// same as `Gc<T>::drop`'s region arm would conclude. Returns
+    /// `Some` (transferring the strong count exactly like
+    /// `from_raw_jit_region`) otherwise.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`from_raw_jit_region`] except the "slot must still
+    /// be alive" clause is relaxed to "slot must still be valid
+    /// memory to *read* `region_id` from" — i.e. `ptr` must be the
+    /// result of a matching `into_raw_jit` call on a Region-backed
+    /// `Gc<T>`, but the owning region may have since dropped.
+    ///
+    /// This is the strict-vs-lenient split `cs-core`'s
+    /// `decode_gc_handle_for_drop` documents in full: reads/mutates
+    /// (`Clone`, `downgrade`, `strong_count`, [`from_raw_jit_region`])
+    /// stay strict on purpose — reaching a dead region through a
+    /// handle believed live is a real bug worth panicking loudly
+    /// for. Drop/peek paths (this function, `Gc<T>::drop`'s own
+    /// region arm) must instead be lenient — a destructor can't
+    /// safely panic, and a stale payload surviving its region's
+    /// bulk-free is often not a bug at this layer at all (recursive
+    /// destructor chains can reach payloads whose region already
+    /// reclaimed everything there was to reclaim). Consult that doc
+    /// before picking which side a new call site belongs on.
+    #[cfg(feature = "regions")]
+    pub unsafe fn from_raw_jit_region_for_drop(ptr: *const ()) -> Option<Self>
+    where
+        T: Sized,
+    {
+        let slot_ptr = NonNull::new(ptr as *mut RegionSlot<T>)?;
+        let raw_id = unsafe { (*slot_ptr.as_ptr()).region_id };
+        let region_id = RegionId::from_raw_u32(raw_id)?;
+        if !is_region_live(region_id) {
+            return None;
+        }
+        Some(Gc::from_region_ptr(slot_ptr))
+    }
+
     /// Bump the strong count for a raw Rc handle without
     /// consuming a reference.
     ///

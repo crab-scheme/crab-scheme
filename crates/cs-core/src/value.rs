@@ -8,6 +8,10 @@ use std::fs::File;
 use std::io::{self, BufWriter, Seek, Write};
 use std::rc::Rc;
 
+use crate::nanbox::{
+    decode_gc_handle_for_drop, nb_clone_owned, nb_decode_gc_ptr, nb_drop_owned, nb_is_tagged,
+    nb_owning_payload_is_live, nb_payload_of, nb_tag_of, NanboxValue, NB_TAG_PAIR,
+};
 use crate::number::Number;
 use crate::symbol::{Symbol, SymbolTable};
 
@@ -90,19 +94,56 @@ thread_local! {
 /// `Cell::get` plus (in the overwhelmingly common untombstoned case)
 /// one `RefCell::borrow` instead of two.
 ///
-/// Direct field access to `.car`/`.cdr` is preserved for
-/// backward compatibility with code paths that don't need to
-/// observe broken cycles (the strong slot is `Unspecified` for
-/// such cells). New code should prefer the accessors.
-#[derive(Debug)]
+/// PR2 (cs-vnf.3): `car`/`cdr` are raw NaN-boxed payloads
+/// (`Cell<u64>`), not `RefCell<Value>` — a `Value` is a 16-byte
+/// tagged Rust enum with no stable/`repr`-fixed layout, so this
+/// slot instead stores whatever i64 the JIT's uniform-NB tier
+/// already produces/consumes, eliminating the Rust-enum <-> NB
+/// transcode on every JIT car/cdr access (cs-vnf.3/cs-vnf.4). Both
+/// fields are private and OWNING (each holds one strong
+/// incref/decref obligation, exactly like the `Value` they used to
+/// hold): read via `car()`/`cdr()` (clone-out, tombstone-upgrading),
+/// write via `set_car()`/`set_cdr()`. Direct field access is no
+/// longer possible from outside this file — all external call sites
+/// were migrated to the accessors in PR1.
+///
+/// The cycle-break/tombstone machinery (`break_car_cycle`,
+/// `break_cdr_cycle`, `Drop`) reads/writes the RAW slot via the
+/// private `peek_car`/`peek_cdr`/`set_car_raw_owned`/
+/// `set_cdr_raw_owned` helpers below, which — unlike `car()`/
+/// `cdr()` — do NOT upgrade a tombstoned slot. Routing that
+/// machinery through the upgrading public accessors would be
+/// circular (it implements the tombstone mechanism, not a consumer
+/// of it) and would silently make `break_*_cycle` inspect the
+/// *pre-break* cyclic target's refcount instead of the slot it's
+/// actually about to demote.
 pub struct Pair {
-    pub car: RefCell<Value>,
-    pub cdr: RefCell<Value>,
+    car: Cell<u64>,
+    cdr: Cell<u64>,
     /// Cold-metadata presence bits: see [`HAS_SPAN`],
     /// [`HAS_CAR_TOMBSTONE`], [`HAS_CDR_TOMBSTONE`]. `Cell` so the
     /// post-construction span/tombstone setters don't need
     /// `&mut Pair`.
     flags: Cell<u8>,
+}
+
+impl fmt::Debug for Pair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Decode via the public (tombstone-upgrading) accessors —
+        // Debug is a user-facing view, same shape a `RefCell<Value>`
+        // derive would have produced pre-PR2.
+        f.debug_struct("Pair")
+            .field("car", &self.car())
+            .field("cdr", &self.cdr())
+            .finish()
+    }
+}
+
+/// Encode an owned `Value` into the raw owning NB bit-pattern a
+/// `Pair` slot stores.
+#[inline]
+fn encode_owned(v: Value) -> u64 {
+    NanboxValue::from_value(v).into_raw() as u64
 }
 
 impl Pair {
@@ -113,10 +154,61 @@ impl Pair {
         self as *const Pair as usize
     }
 
+    /// Non-upgrading, non-consuming decode of whatever NB payload is
+    /// ACTUALLY stored in the car slot right now — bypasses tombstone
+    /// upgrade. Only for the cycle-break/Drop machinery; everyone
+    /// else must use [`car`](Self::car).
+    fn peek_car(&self) -> Value {
+        let raw = self.car.get() as i64;
+        // A dead-region payload can reach here via the layer-4
+        // cycle sweep, which can run mid-Drop-chain (triggered by
+        // an unrelated Pair's own Drop; see the note in `Drop for
+        // Pair`) — well after this pair's owning region already
+        // bulk-freed. There's nothing live left to clone out;
+        // treat it the same as a tombstoned slot (`Unspecified`)
+        // rather than reconstructing a handle into freed arena
+        // memory. SAFETY: `nb_owning_payload_is_live` doesn't
+        // consume/mutate the slot, so this check is side-effect-free.
+        if !unsafe { nb_owning_payload_is_live(raw) } {
+            return Value::Unspecified;
+        }
+        // SAFETY: the slot holds a live owning NB payload (or inline
+        // immediate) for as long as `self` is alive. `nb_clone_owned`
+        // bumps its refcount (if any), so the returned `Value` is an
+        // independent additional owner and the slot's own ownership
+        // is untouched.
+        unsafe { NanboxValue(nb_clone_owned(raw)).to_value() }
+    }
+
+    /// See [`peek_car`](Self::peek_car).
+    fn peek_cdr(&self) -> Value {
+        let raw = self.cdr.get() as i64;
+        if !unsafe { nb_owning_payload_is_live(raw) } {
+            return Value::Unspecified;
+        }
+        unsafe { NanboxValue(nb_clone_owned(raw)).to_value() }
+    }
+
+    /// Overwrite the car slot with an already-owned NB payload
+    /// (`bits`), dropping whatever owning payload was there before.
+    fn set_car_raw_owned(&self, bits: u64) {
+        let old = self.car.replace(bits);
+        // SAFETY: `old` was this slot's own owning payload; we hold
+        // the only reference to it via `self.car` and have just
+        // replaced that reference, so this is exactly one drop.
+        unsafe { nb_drop_owned(old as i64) };
+    }
+
+    /// See [`set_car_raw_owned`](Self::set_car_raw_owned).
+    fn set_cdr_raw_owned(&self, bits: u64) {
+        let old = self.cdr.replace(bits);
+        unsafe { nb_drop_owned(old as i64) };
+    }
+
     pub fn new(car: Value, cdr: Value) -> cs_gc::Gc<Self> {
         cs_gc::Gc::new(Pair {
-            car: RefCell::new(car),
-            cdr: RefCell::new(cdr),
+            car: Cell::new(encode_owned(car)),
+            cdr: Cell::new(encode_owned(cdr)),
             flags: Cell::new(0),
         })
     }
@@ -124,8 +216,8 @@ impl Pair {
     /// Construct a pair tagged with its reader-produced source span.
     pub fn with_source(car: Value, cdr: Value, span: cs_diag::Span) -> cs_gc::Gc<Self> {
         let gc = cs_gc::Gc::new(Pair {
-            car: RefCell::new(car),
-            cdr: RefCell::new(cdr),
+            car: Cell::new(encode_owned(car)),
+            cdr: Cell::new(encode_owned(cdr)),
             flags: Cell::new(HAS_SPAN),
         });
         let addr = cs_gc::Gc::as_addr(&gc);
@@ -177,8 +269,8 @@ impl Pair {
         cs_gc::Gc::new_in(
             region,
             Pair {
-                car: RefCell::new(car),
-                cdr: RefCell::new(cdr),
+                car: Cell::new(encode_owned(car)),
+                cdr: Cell::new(encode_owned(cdr)),
                 flags: Cell::new(0),
             },
         )
@@ -201,7 +293,7 @@ impl Pair {
                 .flatten();
             return upgraded.unwrap_or(Value::Unspecified);
         }
-        self.car.borrow().clone()
+        self.peek_car()
     }
 
     /// Read the cdr as a `Value`. See [`car`] for the
@@ -215,7 +307,7 @@ impl Pair {
                 .flatten();
             return upgraded.unwrap_or(Value::Unspecified);
         }
-        self.cdr.borrow().clone()
+        self.peek_cdr()
     }
 
     /// Replace the car slot with `v`. Clears any weak tombstone
@@ -230,7 +322,7 @@ impl Pair {
                 t.borrow_mut().remove(&addr);
             });
         }
-        self.car.replace(v);
+        self.set_car_raw_owned(encode_owned(v));
     }
 
     /// Replace the cdr slot with `v`. Clears any weak tombstone.
@@ -242,7 +334,7 @@ impl Pair {
                 t.borrow_mut().remove(&addr);
             });
         }
-        self.cdr.replace(v);
+        self.set_cdr_raw_owned(encode_owned(v));
     }
 
     /// Cycle-break action for the car slot. Downgrades the
@@ -285,17 +377,27 @@ impl Pair {
     /// Bacon-Rajan trial deletion that picks safe cycle
     /// edges without caller hints.
     pub fn break_car_cycle(&self, baseline: usize) -> bool {
-        // Read strong count WITHOUT cloning so the count
-        // reflects the slot's contribution plus the caller's
-        // declared transient refs and any external anchors.
-        let car_borrow = self.car.borrow();
-        let total = car_borrow.heap_strong_count().unwrap_or(0);
-        drop(car_borrow);
+        // Raw, non-upgrading peek: if a prior break already
+        // tombstoned this slot, `peek_car` sees the strong slot's
+        // actual `Unspecified`, `heap_strong_count()` is `None`,
+        // `total` is 0, and the guard below declines — same
+        // outcome as the pre-PR2 code (which relied on the same
+        // invariant: the strong slot reads back as `Unspecified`
+        // once tombstoned).
+        //
+        // `peek_car` incref's on the way out (it's a clone-out
+        // read), so `total` is one higher than the "true" strong
+        // count until `peeked` drops — subtract that back out so
+        // `baseline` comparisons are unaffected by our own peek.
+        let peeked = self.peek_car();
+        let total = peeked
+            .heap_strong_count()
+            .map(|n| n.saturating_sub(1))
+            .unwrap_or(0);
         if total <= baseline {
             return false;
         }
-        let val = self.car();
-        let Some(weak) = WeakValue::from_value(&val) else {
+        let Some(weak) = WeakValue::from_value(&peeked) else {
             return false; // leaf (shouldn't reach: heap_strong_count returned Some)
         };
         let addr = self.addr();
@@ -311,7 +413,7 @@ impl Pair {
             return false;
         }
         self.flags.set(self.flags.get() | HAS_CAR_TOMBSTONE);
-        *self.car.borrow_mut() = Value::Unspecified;
+        self.set_car_raw_owned(encode_owned(Value::Unspecified));
         true
     }
 
@@ -319,14 +421,15 @@ impl Pair {
     /// [`break_car_cycle`] for the `baseline` parameter
     /// convention.
     pub fn break_cdr_cycle(&self, baseline: usize) -> bool {
-        let cdr_borrow = self.cdr.borrow();
-        let total = cdr_borrow.heap_strong_count().unwrap_or(0);
-        drop(cdr_borrow);
+        let peeked = self.peek_cdr();
+        let total = peeked
+            .heap_strong_count()
+            .map(|n| n.saturating_sub(1))
+            .unwrap_or(0);
         if total <= baseline {
             return false;
         }
-        let val = self.cdr();
-        let Some(weak) = WeakValue::from_value(&val) else {
+        let Some(weak) = WeakValue::from_value(&peeked) else {
             return false;
         };
         let addr = self.addr();
@@ -339,13 +442,18 @@ impl Pair {
             return false;
         }
         self.flags.set(self.flags.get() | HAS_CDR_TOMBSTONE);
-        *self.cdr.borrow_mut() = Value::Unspecified;
+        self.set_cdr_raw_owned(encode_owned(Value::Unspecified));
         true
     }
 }
 
 impl Drop for Pair {
     fn drop(&mut self) {
+        // NOTE (PR2, cs-vnf.3): `self.car`/`self.cdr` are raw owning
+        // NB `Cell<u64>` payloads now, not `RefCell<Value>` — this
+        // Drop is responsible for explicitly decoding+dropping BOTH
+        // slots exactly once (there's no automatic `Value` drop
+        // glue anymore; a raw `u64` has none).
         // Clear this pair's out-of-line table entries (cs-5te). A
         // freed address CANNOT be left pointing at stale span/
         // tombstone data — the allocator may hand that same address
@@ -384,6 +492,32 @@ impl Drop for Pair {
             }
         }
 
+        // Drop the car slot directly (non-iterative). If car
+        // happens to be part of a long car-chain this recurses
+        // through the normal tag-dispatched drop below (same as
+        // pre-PR2: only the CDR chain gets the iterative
+        // unlinking treatment — car chains aren't the "long
+        // proper list" shape it exists for).
+        //
+        // SAFETY: `self.car` holds this Pair's own live owning NB
+        // payload (or inline immediate); `self` is being dropped
+        // exactly once, so this fires exactly once.
+        //
+        // `replace` (not `get`), matching the pre-PR2 code's
+        // `self.cdr.replace(Value::Null)` below: dropping this
+        // payload can recurse arbitrarily (car may itself be a
+        // Pair/Vector/Hashtable/Promise whose own drop runs) and
+        // that recursive drop can trigger the layer-4 cycle-sweep,
+        // which walks OTHER live pairs' car/cdr slots. If
+        // `self.car` still held the same owning bits we're in the
+        // middle of dropping, a sweep landing on `self` mid-drop
+        // could read/tombstone/drop that same payload a second
+        // time — replacing it with a non-owning immediate FIRST
+        // closes that window.
+        unsafe {
+            nb_drop_owned(self.car.replace(NanboxValue::UNSPECIFIED.into_raw() as u64) as i64)
+        };
+
         // Iteratively unlink the cdr chain. Without this,
         // dropping a long list `(cons x1 (cons x2 …))` triggers
         // recursive `Rc<Pair>::drop` calls — one stack frame per
@@ -394,16 +528,61 @@ impl Drop for Pair {
         // strong holder of the next cdr-Pair (`Gc::into_inner`
         // returns `Some`). Shared pairs and region-backed pairs
         // stop the walk — their other holders / the region drop
-        // is responsible for cleanup.
-        let mut cur = self.cdr.replace(Value::Null);
-        while let Value::Pair(gc) = cur {
+        // is responsible for cleanup. `cur` is always an OWNED NB
+        // payload (we transfer ownership out of whichever slot
+        // currently holds it, one hop at a time). `replace`, same
+        // reentrancy reasoning as the car drop above.
+        let mut cur = self.cdr.replace(NanboxValue::NULL.into_raw() as u64) as i64;
+        loop {
+            let bits = cur as u64;
+            if !(nb_is_tagged(bits) && nb_tag_of(bits) == NB_TAG_PAIR) {
+                // Not a pair (Null, another leaf, or a different
+                // heap type) — drop it normally (recursing through
+                // its own destructor if it owns one) and stop.
+                unsafe { nb_drop_owned(cur) };
+                break;
+            }
+            // It's a pair: reconstitute the `Gc<Pair>` handle,
+            // taking over the strong ref `cur` was carrying.
+            let (ptr, is_region) = nb_decode_gc_ptr(nb_payload_of(bits));
+            // SAFETY: `bits` is a live owning NB_TAG_PAIR payload
+            // (either this Pair's own cdr, or a prior hop's cdr),
+            // produced by the same `encode_owned`/`into_raw_jit`
+            // machinery every other Pair construction uses.
+            //
+            // `decode_gc_handle_for_drop` (not `decode_gc_handle`):
+            // this is a release, so an already-torn-down owning
+            // region must be tolerated the same way `Gc<T>::drop`
+            // tolerates it — a region's bulk-arena free never runs
+            // `Pair::drop`, so a stale region-tagged cdr payload has
+            // nothing left to release. `None` here means exactly
+            // that: stop the walk, same as the "shared/region-
+            // backed" `None` arm below.
+            let Some(gc) = (unsafe { decode_gc_handle_for_drop::<Pair>(ptr, is_region) }) else {
+                break;
+            };
             match cs_gc::Gc::into_inner(gc) {
-                Some(mut pair) => {
-                    cur = std::mem::replace(pair.cdr.get_mut(), Value::Null);
-                    // `pair` drops at scope end: car drops
-                    // naturally (typically a leaf), cdr is
-                    // Null so no further recursion fires.
+                Some(pair) => {
+                    // Sole owner: take its cdr payload for the next
+                    // hop, and neutralize `pair`'s own copy (an
+                    // inline immediate, so "dropping" it is a
+                    // no-op) so `pair`'s own `Drop::drop` — about
+                    // to fire when `pair` goes out of scope below —
+                    // doesn't also try to walk/drop the same
+                    // payload we just took.
+                    let next = pair.cdr.replace(NanboxValue::NULL.into_raw() as u64);
+                    cur = next as i64;
+                    // `pair` drops here: its own `Drop::drop` fires
+                    // (flags cleanup + car drop via `nb_drop_owned`
+                    // + a cdr walk that's now a one-iteration no-op
+                    // since we already zeroed cdr to NULL).
                 }
+                // Shared (or region-backed): `Gc::into_inner`
+                // already decremented the strong count as part of
+                // consuming `gc` (mirrors `Rc::into_inner`'s
+                // documented "drops one strong ref, returns None"
+                // behavior on a shared handle) — there is nothing
+                // further to release here.
                 None => break,
             }
         }
@@ -1859,6 +2038,92 @@ impl fmt::Display for Value {
     }
 }
 
+/// cs-vnf.3 PR2 regression: `Pair`'s raw `Cell<u64>` NB slots must
+/// tolerate an owning region-tagged payload whose region has
+/// already dropped — a real (if rare) scenario reachable via a
+/// Pair's own `Drop` triggering the layer-4 cycle sweep, which can
+/// walk OTHER live pairs' slots (see the note in `Drop for Pair`).
+/// Before this fix, `nb_drop_owned`/`peek_car`/`peek_cdr` decoded
+/// every pointer-typed tag through the strict
+/// `decode_gc_handle`/`from_raw_jit_region`, which panics on
+/// exactly this condition (`from_raw_jit_region: slot region_id
+/// was 0`) — a panic that, reached from inside a recursive `Drop`
+/// chain, aborts the process rather than unwinding. These tests
+/// build that exact condition directly and cheaply (no VM/cycle
+/// sweep needed at the cs-core layer): a `Pair` slot whose payload
+/// is a region-tagged NB encoding for a `Region` that has already
+/// dropped.
+#[cfg(all(test, feature = "regions"))]
+mod region_drop_tolerance_tests {
+    use super::*;
+    use cs_gc::Region;
+
+    /// A raw region-tagged NB payload for a `Region` that has
+    /// already dropped. `Region::drop` marks the region dead in
+    /// `cs_gc`'s thread-local slab deterministically (before the
+    /// arena memory itself is freed), so this is reproducible every
+    /// run, not a timing-dependent UAF.
+    fn dead_region_owning_bits() -> u64 {
+        let region = Region::new();
+        let p = cs_core_pair_new_in_for_test(&region);
+        let bits = encode_owned(Value::Pair(p));
+        drop(region);
+        bits
+    }
+
+    // Thin wrapper so this module doesn't need `cs_gc::Gc::is_region`
+    // asserted inline at every call site.
+    fn cs_core_pair_new_in_for_test(region: &Region) -> cs_gc::Gc<Pair> {
+        let p = Pair::new_in(region, Value::fixnum(11), Value::fixnum(22));
+        assert!(
+            cs_gc::Gc::is_region(&p),
+            "test setup: must be region-backed"
+        );
+        p
+    }
+
+    /// Reading a live pair's car when the car slot's payload is a
+    /// dead-region pointer must not panic — it degrades to
+    /// `Unspecified`, the same graceful fallback an
+    /// already-tombstoned slot gets.
+    #[test]
+    fn peek_car_tolerates_dead_region_payload() {
+        let bits = dead_region_owning_bits();
+        let holder = Pair::new(Value::Unspecified, Value::Unspecified);
+        holder.set_car_raw_owned(bits);
+        assert!(matches!(holder.car(), Value::Unspecified));
+    }
+
+    /// Same for cdr.
+    #[test]
+    fn peek_cdr_tolerates_dead_region_payload() {
+        let bits = dead_region_owning_bits();
+        let holder = Pair::new(Value::Unspecified, Value::Unspecified);
+        holder.set_cdr_raw_owned(bits);
+        assert!(matches!(holder.cdr(), Value::Unspecified));
+    }
+
+    /// Dropping a `Pair` whose car (or cdr) slot holds a
+    /// dead-region payload must not panic — `nb_drop_owned` skips
+    /// the release (nothing left to release; region bulk-free
+    /// already reclaimed it).
+    #[test]
+    fn drop_tolerates_dead_region_payload_in_car() {
+        let bits = dead_region_owning_bits();
+        let holder = Pair::new(Value::Unspecified, Value::Unspecified);
+        holder.set_car_raw_owned(bits);
+        drop(holder); // must not panic
+    }
+
+    #[test]
+    fn drop_tolerates_dead_region_payload_in_cdr() {
+        let bits = dead_region_owning_bits();
+        let holder = Pair::new(Value::Unspecified, Value::Unspecified);
+        holder.set_cdr_raw_owned(bits);
+        drop(holder); // must not panic
+    }
+}
+
 #[cfg(test)]
 mod pair_diet_tests {
     use super::*;
@@ -1873,13 +2138,20 @@ mod pair_diet_tests {
     /// padded to 8 for `Value`'s 8-byte alignment) = 40B measured
     /// (72B on this build once `Value`'s own layout is counted in —
     /// see the assertion below), well under the 80B target.
+    ///
+    /// cs-vnf.3 PR2: `car`/`cdr` flip from `RefCell<Value>` (16B
+    /// each — a 16-byte tagged Rust enum behind a `RefCell` borrow
+    /// flag) to raw NaN-boxed `Cell<u64>` (8B each). New size:
+    /// `car`(8) + `cdr`(8) + `flags`(1, padded to 8) = 24B — a
+    /// further 56B -> 24B drop (with the +16B `Rc` header, cons
+    /// cells shrink 72B -> 40B).
     #[test]
     fn pair_is_diet_sized() {
-        let before = 144usize;
+        let before = 56usize;
         let after = std::mem::size_of::<Pair>();
         assert_eq!(
-            after, 56,
-            "Pair size changed: {after}B (was {before}B before cs-5te; cs-5te landed it at 72B, cs-3wa's 16B Value shrank it to 56B)"
+            after, 24,
+            "Pair size changed: {after}B (was {before}B before cs-vnf.3 PR2's Cell<u64> NB-slot flip)"
         );
         assert!(
             after <= 80,

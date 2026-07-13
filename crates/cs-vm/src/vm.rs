@@ -946,7 +946,7 @@ pub use cs_core::nanbox::{
 // this file before the move; re-export at the same restricted
 // visibility so cs-vm's own many internal call sites keep resolving
 // while external crates (cs-jit-cranelift, etc.) still can't see them.
-pub(crate) use cs_core::nanbox::{decode_gc_handle, proc_table};
+pub(crate) use cs_core::nanbox::{decode_gc_handle, decode_gc_handle_for_drop, proc_table};
 
 // ===== ValueStack (Stage 2 K1 step 3b — NanboxValue-backed dispatch stack) =====
 //
@@ -5727,23 +5727,35 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
         return;
     }
     let (ptr, is_region) = nb_decode_gc_ptr(payload);
+    // `decode_gc_handle_for_drop` (not `decode_gc_handle`): this is
+    // a release, and an owning region-tagged payload whose region
+    // already tore down has nothing left to release (region
+    // bulk-free never runs `T::drop`) — tolerate that the same way
+    // `Gc<T>::drop` does, rather than panicking (cs-vnf.3 PR2 fix;
+    // this function predates PR2 but shares the same bug shape once
+    // `Pair`'s raw NB slots made this path reachable from a Pair
+    // Drop's recursive cycle sweep).
     match tag {
-        t if t == NB_TAG_PAIR => drop(unsafe { decode_gc_handle::<cs_core::Pair>(ptr, is_region) }),
-        t if t == NB_TAG_VECTOR => {
-            drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<Value>>>(ptr, is_region) })
+        t if t == NB_TAG_PAIR => {
+            drop(unsafe { decode_gc_handle_for_drop::<cs_core::Pair>(ptr, is_region) })
         }
-        t if t == NB_TAG_STRING => {
-            drop(unsafe { decode_gc_handle::<std::cell::RefCell<cs_core::CsStr>>(ptr, is_region) })
-        }
-        t if t == NB_TAG_BYTEVECTOR => {
-            drop(unsafe { decode_gc_handle::<std::cell::RefCell<Vec<u8>>>(ptr, is_region) })
-        }
+        t if t == NB_TAG_VECTOR => drop(unsafe {
+            decode_gc_handle_for_drop::<std::cell::RefCell<Vec<Value>>>(ptr, is_region)
+        }),
+        t if t == NB_TAG_STRING => drop(unsafe {
+            decode_gc_handle_for_drop::<std::cell::RefCell<cs_core::CsStr>>(ptr, is_region)
+        }),
+        t if t == NB_TAG_BYTEVECTOR => drop(unsafe {
+            decode_gc_handle_for_drop::<std::cell::RefCell<Vec<u8>>>(ptr, is_region)
+        }),
         t if t == NB_TAG_HASHTABLE => {
-            drop(unsafe { decode_gc_handle::<cs_core::Hashtable>(ptr, is_region) })
+            drop(unsafe { decode_gc_handle_for_drop::<cs_core::Hashtable>(ptr, is_region) })
         }
-        t if t == NB_TAG_PORT => drop(unsafe { decode_gc_handle::<cs_core::Port>(ptr, is_region) }),
+        t if t == NB_TAG_PORT => {
+            drop(unsafe { decode_gc_handle_for_drop::<cs_core::Port>(ptr, is_region) })
+        }
         t if t == NB_TAG_PROMISE => {
-            drop(unsafe { decode_gc_handle::<cs_core::Promise>(ptr, is_region) })
+            drop(unsafe { decode_gc_handle_for_drop::<cs_core::Promise>(ptr, is_region) })
         }
         // NB_TAG_GC_VALUE (and the reserved-but-routed-here
         // NB_TAG_PROCEDURE) — Gc<Value> wrap. Also the defensive
@@ -10906,55 +10918,60 @@ impl cs_gc::cycle::CycleVisit for Bindings {
             // Rc-backed closure capturing that env can register as a
             // cycle candidate, walking down into this Bindings.
             let (ptr, is_region) = nb_decode_gc_ptr(payload);
+            // `decode_gc_handle_for_drop` (not `decode_gc_handle`):
+            // this walk can run mid-Drop-chain (a Pair's Drop can
+            // recurse into arbitrary destructors, which can trigger
+            // this very cycle sweep), well after some OTHER
+            // binding's owning region already tore down — tolerate
+            // that (skip the visit; there's nothing live left to
+            // walk into) rather than panicking. `ManuallyDrop`
+            // still wraps the `Some` case: this is a peek, not a
+            // release, so `decode_gc_handle_for_drop`'s Some-side
+            // strong-count transfer must NOT be allowed to run its
+            // Drop.
+            macro_rules! peek_or_skip {
+                ($t:ty) => {
+                    match unsafe { decode_gc_handle_for_drop::<$t>(ptr, is_region) } {
+                        Some(g) => std::mem::ManuallyDrop::new(g),
+                        None => return,
+                    }
+                };
+            }
             match tag {
                 t if t == NB_TAG_PAIR => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<cs_core::Pair>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(cs_core::Pair);
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
                     }
                 }
                 t if t == NB_TAG_VECTOR => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<std::cell::RefCell<Vec<Value>>>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(std::cell::RefCell<Vec<Value>>);
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
                     }
                 }
                 t if t == NB_TAG_STRING => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<std::cell::RefCell<cs_core::CsStr>>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(std::cell::RefCell<cs_core::CsStr>);
                     // String holds no Gc<...> children; register
                     // identity for cycle target check, then stop.
                     let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_BYTEVECTOR => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<std::cell::RefCell<Vec<u8>>>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(std::cell::RefCell<Vec<u8>>);
                     let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_HASHTABLE => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<cs_core::Hashtable>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(cs_core::Hashtable);
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
                     }
                 }
                 t if t == NB_TAG_PORT => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<cs_core::Port>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(cs_core::Port);
                     let _ = ctx.visit(&g);
                 }
                 t if t == NB_TAG_PROMISE => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<cs_core::Promise>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(cs_core::Promise);
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
                     }
@@ -10962,9 +10979,7 @@ impl cs_gc::cycle::CycleVisit for Bindings {
                 // Procedure is a ProcTable index, not a Gc pointer.
                 t if t == NB_TAG_PROCEDURE => {}
                 _ => {
-                    let g = std::mem::ManuallyDrop::new(unsafe {
-                        decode_gc_handle::<Value>(ptr, is_region)
-                    });
+                    let g = peek_or_skip!(Value);
                     if ctx.visit(&g) {
                         (**g).visit_children(ctx);
                     }
@@ -11034,6 +11049,56 @@ mod bindings_cycle_visit_region_tests {
     /// walks it via the real `CycleVisitor` machinery
     /// (`cycle_check`), which invokes `Bindings::visit_children`
     /// exactly as the synchronous detector would.
+    /// cs-vnf.3 PR2 regression: deterministically reproduces the
+    /// `from_raw_jit_region: slot region_id was 0` panic this fix
+    /// closes, without relying on timing/luck. Builds a `Bindings`
+    /// frame holding a region-tagged NB payload whose OWNING REGION
+    /// HAS ALREADY DROPPED — `Region::drop` marks the region dead in
+    /// `REGION_SLAB` deterministically (before the arena memory
+    /// itself is freed), so `is_region_live` reliably returns
+    /// `false` here regardless of allocator reuse timing. This is
+    /// exactly the shape a Pair's raw-bits `Drop` cdr-walk (or the
+    /// layer-4 cycle sweep it can trigger recursively — see the
+    /// note on `Drop for Pair` in cs-core) can hand to
+    /// `Bindings::visit_children`: a stale owning payload for a
+    /// region that's already gone. Before the fix, `visit_children`
+    /// decoded every pointer-typed tag through the strict
+    /// `decode_gc_handle`/`from_raw_jit_region`, which panics on
+    /// exactly this condition; the walk must instead skip the dead
+    /// payload gracefully, the same way `Gc<T>::drop` already
+    /// tolerates it.
+    #[test]
+    fn visit_children_skips_pair_whose_owning_region_already_dropped() {
+        let nb = {
+            let region = Region::new();
+            let p = cs_core::Pair::new_in(&region, Value::fixnum(11), Value::fixnum(22));
+            assert!(Gc::is_region(&p), "test setup: pair must be region-backed");
+            NanboxValue::from_value(Value::Pair(p))
+            // `region` drops here — `REGION_SLAB` marks it dead
+            // immediately, before `nb`'s raw payload (captured
+            // above, a plain `i64`) goes out of scope. `nb` now
+            // encodes a region-tagged pointer into a region that no
+            // longer exists.
+        };
+
+        let mut bindings = Bindings::default();
+        match &mut bindings {
+            Bindings::Small(v) => v.push((Symbol(0), nb)),
+            Bindings::Large(_) => unreachable!("default Bindings starts Small"),
+        }
+        let gc_bindings = Gc::new(bindings);
+
+        // Must not panic. Before the fix this aborted the process
+        // (`from_raw_jit_region`'s panic fires inside a Drop-adjacent
+        // walk, which can't unwind).
+        let found = cycle_check(&gc_bindings);
+        assert!(
+            found.is_none(),
+            "no cycle exists in this shape; the dead-region payload must be \
+             skipped, not decoded"
+        );
+    }
+
     #[test]
     fn visit_children_decodes_region_pair_without_corruption() {
         let region = Region::new();
