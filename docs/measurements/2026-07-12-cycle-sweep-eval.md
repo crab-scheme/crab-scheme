@@ -15,11 +15,14 @@ cycles the layer-2 synchronous detector can't break (heap is RC-only;
   `--features tracing-cycle-collector` (`/tmp/crabscheme-sweep-on`).
   Verified they are distinct artifacts (differing SHA-1) rather than a
   stale relink.
-- Leak harness: four Scheme workloads in a scratch `leak-scm/` (deleted
-  before commit), each looping N iterations of a residual-leak shape,
-  sampling `(gc-stats)` (`live-slots`, `live-bytes`,
-  `sweep-candidates-checked`, `sweep-cycles-collected`,
-  `sweep-broken-total`) every 2,000–10,000 iterations:
+- Leak harness: four Scheme workloads (reconstructed under
+  `bench/leak-scm/`, see the Appendix), each looping N iterations of a
+  residual-leak shape, sampling `(gc-stats)` (`live-slots`,
+  `live-bytes`, `sweep-candidates-checked`, `sweep-cycles-collected`,
+  `sweep-broken-total`) every 2,000–10,000 iterations. Each leak/efficacy
+  run below is a single run per (shape, N); growth is monotone across
+  samples within a run, so a single run is sufficient to characterize
+  the trend, but the exact byte counts are not averaged across repeats:
   - (a) `vector-cycle`: `(let ((v (make-vector 1 0))) (vector-set! v 0 v))`, drop.
   - (b) `hashtable-cycle`: `(let ((h (make-eq-hashtable))) (hashtable-set! h 'self h))`, drop.
   - (c) `closure-cycle`: `letrec`-bound mutually-recursive lambdas, called once, then dropped.
@@ -47,6 +50,11 @@ cycles the layer-2 synchronous detector can't break (heap is RC-only;
 | (b) hashtable self-cycle | 1 slot/iter | 144 B/iter | No — linear growth to 200k iters |
 | (c) closure/letrec mutual-recursion | **0** (plateaus at 48 slots) | 0 | Yes — see caveat below |
 | (d) churn-loop (vector+closure composite) | 1 slot/iter | 48 B/iter (same as (a); the closure alloc adds no measurable heap growth in this tier) | No — linear growth to 200k iters |
+
+Each row is a single run; `live-slots` growth was monotone (no
+plateau, no sawtooth) across every sample point in that run, which is
+what licenses the "linear" / "flat" characterization from one run
+rather than a distribution.
 
 Extrapolation at realistic churn rates (bytes/iter × iterations/hour):
 a 10,000 conn/s churn rate on shape (a) or (d) leaks ≈ 1.7 GB/hour; the
@@ -77,6 +85,11 @@ regardless of this decision.
 | (c) closure/env cycle | No — never registered (no trait impls, see §2) | N/A | No effect either way |
 | (d) churn-loop (vector-anchored) | Yes | **No** — dominated by the same Vector no-op path as (a) | Same as (a): identical leak curve, 0 cycles collected |
 
+As in §2, each cell above is from a single sweep-on run per shape; the
+"identical leak curve" / "100% reclaimed" characterizations are read
+off monotone per-sample `live-slots`/`sweep-cycles-collected` series
+within that one run, not an average over repeats.
+
 ## 4. Overhead A/B
 
 **Non-cycle workloads** (registry stays empty — the only added cost is
@@ -84,11 +97,23 @@ the `take_sweep_pending()` bool check on `Gc::new`'s hot path):
 
 | Bench | sweep-off MIN | sweep-on MIN | Δ |
 |---|---|---|---|
-| fib(32), `--tier vm-jit` | 15.73 ms | 14.90 ms | −5.3% (noise; sweep-on nominally faster) |
-| alloc-stress(200), `--tier vm-jit` | 16.70 ms | 14.97 ms | −10.4% (noise) |
+| fib(32), `--tier vm-jit` | 15.73 ms | 14.90 ms | −5.3% |
+| alloc-stress(200), `--tier vm-jit` | 16.70 ms | 14.97 ms | −10.4% |
 
-Both comfortably clear the <2% MIN threshold — for workloads that don't
-create sweep candidates, the feature is free, as expected.
+No regression detected above noise — both deltas are sweep-on
+*faster*, i.e. the opposite direction of what the <2% gate is
+checking for. The alloc-stress −10.4% is larger than a single
+`take_sweep_pending()` bool check would explain by itself; the most
+likely source is ordinary run-to-run machine noise (shared CI/dev
+box, no isolated core pinning, ≥20-run MIN is still sensitive to a
+single lucky run) rather than sweep-on doing systematically less
+work than sweep-off. It was not chased further because it does not
+threaten the decision either way: a *faster* sweep-on result cannot
+be the thing that blocks default-on. What does block default-on is
+the unbounded cycle-workload case in the next table, which is not
+sensitive to this kind of noise (320–1,060×, orders of magnitude
+above any noise floor). For workloads that don't create sweep
+candidates, the feature is free, as expected.
 
 **Cycle-heavy workload (vector self-cycles, shape a) — NOT gated by the
 <2% check, and it should have been part of the gate:**
@@ -101,12 +126,19 @@ create sweep candidates, the feature is free, as expected.
 
 Root cause: `register_cycle_candidate` arms `SWEEP_PENDING` whenever
 `registry.len() >= AUTO_TRIGGER_THRESHOLD` (default 10,000,
-`cycle_registry.rs:317`). Once the vector-cycle registry crosses that
-threshold it **never shrinks** (§3 — `try_break_candidate` always
-returns `false` for Vector), so `registry.len() >= threshold` is true
-forever, meaning **every subsequent `Gc::new` re-arms and re-runs a
-full O(n) Bacon-Rajan pass over the entire ever-growing candidate set**.
-That's O(n²) total work for a workload that does nothing but allocate
+`cycle_registry.rs:317`) — i.e. the re-arm check runs on every new
+*candidate registration*, not on every allocation. `Gc::new` is where
+an already-armed sweep actually **runs** (`take_sweep_pending()` is
+polled on that hot path). Once the vector-cycle registry crosses the
+10,000 threshold it **never shrinks** (§3 — `try_break_candidate`
+always returns `false` for Vector), so `registry.len() >= threshold`
+stays true forever: every subsequent candidate registration re-arms
+`SWEEP_PENDING`, and the very next `Gc::new` call — cycle-producing or
+not — pays for a **full O(n) Bacon-Rajan pass over the entire
+ever-growing candidate set**. Non-cycle-producing allocations in
+between candidate registrations are not exempt: any of them can be
+the one that observes the armed flag and triggers the pass. That's
+O(n²) total work for a workload that does nothing but allocate
 self-referential vectors in a loop — a very ordinary pattern (building
 parent-pointer or doubly-linked structures via vectors, or exactly the
 `spawn-source`-adjacent churn loop in shape (d)). A 200,000-iteration
@@ -175,3 +207,43 @@ their workload is hashtable-cycle-heavy and vector-cycle-free.
 
 No product-code changes. `crates/cs-gc/Cargo.toml`'s `default = [...]`
 line is unchanged; `tracing-cycle-collector` stays opt-in.
+
+## Appendix: reproducing this eval
+
+The original `leak-scm/` scratch directory was deleted before the
+first commit of this doc; the four workload files below are
+reconstructions of the same shapes, committed under `bench/leak-scm/`
+and re-verified against the sweep-off binary before this revision.
+Edit each file's `(define n ...)` to change the iteration count (this
+eval used 10,000 / 20,000 / 40,000 / 200,000 at various points, per
+the tables above).
+
+- `bench/leak-scm/vector-cycle.scm` — shape (a)
+- `bench/leak-scm/hashtable-cycle.scm` — shape (b)
+- `bench/leak-scm/closure-cycle.scm` — shape (c)
+- `bench/leak-scm/churn-loop.scm` — shape (d)
+
+Build the two binaries from the same commit:
+
+```sh
+devenv shell -- cargo build --release -p cs-cli
+cp target/release/crabscheme /tmp/crabscheme-sweep-off
+
+devenv shell -- cargo build --release -p cs-cli --features cs-gc/tracing-cycle-collector
+cp target/release/crabscheme /tmp/crabscheme-sweep-on
+```
+
+Run a shape against either binary:
+
+```sh
+/tmp/crabscheme-sweep-off run bench/leak-scm/vector-cycle.scm
+/tmp/crabscheme-sweep-on  run bench/leak-scm/vector-cycle.scm
+```
+
+Each run prints `(gc-stats)` every 2,000 iterations plus a `final:`
+line; watch `live-slots` / `live-bytes` for growth and
+`sweep-cycles-collected` / `sweep-candidates-checked` for sweep
+activity. The §4 overhead A/B used `hyperfine --shell=none` wrapping
+the same two binaries against `bench/microbench/scheme/fib.scm`
+(`n` bumped 25→32) and `bench/microbench/scheme/alloc-stress.scm`,
+run with `--tier vm-jit`.
