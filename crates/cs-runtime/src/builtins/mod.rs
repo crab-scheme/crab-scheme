@@ -7015,7 +7015,7 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
             // `Hashtable::break_value_cycle`'s doc. Values only;
             // keys are never tombstoned (see
             // HASHTABLE_VALUE_TOMBSTONES's doc for why).
-            if h.break_value_cycle(written_idx, 3) {
+            if Hashtable::break_value_cycle(h, written_idx, 3) {
                 crate::countable_memory_cycle::record_cycle_broken();
             }
         });

@@ -218,13 +218,25 @@ fn vector_and_hashtable_self_cycle_observability_preserved() {
 
 #[test]
 fn vector_and_hashtable_self_cycle_no_reclaim_when_only_holder_is_transient() {
-    // Mirrors `cycle_break.rs`'s `metacircular_style_define_...` /
-    // strong-count-guard shape: a self-cycle whose only strong
-    // holder is the freshly-mutated subgraph itself (never bound
-    // anywhere externally) must be DETECTED but the guard must
-    // refuse to demote it — demoting here would make the value
-    // unreachable mid-construction, which is exactly the hazard
-    // the `baseline` guard exists to prevent.
+    // Mirrors `cycle_break.rs`'s `metacircular_style_define_...`
+    // shape: a self-cycle whose only strong holder is a `let`-local
+    // that never escapes the enclosing call. Detection fires either
+    // way; demotion ALSO fires here (`total` = slot + args[0] +
+    // args[2] + the `let` binding = 4 > baseline 3), so this is NOT
+    // a case where the `baseline` guard declines to demote — the
+    // guard's job is purely to avoid demoting a slot whose demotion
+    // would drop the value's *only* strong reference (0 vs. 1
+    // external refs at baseline+1 total). Here the demoted slot's
+    // target stays reachable for the rest of the call purely
+    // because `vector_get`/`value_at` transparently upgrade the
+    // weak tombstone back to the live value — the same
+    // observability path proven by
+    // `vector_and_hashtable_self_cycle_observability_preserved`
+    // above. Once the `let` binding itself goes out of scope, the
+    // (now-weak) reference drops and the value reclaims normally;
+    // this test only checks that detection AND (here) demotion both
+    // fire without panicking or corrupting the transient value
+    // before it's discarded.
     let mut rt = Runtime::new();
     reset_cycle_detection_count();
     rt.eval_str(
@@ -242,8 +254,14 @@ fn vector_and_hashtable_self_cycle_no_reclaim_when_only_holder_is_transient() {
         cycle_detection_count() > 0,
         "detection should have fired for the transient vector cycle"
     );
+    assert!(
+        cycle_broken_count() > 0,
+        "total refs (slot+args[0]+args[2]+let-binding=4) exceed baseline=3, \
+         so demotion should fire even though the binding is transient"
+    );
 
     let ht_detected_before = cycle_detection_count();
+    let ht_broken_before = cycle_broken_count();
     rt.eval_str(
         "<ht_transient>",
         r"
@@ -259,4 +277,100 @@ fn vector_and_hashtable_self_cycle_no_reclaim_when_only_holder_is_transient() {
         cycle_detection_count() > ht_detected_before,
         "detection should have fired for the transient hashtable cycle"
     );
+    assert!(
+        cycle_broken_count() > ht_broken_before,
+        "same total-refs-over-baseline reasoning applies to the hashtable case"
+    );
 }
+
+/// Multi-element vector: cycling through slot 1 of a 3-element
+/// vector must not disturb slots 0/2, and the demoted slot must
+/// still round-trip through `vector-ref`.
+#[test]
+fn vector_multi_element_self_cycle_isolates_slot() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<multi_vec>",
+        r"
+        (define v (vector 'a 0 'c))
+        (vector-set! v 1 v)
+        ",
+    )
+    .expect("eval ok");
+    let r0 = rt
+        .eval_str("<r0>", "(eq? (vector-ref v 0) 'a)")
+        .expect("r0");
+    let r2 = rt
+        .eval_str("<r2>", "(eq? (vector-ref v 2) 'c)")
+        .expect("r2");
+    assert_eq!(format!("{r0}"), "#t");
+    assert_eq!(format!("{r2}"), "#t");
+    let r1 = rt.eval_str("<r1>", "(eq? (vector-ref v 1) v)").expect("r1");
+    assert_eq!(format!("{r1}"), "#t");
+}
+
+/// Cross-type cycle: vector -> pair -> vector, closing through the
+/// vector's own slot. Exercises `CycleVisit`/`BreakCycle` walking
+/// through a heap-bearing intermediate type rather than a pure
+/// self-reference.
+#[test]
+fn vector_pair_vector_cross_type_cycle_breaks_and_stays_observable() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<cross_cycle>",
+        r"
+        (define v (vector 0))
+        (define p (cons v 'tail))
+        (vector-set! v 0 p)
+        ",
+    )
+    .expect("eval ok");
+    // Still observable: (car (vector-ref v 0)) should be v itself.
+    let r = rt
+        .eval_str("<cross_read>", "(eq? (car (vector-ref v 0)) v)")
+        .expect("cross read");
+    assert_eq!(format!("{r}"), "#t");
+}
+
+/// Regression for the self-healing fix: a raw writer that bypasses
+/// `vector_set` (`vector-fill!`) must not leave a stale tombstone
+/// that shadows the fresh value on a later `vector-ref`.
+#[test]
+fn vector_fill_after_demotion_is_not_shadowed_by_stale_tombstone() {
+    let mut rt = Runtime::new();
+    rt.eval_str(
+        "<fill_setup>",
+        r"
+        (define v (vector 0))
+        (vector-set! v 0 v)
+        ",
+    )
+    .expect("eval ok");
+    // Sanity: the self-cycle is observable before the fill.
+    let before = rt
+        .eval_str("<before_fill>", "(eq? (vector-ref v 0) v)")
+        .expect("before fill");
+    assert_eq!(format!("{before}"), "#t");
+    rt.eval_str("<do_fill>", "(vector-fill! v 42)")
+        .expect("fill ok");
+    let after = rt
+        .eval_str("<after_fill>", "(vector-ref v 0)")
+        .expect("after fill");
+    assert_eq!(
+        format!("{after}"),
+        "42",
+        "a stale tombstone must not shadow vector-fill!'s raw write"
+    );
+}
+
+// A VM-tier-vs-walker-tier hashtable-builtin regression
+// (`vm_tier_hashtable_builtins_honor_value_tombstones`) lives as a
+// whitebox unit test in `cs-runtime/src/lib.rs`'s own `tests`
+// module instead of here: a walker-tier `eval_str` call and a
+// VM-tier `eval_str_via_vm` call on the same `Runtime` don't share
+// a top-level environment (`top` vs. `vm_env` are separate globals
+// tables), so there's no way to hand a walker-demoted hashtable to
+// a VM-tier session through Scheme source alone. The unit test
+// builds the demoted hashtable directly against `cs_core::Hashtable`
+// (the same API `b_hashtable_set` uses) and defines it straight
+// into `vm_env`, which requires access to that private field.

@@ -6761,15 +6761,20 @@ unsafe fn vm_vector_ref_gc_inner(vec: i64, idx: i64) -> i64 {
     let v = unsafe { gc_i64_to_value(vec) };
     match v {
         Value::Vector(vc) => {
-            let storage = vc.borrow();
-            if idx < 0 || (idx as usize) >= storage.len() {
-                panic!(
+            // cs-i6p.2: `vector_get` transparently upgrades a weak
+            // slot-cycle tombstone — a raw indexed read would
+            // return `Unspecified` for a slot the walker/VM
+            // `vector-set!` fast path demoted, even though it's
+            // still live and reachable through the normal
+            // (non-JIT) read path.
+            match cs_core::value::vector_get(&vc, idx as usize) {
+                Some(val) => value_to_gc_i64(val),
+                None => panic!(
                     "vm_vector_ref_gc: index {} out of bounds for vector of length {}",
                     idx,
-                    storage.len()
-                );
+                    vc.borrow().len()
+                ),
             }
-            value_to_gc_i64(storage[idx as usize].clone())
         }
         other => panic!("vm_vector_ref_gc: not a vector ({})", other.type_name()),
     }

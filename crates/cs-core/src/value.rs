@@ -464,7 +464,12 @@ impl cs_gc::cycle::BreakCycle for Hashtable {
             })
         };
         match idx {
-            Some(i) => self.break_value_cycle(i, 0),
+            // Safe to skip the `is_region` guard here: the layer-4
+            // sweep only reaches `try_break_cycle` on hashtables
+            // registered as cycle candidates, and
+            // `record_cycle_with_candidate` already declines to
+            // register region-allocated ones.
+            Some(i) => self.break_value_cycle_unchecked(i, 0),
             None => false,
         }
     }
@@ -668,21 +673,41 @@ thread_local! {
 /// Read `v[i]`, upgrading a weak slot tombstone if present. Returns
 /// `None` if `i` is out of bounds. See the module doc above for
 /// which call sites this funnel actually covers.
+///
+/// Self-healing: a tombstone entry is only honored while the raw
+/// slot still holds the `Unspecified` placeholder that
+/// `vector_break_slot_cycle` wrote. Several writers go around
+/// `vector_set` (`vector-fill!`, `vector-copy!`, `vector-sort!`, the
+/// JIT's `vm_vector_set_gc`, …) and overwrite the raw slot directly
+/// without knowing about the tombstone table; if the slot no longer
+/// reads `Unspecified`, the tombstone is stale and is dropped here
+/// instead of shadowing the real value.
 pub fn vector_get(v: &cs_gc::Gc<RefCell<Vec<Value>>>, i: usize) -> Option<Value> {
-    if i >= v.borrow().len() {
-        return None;
-    }
-    if VECTOR_ANY_TOMBSTONE.with(Cell::get) {
-        let addr = cs_gc::Gc::as_addr(v);
-        let entry = VECTOR_TOMBSTONES
-            .try_with(|t| t.borrow().get(&(addr, i)).map(|ts| ts.weak.clone()))
-            .ok()
-            .flatten();
-        if let Some(weak) = entry {
-            return Some(weak.upgrade().unwrap_or(Value::Unspecified));
+    let raw = {
+        let vb = v.borrow();
+        if i >= vb.len() {
+            return None;
         }
+        vb[i].clone()
+    };
+    if !VECTOR_ANY_TOMBSTONE.with(Cell::get) {
+        return Some(raw);
     }
-    Some(v.borrow()[i].clone())
+    let addr = cs_gc::Gc::as_addr(v);
+    if !matches!(raw, Value::Unspecified) {
+        let _ = VECTOR_TOMBSTONES.try_with(|t| {
+            t.borrow_mut().remove(&(addr, i));
+        });
+        return Some(raw);
+    }
+    let entry = VECTOR_TOMBSTONES
+        .try_with(|t| t.borrow().get(&(addr, i)).map(|ts| ts.weak.clone()))
+        .ok()
+        .flatten();
+    if let Some(weak) = entry {
+        return Some(weak.upgrade().unwrap_or(Value::Unspecified));
+    }
+    Some(raw)
 }
 
 /// Write `val` into `v[i]`, clearing any weak tombstone (the new
@@ -977,22 +1002,40 @@ impl Hashtable {
     /// present. Returns `None` if `i` is out of bounds. Returns
     /// `Value::Unspecified` for a tombstone whose target has been
     /// fully reclaimed — mirrors `Pair::car`.
+    ///
+    /// Self-healing: a tombstone entry is only honored while the raw
+    /// slot still reads `Unspecified`. Some writers touch
+    /// `items[i].1` directly instead of going through
+    /// `set_value_at` (e.g. VM-tier hashtable builtin overrides); if
+    /// the raw slot no longer reads `Unspecified` the tombstone is
+    /// stale and is dropped here rather than shadowing the real
+    /// value.
     pub fn value_at(&self, i: usize) -> Option<Value> {
-        let items = self.items.borrow();
-        if i >= items.len() {
-            return None;
-        }
-        if self.flags.get() & HAS_VALUE_TOMBSTONE != 0 {
-            let addr = self.addr();
-            let entry = HASHTABLE_VALUE_TOMBSTONES
-                .try_with(|t| t.borrow().get(&(addr, i)).cloned())
-                .ok()
-                .flatten();
-            if let Some(weak) = entry {
-                return Some(weak.upgrade().unwrap_or(Value::Unspecified));
+        let raw = {
+            let items = self.items.borrow();
+            if i >= items.len() {
+                return None;
             }
+            items[i].1.clone()
+        };
+        if self.flags.get() & HAS_VALUE_TOMBSTONE == 0 {
+            return Some(raw);
         }
-        Some(items[i].1.clone())
+        let addr = self.addr();
+        if !matches!(raw, Value::Unspecified) {
+            let _ = HASHTABLE_VALUE_TOMBSTONES.try_with(|t| {
+                t.borrow_mut().remove(&(addr, i));
+            });
+            return Some(raw);
+        }
+        let entry = HASHTABLE_VALUE_TOMBSTONES
+            .try_with(|t| t.borrow().get(&(addr, i)).cloned())
+            .ok()
+            .flatten();
+        if let Some(weak) = entry {
+            return Some(weak.upgrade().unwrap_or(Value::Unspecified));
+        }
+        Some(raw)
     }
 
     /// Overwrite `items[i].1` with `v`, clearing any weak tombstone
@@ -1013,7 +1056,39 @@ impl Hashtable {
     /// same reasoning applies here: `(hashtable-set! h k h)`'s
     /// worst-case self-reference contributes slot(1) + `args[2]`(1)
     /// + `args[0]`(1) = 3 transient strong refs.
-    pub fn break_value_cycle(&self, i: usize, baseline: usize) -> bool {
+    ///
+    /// Returns `false` (no-op) for region-allocated hashtables —
+    /// mirrors `vector_break_slot_cycle`'s region guard (which
+    /// mirrors `WeakValue::from_value`'s): region drop reclaims
+    /// region cycles regardless, and tombstoning by *this* table's
+    /// address would leak a `HASHTABLE_VALUE_TOMBSTONES` entry keyed
+    /// to an address that a region-bump-allocated table never gets a
+    /// `Drop` call for on region reset — a stale entry that could
+    /// alias onto whatever unrelated table the region next hands
+    /// that address to.
+    ///
+    /// Takes `h: &Gc<Hashtable>` (rather than plain `&self`) so this
+    /// can check `Gc::is_region` itself instead of relying on every
+    /// call site to guard upstream — mirrors
+    /// `vector_break_slot_cycle`'s own `is_region` check on the
+    /// container.
+    pub fn break_value_cycle(h: &cs_gc::Gc<Hashtable>, i: usize, baseline: usize) -> bool {
+        if cs_gc::Gc::is_region(h) {
+            return false;
+        }
+        h.break_value_cycle_unchecked(i, baseline)
+    }
+
+    /// The actual demote logic, minus the `is_region` guard. Only
+    /// call this directly when the caller has already established
+    /// `self` can't be region-allocated — today that's exactly the
+    /// layer-4 sweep's `try_break_cycle`, which only ever runs on
+    /// hashtables the cycle registry accepted, and
+    /// `record_cycle_with_candidate` already declines to register
+    /// region allocations (see that function's `is_region` early
+    /// return). All other callers should go through
+    /// `break_value_cycle` above.
+    fn break_value_cycle_unchecked(&self, i: usize, baseline: usize) -> bool {
         let current = {
             let items = self.items.borrow();
             if i >= items.len() {
@@ -2311,7 +2386,7 @@ mod pair_diet_tests {
         h.set_value_at(0, Value::Hashtable(h.clone()));
         // Strong refs to `h` right now: the `h` binding + the
         // value slot = 2. baseline=1 leaves one external anchor.
-        assert!(h.break_value_cycle(0, 1));
+        assert!(Hashtable::break_value_cycle(&h, 0, 1));
         assert_eq!(h.flags.get() & HAS_VALUE_TOMBSTONE, HAS_VALUE_TOMBSTONE);
         // Tombstone upgrade returns the cyclic value transparently.
         assert!(matches!(h.value_at(0), Some(Value::Hashtable(_))));
