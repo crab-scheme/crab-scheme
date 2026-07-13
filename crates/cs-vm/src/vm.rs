@@ -5761,7 +5761,23 @@ pub unsafe extern "C" fn vm_value_drop_gc(r: i64) {
         // NB_TAG_PROCEDURE) — Gc<Value> wrap. Also the defensive
         // default for any other pointer-typed tag. GC_VALUE is
         // always Rc (no region path constructs it).
-        _ => drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(ptr) }),
+        //
+        // Judge fixup (cs-vnf.3): guard that claim (mirrors the
+        // identical assert added to `nb_drop_owned`'s catchall in
+        // cs-core/nanbox.rs) — debug builds catch it immediately if
+        // this ever becomes reachable with a region-flagged payload,
+        // instead of silently misdecoding a RegionSlot<T> header as
+        // an RcBox<T> header.
+        _ => {
+            debug_assert!(
+                !is_region,
+                "vm_value_drop_gc: NB_TAG_GC_VALUE catchall hit a \
+                 region-tagged payload — this arm assumes Rc-only; \
+                 decoding it via the unconditional Rc path would misread a \
+                 RegionSlot<T> header as an RcBox<T> header."
+            );
+            drop(unsafe { cs_gc::Gc::<Value>::from_raw_jit(ptr) })
+        }
     }
 }
 

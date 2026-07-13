@@ -293,6 +293,26 @@ impl Pair {
                 .flatten();
             return upgraded.unwrap_or(Value::Unspecified);
         }
+        // Judge fixup (cs-vnf.3): `peek_car` is shared with the
+        // cycle-break/Drop machinery, where a dead-region payload is
+        // expected traffic and must degrade silently to
+        // `Unspecified` (see `peek_car`'s own doc). But THIS is the
+        // public, ordinary-read entry point — a dead-region payload
+        // reaching a live `car()` call is a genuine
+        // use-after-region-drop bug in the CALLER (layer-5 escape
+        // analysis failed to prevent it), not expected traffic, and
+        // silently returning `Unspecified` would mask it. Debug-only
+        // (compiles to nothing in release, matching every other
+        // panic-on-UAF check in `cs_gc`, e.g. `assert_region_live`):
+        // keep it loud here while `peek_car` itself stays graceful.
+        debug_assert!(
+            unsafe { nb_owning_payload_is_live(self.car.get() as i64) },
+            "Pair::car: use-after-region-drop — the car slot's owning \
+             region has already dropped. Release builds silently return \
+             Unspecified (via peek_car); this debug_assert exists so a \
+             genuine live-code UAF through the public accessor stays loud \
+             instead of being masked by peek_car's Drop-context tolerance."
+        );
         self.peek_car()
     }
 
@@ -307,6 +327,16 @@ impl Pair {
                 .flatten();
             return upgraded.unwrap_or(Value::Unspecified);
         }
+        // See the matching debug_assert in `car()` for why this is
+        // here and not in `peek_cdr` itself.
+        debug_assert!(
+            unsafe { nb_owning_payload_is_live(self.cdr.get() as i64) },
+            "Pair::cdr: use-after-region-drop — the cdr slot's owning \
+             region has already dropped. Release builds silently return \
+             Unspecified (via peek_cdr); this debug_assert exists so a \
+             genuine live-code UAF through the public accessor stays loud \
+             instead of being masked by peek_cdr's Drop-context tolerance."
+        );
         self.peek_cdr()
     }
 
@@ -812,8 +842,14 @@ impl cs_gc::cycle_registry::CycleChildren for Pair {
         // Read through the accessors so a previous
         // break_*_cycle's tombstoned weak still surfaces the
         // cyclic edge for BR's walk — matches CycleVisit.
-        self.car().cycle_children(visit);
-        self.cdr().cycle_children(visit);
+        //
+        // `peek_car`/`peek_cdr` (judge fixup, cs-vnf.3): same
+        // reasoning as `CycleVisit for Pair` just below — this is
+        // another cycle-sweep participant, not an external live-code
+        // reader, so it must not trip `car()`/`cdr()`'s debug-only
+        // UAF assert on legitimate dead-region traffic.
+        self.peek_car().cycle_children(visit);
+        self.peek_cdr().cycle_children(visit);
     }
 }
 
@@ -864,12 +900,26 @@ impl cs_gc::cycle::CycleVisit for Pair {
         // see ADR 0014 §"iter 7.1.x.z note". The iter
         // 7.1.x.y caller-supplied baseline at the root level
         // remains the in-tree safe demote path.
-        let car = self.car();
+        //
+        // `peek_car`/`peek_cdr`, NOT the public `car()`/`cdr()`
+        // (judge fixup, cs-vnf.3): this IS the layer-4 cycle sweep
+        // that can run mid-Drop-chain (see the note on `Drop for
+        // Pair`) and legitimately encounter a dead-region payload on
+        // some OTHER live pair it's walking through — that's
+        // expected traffic here, not a bug, so it must stay silently
+        // tolerant regardless of build profile. `car()`/`cdr()`
+        // carry a debug-only loud UAF assert precisely because
+        // THEIR callers are external/live-code and a dead-region hit
+        // there IS a bug; routing this internal walk through them
+        // would trip that assert on legitimate traffic. Mirrors the
+        // identical fix already applied to `cs-vm`'s
+        // `Bindings::visit_children`.
+        let car = self.peek_car();
         car.visit_children(ctx);
         if ctx.done() {
             return;
         }
-        let cdr = self.cdr();
+        let cdr = self.peek_cdr();
         cdr.visit_children(ctx);
     }
 }
@@ -2091,7 +2141,14 @@ mod region_drop_tolerance_tests {
         let bits = dead_region_owning_bits();
         let holder = Pair::new(Value::Unspecified, Value::Unspecified);
         holder.set_car_raw_owned(bits);
-        assert!(matches!(holder.car(), Value::Unspecified));
+        // `peek_car` directly, not the public `car()` — `car()` now
+        // carries a debug-only loud UAF assert (judge fixup) since a
+        // dead-region payload reaching the PUBLIC accessor is a real
+        // bug the caller should hear about; `peek_car` is the
+        // Drop/cycle-sweep-internal path that must stay silently
+        // tolerant no matter the build profile, which is what this
+        // test actually exercises.
+        assert!(matches!(holder.peek_car(), Value::Unspecified));
     }
 
     /// Same for cdr.
@@ -2100,7 +2157,7 @@ mod region_drop_tolerance_tests {
         let bits = dead_region_owning_bits();
         let holder = Pair::new(Value::Unspecified, Value::Unspecified);
         holder.set_cdr_raw_owned(bits);
-        assert!(matches!(holder.cdr(), Value::Unspecified));
+        assert!(matches!(holder.peek_cdr(), Value::Unspecified));
     }
 
     /// Dropping a `Pair` whose car (or cdr) slot holds a
