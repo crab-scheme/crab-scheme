@@ -40,6 +40,11 @@ fn register_order_collector(name: &'static str, n: usize, out: Arc<Mutex<Vec<Str
             for _ in 0..n {
                 match primop_raw_receive(actor, None) {
                     Ok(Some(SendableValue::Symbol(s))) => out.lock().unwrap().push(s.to_string()),
+                    // cs-845.2: a base-image symbol crosses as `{id, name}`;
+                    // the name rides along, so use it directly.
+                    Ok(Some(SendableValue::SymbolId { name, .. })) => {
+                        out.lock().unwrap().push(name)
+                    }
                     Ok(Some(other)) => out.lock().unwrap().push(format!("{other:?}")),
                     _ => break,
                 }

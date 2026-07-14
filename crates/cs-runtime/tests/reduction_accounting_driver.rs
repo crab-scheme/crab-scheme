@@ -87,6 +87,9 @@ fn resumed_actor_restores_its_own_slice_not_a_cotenants_leftover() {
                     Ok(Some(SendableValue::Symbol(s))) => {
                         out_for_actor.lock().unwrap().push(s.to_string())
                     }
+                    Ok(Some(SendableValue::SymbolId { name, .. })) => {
+                        out_for_actor.lock().unwrap().push(name)
+                    }
                     Ok(Some(other)) => out_for_actor.lock().unwrap().push(format!("{other:?}")),
                     _ => break,
                 }

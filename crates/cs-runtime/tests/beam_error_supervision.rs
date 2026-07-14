@@ -40,7 +40,16 @@ fn register_collector(name: &'static str, n: usize, out: Arc<Mutex<Vec<String>>>
         Arc::new(move |actor, _args| {
             for _ in 0..n {
                 match primop_raw_receive(actor, None) {
-                    Ok(Some(SendableValue::Symbol(s))) => out.lock().unwrap().push(s.to_string()),
+                    Ok(Some(SendableValue::Symbol(s))) => out.lock().unwrap().push(s),
+                    // cs-845.2: a base-image symbol (e.g. 'armed, happens to
+                    // collide with a bundled-library binding name) crosses as
+                    // `{id, name}` — the name rides along, so this test
+                    // helper (which inspects the raw SendableValue instead
+                    // of decoding through `from_sendable`) can use it
+                    // directly without needing a SymbolTable.
+                    Ok(Some(SendableValue::SymbolId { name, .. })) => {
+                        out.lock().unwrap().push(name)
+                    }
                     Ok(Some(other)) => out.lock().unwrap().push(format!("{other:?}")),
                     _ => break,
                 }

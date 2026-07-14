@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cs_core::{Number, Pair, SymbolTable, Value};
+use cs_core::{Number, Pair, Symbol, SymbolTable, Value};
 
 use cs_actor::{ActorPid, Payload};
 
@@ -72,6 +72,39 @@ pub enum SendableValue {
     /// Symbols cross as their name; the receiver re-interns into
     /// its own SymbolTable on arrival.
     Symbol(String),
+    /// cs-845.2 cross-worker fast path: a symbol already interned in the
+    /// *shared base* `SymbolTable` (see `SymbolTable::with_base` /
+    /// `SymbolTable::is_base` in cs-core) at send time, carried as `id`
+    /// (its base id on the sender) plus `name` as a verification/fallback
+    /// ground truth.
+    ///
+    /// The theory this was built on — "every worker's base is built the
+    /// same way, so a base id names the same symbol everywhere" — turned
+    /// out NOT to hold exactly in practice: two independently-built
+    /// per-worker `RuntimeImage` base tables (see `worker_runtime_image`,
+    /// one lazily built per OS thread) were observed to differ in length by
+    /// a few entries even though both loaded the identical builtin/bundled-
+    /// library set (root cause not fully chased down — plausibly a
+    /// nondeterministic-iteration-order gensym/registration path somewhere
+    /// in library loading). So `id` is a **hint, not a guarantee**:
+    /// `from_sendable` only trusts it after confirming, via
+    /// `SymbolTable::name_checked`, that the RECEIVER's own base agrees
+    /// `id` names `name`; otherwise it safely falls back to `intern(name)`.
+    /// This buys the receive-side win (an array index + string compare
+    /// instead of a hashmap intern lookup/insert) without correctness ever
+    /// depending on cross-thread base agreement.
+    ///
+    /// Only ever produced by [`to_sendable_in_for_message`] (the general
+    /// `to_sendable_in` used for spawn args / table keys always emits the
+    /// plain `Symbol(String)` form, because those consumers —
+    /// `sendable_to_datum`'s textual re-encoding, and `cs-table`'s
+    /// name-keyed `Key` — don't decode through `from_sendable` at all). A
+    /// symbol interned into an actor's own *private* extension table isn't
+    /// a base id and still crosses as plain `Symbol(String)`.
+    SymbolId {
+        id: u32,
+        name: String,
+    },
     Pair(Box<SendableValue>, Box<SendableValue>),
     Vector(Vec<SendableValue>),
     ByteVector(Vec<u8>),
@@ -106,6 +139,36 @@ pub enum SendableValue {
 /// and hashtables can't cross — see the SendableValue doc for
 /// the design call.
 pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, String> {
+    to_sendable_in_opts(v, syms, false)
+}
+
+/// Same projection as [`to_sendable_in`], but symbols already interned in
+/// the shared base `SymbolTable` are carried as [`SendableValue::SymbolId`]
+/// instead of a cloned name string — see that variant's doc for why this is
+/// sound. Only for consumers that reconstruct the tree via [`from_sendable`]
+/// against a `SymbolTable` sharing the same base image, which is exactly
+/// the actor cross-worker message path (`b_beam_send`'s general fallback +
+/// the receive-side `Runtime::sendable_to_value`). Do **not** use this for
+/// spawn-source args (`sendable_to_datum` re-encodes as Scheme *source
+/// text*, which needs the name) or table keys (`cs-table::Key` is
+/// name-keyed).
+pub fn to_sendable_in_for_message(v: &Value, syms: &SymbolTable) -> Result<SendableValue, String> {
+    to_sendable_in_opts(v, syms, true)
+}
+
+fn to_sendable_in_opts(
+    v: &Value,
+    syms: &SymbolTable,
+    fast_symbols: bool,
+) -> Result<SendableValue, String> {
+    let sendable_symbol = |sym: Symbol| {
+        let name = syms.name(sym).to_string();
+        if fast_symbols && syms.is_base(sym) {
+            SendableValue::SymbolId { id: sym.0, name }
+        } else {
+            SendableValue::Symbol(name)
+        }
+    };
     match v {
         Value::Null => Ok(SendableValue::Null),
         Value::Unspecified => Ok(SendableValue::Unspecified),
@@ -117,20 +180,23 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
             num_to_sendable(&n)
         }
         Value::String(s) => Ok(SendableValue::String(s.borrow().clone())),
-        Value::Symbol(s) => Ok(SendableValue::Symbol(syms.name(*s).to_string())),
+        Value::Symbol(s) => Ok(sendable_symbol(*s)),
         // Identifiers cross as their name (mark dropped). Marks
         // are a per-process lexical-hygiene concept that doesn't
         // survive a cross-actor boundary -- a fresh expansion in
         // the destination would assign new marks anyway.
-        Value::Identifier { name, .. } => Ok(SendableValue::Symbol(syms.name(*name).to_string())),
+        Value::Identifier { name, .. } => Ok(sendable_symbol(*name)),
         Value::Pair(p) => {
-            let head = to_sendable_in(&p.car(), syms)?;
-            let tail = to_sendable_in(&p.cdr(), syms)?;
+            let head = to_sendable_in_opts(&p.car(), syms, fast_symbols)?;
+            let tail = to_sendable_in_opts(&p.cdr(), syms, fast_symbols)?;
             Ok(SendableValue::Pair(Box::new(head), Box::new(tail)))
         }
         Value::Vector(v) => {
-            let items: Result<Vec<_>, _> =
-                v.borrow().iter().map(|e| to_sendable_in(e, syms)).collect();
+            let items: Result<Vec<_>, _> = v
+                .borrow()
+                .iter()
+                .map(|e| to_sendable_in_opts(e, syms, fast_symbols))
+                .collect();
             Ok(SendableValue::Vector(items?))
         }
         Value::ByteVector(bv) => Ok(SendableValue::ByteVector(bv.borrow().clone())),
@@ -189,6 +255,20 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
         }
         SendableValue::String(s) => Value::string(s.clone()),
         SendableValue::Symbol(name) => Value::Symbol(syms.intern(name)),
+        // cs-845.2: `id` is only trustworthy if THIS table's own base
+        // agrees it names `name` (independently-built per-worker base
+        // images were observed to disagree in length — see the
+        // `SymbolId` doc). Verified: construct the Symbol directly, no
+        // intern lookup. Unverified: safe fallback to `intern(name)`,
+        // identical to the plain `Symbol(String)` path.
+        SendableValue::SymbolId { id, name } => {
+            let sym = Symbol(*id);
+            if syms.is_base(sym) && syms.name_checked(sym) == Some(name.as_str()) {
+                Value::Symbol(sym)
+            } else {
+                Value::Symbol(syms.intern(name))
+            }
+        }
         SendableValue::Pair(car, cdr) => {
             let car_v = from_sendable(car, syms);
             let cdr_v = from_sendable(cdr, syms);
@@ -1470,6 +1550,12 @@ fn sendable_to_datum(s: &SendableValue, out: &mut String) -> Result<(), String> 
         SendableValue::Eof => {
             return Err("the eof object cannot be a spawn-source argument".into());
         }
+        // cs-845.2: `to_sendable_in` (what spawn-arg encoding always uses)
+        // never produces `SymbolId` — only `to_sendable_in_for_message`
+        // (the actor cross-worker message path) does. Should never reach
+        // here, but `name` is always populated, so render it rather than
+        // erroring: as safe as the plain `Symbol` arm above.
+        SendableValue::SymbolId { name, .. } => out.push_str(name),
     }
     Ok(())
 }
@@ -2355,7 +2441,9 @@ pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     // cs-845.1: try the same-worker fast path first — skips the
     // SendableValue projection/rebuild round-trip when sender and
     // receiver are colocated on the same LocalWorkerPool worker. Falls
-    // back to the general to_sendable_in path unchanged otherwise.
+    // back to the general cross-worker path otherwise, which (cs-845.2)
+    // uses `to_sendable_in_for_message` so base-table symbols cross as a
+    // bare id instead of a cloned name + receiver-side re-intern.
     let target_worker = beam_state().actors.local_worker_of(pid);
     match try_send_same_worker(&args[1], syms, pid, target_worker)? {
         Some((recv, seq, cloned)) => {
@@ -2367,7 +2455,7 @@ pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
             commit_same_worker_msg(recv, seq, cloned);
         }
         None => {
-            let sv = to_sendable_in(&args[1], syms)?;
+            let sv = to_sendable_in_for_message(&args[1], syms)?;
             primop_send(pid, sv)?;
         }
     }
@@ -3708,6 +3796,7 @@ pub fn beam_syms_builtins() -> Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     // cs-845.9: deliberate-misuse tests for `CheckedTls` / `CoPtr` — these are
     // debug-only guards (the fields the assertions read don't exist in a
@@ -3860,6 +3949,244 @@ mod tests {
             assert_ne!(src_foo.0, dst_foo.0, "interning offsets should differ");
         } else {
             panic!("expected Symbol");
+        }
+    }
+
+    /// Two `SymbolTable`s layered (`with_base`) over the identical shared
+    /// base image, standing in for two different `LocalWorkerPool` workers'
+    /// per-actor tables — this is exactly the shape `worker_runtime_image`
+    /// produces per worker in production.
+    fn base_and_two_workers() -> (Rc<SymbolTable>, SymbolTable, SymbolTable) {
+        let mut base = SymbolTable::new();
+        base.intern("car");
+        base.intern("cdr");
+        let foo_base = base.intern("foo"); // interned into the SHARED base
+        let base = Rc::new(base);
+        let worker_a = SymbolTable::with_base(base.clone());
+        let worker_b = SymbolTable::with_base(base.clone());
+        let _ = foo_base;
+        (base, worker_a, worker_b)
+    }
+
+    #[test]
+    fn cross_worker_message_base_symbol_is_eq_by_id_no_string_roundtrip() {
+        // cs-845.2: a base-table symbol crosses as `SendableValue::SymbolId`
+        // (id + name), not plain `Symbol(String)` — assert the *projection*
+        // itself (not just the round-tripped value) so this fails the
+        // moment the fast path silently falls back to the string form.
+        let (base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let foo = worker_a.intern("foo"); // resolves to the shared base id
+        assert!(
+            worker_a.is_base(foo),
+            "foo must be a base symbol for this test to be meaningful"
+        );
+
+        let v = Value::Symbol(foo);
+        let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+        match &sv {
+            SendableValue::SymbolId { id, name } => {
+                assert_eq!(*id, foo.0);
+                assert_eq!(name, "foo");
+            }
+            other => panic!(
+                "expected SendableValue::SymbolId, got {:?} (fast path fell back)",
+                other
+            ),
+        }
+
+        // Deliver on worker B: eq? to the SAME symbol B would get by
+        // locally interning "foo" itself — no string ever crossed.
+        let delivered = from_sendable(&sv, &mut worker_b);
+        let locally_interned = worker_b.intern("foo");
+        match delivered {
+            Value::Symbol(s) => assert_eq!(
+                s, locally_interned,
+                "delivered symbol must be eq? to B's own interning of the same name"
+            ),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+        drop(base);
+    }
+
+    #[test]
+    fn cross_worker_message_extension_symbol_still_roundtrips_via_string() {
+        // A symbol private to the SENDER's own extension table (never
+        // shared with worker B) must NOT take the id-only fast path —
+        // its id is meaningless off the sender's table.
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        // Force worker_b to have already claimed a different extension
+        // symbol first, so a naive "copy the id verbatim" bug would
+        // collide with the wrong name and this test would catch it.
+        worker_b.intern("something-else-first");
+
+        let private = worker_a.intern("actor-a-private-helper");
+        assert!(
+            !worker_a.is_base(private),
+            "a freshly-interned symbol must be an extension symbol"
+        );
+
+        let v = Value::Symbol(private);
+        let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+        assert_eq!(
+            sv,
+            SendableValue::Symbol("actor-a-private-helper".into()),
+            "extension-table symbols must still cross by name"
+        );
+
+        let delivered = from_sendable(&sv, &mut worker_b);
+        match delivered {
+            Value::Symbol(s) => assert_eq!(worker_b.name(s), "actor-a-private-helper"),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cross_worker_message_stale_symbol_id_falls_back_safely() {
+        // The bug this test pins: two independently-built per-worker base
+        // images are NOT guaranteed to be byte-identical in this codebase
+        // (found empirically — see the `SymbolId` doc). If the receiver's
+        // own base disagrees that `id` names `name` (wrong name at that id,
+        // OR `id` out of range entirely), `from_sendable` MUST fall back to
+        // `intern(name)` rather than trusting the id — silently building the
+        // wrong symbol, or panicking on an out-of-bounds index, are both
+        // unacceptable.
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let foo = worker_a.intern("foo");
+        assert!(worker_a.is_base(foo));
+
+        // Case 1: id in range but names a DIFFERENT symbol on the receiver
+        // (simulates a base that grew/shrank between the two builds).
+        let wrong_name_sv = SendableValue::SymbolId {
+            id: foo.0,
+            name: "totally-different-name".into(),
+        };
+        let delivered = from_sendable(&wrong_name_sv, &mut worker_b);
+        match delivered {
+            Value::Symbol(s) => assert_eq!(
+                worker_b.name(s),
+                "totally-different-name",
+                "must fall back to interning `name`, not blindly trust a mismatched id"
+            ),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+
+        // Case 2: id far out of range for the receiver's table entirely —
+        // must not panic (this reproduces the `index out of bounds` crash
+        // this test suite hit during development).
+        let out_of_range_sv = SendableValue::SymbolId {
+            id: 999_999,
+            name: "still-fine".into(),
+        };
+        let delivered = from_sendable(&out_of_range_sv, &mut worker_b);
+        match delivered {
+            Value::Symbol(s) => assert_eq!(worker_b.name(s), "still-fine"),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+    }
+
+    /// A/B micro-benchmark: cs-845.2's `to_sendable_in_for_message` (SymbolId
+    /// fast path for base-table symbols) vs. the pre-cs-845.2 general
+    /// `to_sendable_in` path (always `Symbol(String)`, always re-interned by
+    /// name on decode) that every cross-worker `send` used before this
+    /// change. `#[ignore]` (it's a throughput measurement, not a
+    /// correctness check) — run with
+    /// `cargo test --release -p cs-runtime --features actor --lib \
+    ///  cross_worker_message_symbol_ab_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cross_worker_message_symbol_ab_bench() {
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let car = worker_a.intern("car"); // base symbol, present in both tables
+        let v = Value::Symbol(car);
+        const N: u32 = 2_000_000;
+
+        let before = std::time::Instant::now();
+        for _ in 0..N {
+            let sv = to_sendable_in(&v, &worker_a).expect("encode");
+            std::hint::black_box(from_sendable(&sv, &mut worker_b));
+        }
+        let before_elapsed = before.elapsed();
+
+        let after = std::time::Instant::now();
+        for _ in 0..N {
+            let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+            std::hint::black_box(from_sendable(&sv, &mut worker_b));
+        }
+        let after_elapsed = after.elapsed();
+
+        let before_rate = N as f64 / before_elapsed.as_secs_f64();
+        let after_rate = N as f64 / after_elapsed.as_secs_f64();
+        println!(
+            "cs-845.2 symbol fast-path A/B ({N} sends each):\n  \
+             before (to_sendable_in, string): {:>10.0} msg/s ({:?})\n  \
+             after  (to_sendable_in_for_message, id): {:>10.0} msg/s ({:?})\n  \
+             speedup: {:.2}x",
+            before_rate,
+            before_elapsed,
+            after_rate,
+            after_elapsed,
+            after_rate / before_rate
+        );
+    }
+
+    #[test]
+    fn cross_worker_message_send_recv_symbol_identity_via_actors() {
+        // Full end-to-end wiring check, through the real `b_beam_send`
+        // primop (not the unit-tested `to_sendable_in_for_message`
+        // directly): two *dedicated*-thread actors (each its own OS thread,
+        // each building its own `RuntimeImage::build()` — never in a
+        // `LocalWorkerPool`, so `local_worker_of` is always `None` and
+        // `send` between them always takes the general/cross-worker path,
+        // never the cs-845.1 same-worker fast path) exchange a base-image
+        // symbol. The receiver's `(eq? v 'car)` must be `#t`: the id `car`
+        // gets baked into `SendableValue::SymbolId` on the sender's actor
+        // thread must name the identical symbol in the receiver's
+        // independently-built base table.
+        let table = "cs-845-2-cross-worker-symbol-eq";
+        primop_make_table(table, "set").expect("make table");
+
+        // B: receive a value, record whether it's eq? to its own 'car.
+        let checker = primop_spawn_source_dedicated(
+            "(define (check key) (let ((v (raw-receive))) \
+             (table-insert! 'cs-845-2-cross-worker-symbol-eq key (eq? v (quote car)))))"
+                .into(),
+            "check".into(),
+            vec![SendableValue::String("r".into())],
+        )
+        .expect("spawn checker");
+
+        // A: receive B's pid as a message (Pid round-trips as a `<pid:..>`
+        // symbol `send` parses back), then relay a base-image symbol to B.
+        // This `(send target 'car)` call is the one that runs through
+        // `b_beam_send` on A's own dedicated thread.
+        let relay = primop_spawn_source_dedicated(
+            "(define (relay key) (let ((target (raw-receive))) (send target (quote car))))".into(),
+            "relay".into(),
+            vec![SendableValue::String("unused".into())],
+        )
+        .expect("spawn relay");
+
+        // Kick things off from the test thread (also never a LocalWorkerPool
+        // worker, so this hop is cross-worker-shaped too): tell A where B is.
+        primop_send(relay, SendableValue::Pid(checker)).expect("send checker pid to relay");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(v) = primop_table_lookup(table, &SendableValue::String("r".into()))
+                .expect("table lookup")
+            {
+                assert_eq!(
+                    v,
+                    SendableValue::Boolean(true),
+                    "a base-image symbol sent cross-worker must be eq? to the same name \
+                     interned locally on the receiver"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("cross-worker symbol relay never completed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 

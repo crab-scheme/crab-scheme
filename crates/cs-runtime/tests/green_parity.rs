@@ -49,6 +49,9 @@ fn register_markers(name: &'static str, n: usize, out: Arc<Mutex<Vec<String>>>) 
             for _ in 0..n {
                 match primop_raw_receive(actor, None) {
                     Ok(Some(SendableValue::Symbol(s))) => out.lock().unwrap().push(s.to_string()),
+                    Ok(Some(SendableValue::SymbolId { name, .. })) => {
+                        out.lock().unwrap().push(name)
+                    }
                     Ok(Some(other)) => out.lock().unwrap().push(format!("{other:?}")),
                     _ => break,
                 }
