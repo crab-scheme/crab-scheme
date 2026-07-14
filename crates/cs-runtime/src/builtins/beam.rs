@@ -15,6 +15,26 @@ use cs_actor::{ActorPid, Payload};
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 
+/// Whether JIT tiering should stay enabled for actor bodies. Default is
+/// `false` (JIT disabled — see the `set_jit_enabled(false)` call sites in
+/// `activation_body` / `green_source_body` / `run_actor_body`): a prior
+/// perf branch (perf/actor-vm-jit) found a JIT-tiered CPU-bound actor could
+/// starve a co-located peer on a shared `LocalSet` worker, for only a
+/// marginal (~5%) throughput gain.
+///
+/// `CRABSCHEME_ACTOR_JIT=1` opts back in (cs-845.6 investigation). Read
+/// once via `OnceLock` — actor worker threads are long-lived and the value
+/// is fixed for the process, so there's no need to re-read the env on
+/// every body invocation.
+fn actor_jit_enabled_override() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CRABSCHEME_ACTOR_JIT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// A subset of `cs_core::Value` safe to ship across actor
 /// boundaries.
 ///
@@ -480,11 +500,18 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
     // cs-tds: see the matching comment in `green_source_body` — this
     // future is pinned to one actor-dedicated `LocalWorkerPool` worker
     // thread for its whole life, so disabling JIT tiering here needs no
-    // restore.
-    cs_vm::vm::set_jit_enabled(false);
+    // restore. cs-845.6: `CRABSCHEME_ACTOR_JIT=1` opts back in.
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // Shared-Runtime: overlay this worker's shared base (builtins + bundled libs)
     // instead of a full Runtime::new() per actor (same lever as green_source_body).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
+    // cs-845.6: JIT only tiers a closure up if `install_jit` registered the
+    // tier-up hook on this runtime — `set_jit_enabled` alone (above) just
+    // controls whether the VM dispatch loop *consults* jit_ptr(); without
+    // this the JIT never compiles anything even with the flag on.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // VM bytecode tier for the handler (see run_scheme_body re: no JIT). The
     // handler is loaded as a VM closure; `apply_value` (below, per message)
     // delegates VM closures to the VM caller, so each invocation runs on the VM.
@@ -782,14 +809,19 @@ async fn green_source_body(
     // thread that owns their `LocalSet`), and that pool is dedicated to
     // actor bodies — so disabling JIT tiering here is a once-per-task,
     // no-restore-needed equivalent of disabling it once at worker-thread
-    // startup. See `cs_vm::vm::set_jit_enabled` doc.
-    cs_vm::vm::set_jit_enabled(false);
+    // startup. See `cs_vm::vm::set_jit_enabled` doc. cs-845.6:
+    // `CRABSCHEME_ACTOR_JIT=1` opts back in.
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // Shared-Runtime: a cheap per-actor Runtime overlaying this worker's shared
     // base (builtins + bundled libs), instead of a full `Runtime::new()` per
     // actor. The body's defines land in the per-actor overlay env; builtins /
     // libraries resolve through to the shared base. This is the green-threads
     // memory lever (N actors → one base + N small overlays).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
+    // cs-845.6: see the matching comment in `activation_body`.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // Load on the VM tier in the driver frame (no YIELDER installed yet:
     // top-level `(define …)`s don't park). Cached per source per worker — actors
     // running the same body reuse the compiled bytecode (sharing its code
@@ -964,6 +996,10 @@ fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
 /// invoking us.
 fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<(), String> {
     let mut rt = crate::Runtime::new();
+    // cs-845.6: see the matching comment in `activation_body`.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // Run the actor body on the VM bytecode tier, not the walker — the VM is
     // ~2.8× faster than the tree-walker on this kind of code (RESP parse,
     // command dispatch, store ops, Raft logic). JIT is intentionally NOT
@@ -1163,14 +1199,15 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // contexts never reach here, so the hook stays None and
     // the dispatch loop's per-op tick is a pure counter no-op.
     let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
-    // cs-tds: actor bodies run VM-only — the JIT is deliberately dropped
-    // for actors (perf/actor-vm-jit found it hung concurrent SET, with
-    // only marginal gain elsewhere). Clearing this per-invocation lets
+    // cs-tds: actor bodies run VM-only by default — the JIT is deliberately
+    // dropped for actors (perf/actor-vm-jit found it hung concurrent SET,
+    // with only marginal gain elsewhere). Clearing this per-invocation lets
     // the Call/TailCall dispatch loop skip the tier-bump/jit_ptr checks
     // that only matter for JIT tiering; a pooled worker thread reused by
     // a non-actor caller has it restored to `true` by the Guard below.
+    // cs-845.6: `CRABSCHEME_ACTOR_JIT=1` opts back in.
     let prev_jit_enabled = cs_vm::vm::jit_enabled();
-    cs_vm::vm::set_jit_enabled(false);
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // parallel-runtime C4.5: bridge the BR sweep's yield
     // hook to cs-vm's reduction counter. The same
     // per-iteration tick the bytecode dispatch loop uses
