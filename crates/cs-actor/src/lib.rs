@@ -83,6 +83,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 mod local_pool;
+pub use local_pool::current_worker_id;
 use local_pool::LocalWorkerPool;
 
 // ---------- Mailbox backing strategy ----------
@@ -490,6 +491,14 @@ pub(crate) struct ActorState {
     /// `(send pid …)` primop, which routes through
     /// `send_with_cap`.
     soft_cap: AtomicUsize,
+    /// `LocalWorkerPool` worker index this actor is pinned to, if it was
+    /// spawned via `spawn_local_activation[_with_kind]`. `None` for actors
+    /// spawned any other way (`spawn`, `spawn_async`,
+    /// `spawn_sync_body_on_task`, ...). Set once at spawn time and never
+    /// changed (an actor never migrates workers) — cs-runtime's same-worker
+    /// fast-send path uses this to check colocation before skipping the
+    /// `SendableValue` projection round-trip (cs-845.1).
+    local_worker_id: std::sync::OnceLock<usize>,
 }
 
 impl ActorState {
@@ -500,7 +509,13 @@ impl ActorState {
             monitored_by: Mutex::new(HashMap::new()),
             trap_exit: AtomicBool::new(false),
             soft_cap: AtomicUsize::new(0),
+            local_worker_id: std::sync::OnceLock::new(),
         }
+    }
+
+    /// This actor's `LocalWorkerPool` worker index, if any.
+    pub(crate) fn local_worker_id(&self) -> Option<usize> {
+        self.local_worker_id.get().copied()
     }
 
     /// Internal raw push that delegates to the ActorMailbox.
@@ -1383,7 +1398,7 @@ impl ActorSystem {
         // The job closure is `Send` (captures only `Send` data); it runs
         // on the worker thread, where it builds the `!Send` future and
         // `spawn_local`s it. The future never crosses back.
-        let dispatched = self.local_pool().dispatch(Box::new(move || {
+        let dispatched_idx = self.local_pool().dispatch(Box::new(move || {
             let actor = Actor {
                 pid,
                 mailbox: mailbox_for_actor,
@@ -1407,10 +1422,19 @@ impl ActorSystem {
             });
         }));
 
-        if !dispatched {
-            // Only reachable if the pool has shut down (system teardown).
-            // Deregister so the never-started actor doesn't linger.
-            self.inner.on_actor_termination(pid, ExitReason::Normal);
+        match dispatched_idx {
+            Some(idx) => {
+                // Best-effort: the actor's own body may already be running
+                // concurrently, but nothing reads `local_worker_id` before
+                // the actor's first send/receive, and `OnceLock::set` is
+                // safe to race (the actor is the only writer in practice).
+                let _ = state.local_worker_id.set(idx);
+            }
+            None => {
+                // Only reachable if the pool has shut down (system teardown).
+                // Deregister so the never-started actor doesn't linger.
+                self.inner.on_actor_termination(pid, ExitReason::Normal);
+            }
         }
 
         ActorRef { pid, mailbox }
@@ -1420,6 +1444,18 @@ impl ActorSystem {
     /// or never existed.
     pub fn lookup(&self, pid: ActorPid) -> Option<ActorRef> {
         self.inner.lookup(pid)
+    }
+
+    /// The `LocalWorkerPool` worker index `pid` is pinned to, if it was
+    /// spawned via `spawn_local_activation[_with_kind]` and is still live.
+    /// `None` for actors spawned any other way, or for a dead/unknown pid.
+    /// Combined with [`local_pool::current_worker_id`], lets a sender check
+    /// same-worker colocation before taking a fast send path (cs-845.1).
+    pub fn local_worker_of(&self, pid: ActorPid) -> Option<usize> {
+        self.inner
+            .registry
+            .get(&pid)
+            .and_then(|entry| entry.value().local_worker_id())
     }
 
     /// Total actors currently registered. Useful for tests + tools.

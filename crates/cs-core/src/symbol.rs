@@ -88,6 +88,17 @@ impl SymbolTable {
         self.base_offset as usize + self.by_id.len()
     }
 
+    /// True if `sym` resolves through the shared `base` chain (id below
+    /// this table's `base_offset`) rather than this table's own
+    /// extension. Base ids are stable across every table layered over the
+    /// same `Rc<SymbolTable>` base, so they're safe to copy verbatim
+    /// between two such tables without re-interning; extension ids are
+    /// private to this table and are not. Used by cs-runtime's
+    /// same-worker actor fast-send path (cs-845.1).
+    pub fn is_base(&self, sym: Symbol) -> bool {
+        sym.0 < self.base_offset
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

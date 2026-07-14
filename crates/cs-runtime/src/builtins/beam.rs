@@ -62,6 +62,16 @@ pub enum SendableValue {
     // dedicated variant needed. cs-runtime/builtins/channel.rs
     // recognizes the shape on inspection and looks the ID up in
     // the process-global ChannelRegistry.
+    /// cs-845.1 same-worker fast-send path: a key into this OS
+    /// thread's `SAME_WORKER_MSGS` table, where the real (already
+    /// deep-cloned) `Value` sits. Only ever produced by
+    /// [`try_send_same_worker`] and only ever consumed by
+    /// [`from_sendable`] running on the *same* worker thread (the
+    /// sender checked colocation before picking this path) — the id
+    /// is `Send`/`Sync` (it's a plain `u64`) so it satisfies
+    /// `Payload`'s bound, but it's meaningless off the thread that
+    /// produced it.
+    Local(u64),
 }
 
 /// Project a Scheme `Value` onto a `SendableValue`. Symbols
@@ -174,7 +184,180 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
             let s = format!("<pid:{}>", _pid);
             Value::Symbol(syms.intern(&s))
         }
+        SendableValue::Local(id) => take_same_worker_msg(*id),
     }
+}
+
+// ---------- cs-845.1: same-worker fast-send path ----------
+//
+// `to_sendable_in`/`from_sendable` round-trip through a fully separate
+// `SendableValue` tree so a message can cross an OS-thread boundary (the
+// mailbox `Payload` is `Arc<dyn Any + Send + Sync>`, and `Value`'s `Rc`s
+// are `!Send`). When sender and receiver are actors pinned to the *same*
+// `LocalWorkerPool` worker (see `cs_actor::ActorSystem::local_worker_of` /
+// `cs_actor::current_worker_id`), that whole projection is unnecessary
+// work: nothing ever crosses threads, so a same-thread deep clone of the
+// `Value` tree (fresh `Gc`/`RefCell` allocations, so mutating the
+// original after send can't leak into the receiver's copy) is both
+// sufficient and one tree-walk instead of two.
+//
+// Symbols are the one wrinkle: `Symbol` ids are private to a
+// `SymbolTable`, so an id from the sender's table isn't valid in the
+// receiver's — *unless* both tables are `SymbolTable::with_base` layers
+// over the identical `Rc`-shared base, which is exactly what every
+// `spawn_local_activation` actor on a given worker gets (built via
+// `Runtime::from_image(&worker_runtime_image())`, the same thread-local
+// image for the worker's whole lifetime). Base ids (`syms.is_base`) are
+// therefore safe to copy verbatim; a symbol interned into an actor's
+// *private* extension table isn't, and we don't have receiver-side
+// access to intern it correctly at send time. When the clone hits such a
+// symbol it bails out (`Ok(None)`) and the caller falls back to the
+// general `to_sendable_in`/`from_sendable` path, unchanged.
+std::thread_local! {
+    static SAME_WORKER_MSGS: std::cell::RefCell<std::collections::HashMap<u64, Value>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NEXT_LOCAL_MSG_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide count of sends that took the same-worker fast path.
+/// Telemetry for tests + perf analysis (a Relaxed add is negligible next
+/// to the tree clone it accounts for).
+static SAME_WORKER_FAST_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many `(send ...)`s have taken the same-worker fast path so far.
+pub fn same_worker_fast_send_count() -> u64 {
+    SAME_WORKER_FAST_SENDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pull a same-worker message back out by id. Only called from
+/// `from_sendable` for a `SendableValue::Local`, which — per the module
+/// doc above — is only ever handed to a receiver running on the same OS
+/// thread that produced it, so the entry is always present exactly once.
+fn take_same_worker_msg(id: u64) -> Value {
+    SAME_WORKER_MSGS.with(|m| {
+        m.borrow_mut().remove(&id).unwrap_or_else(|| {
+            panic!(
+                "cs-845.1: same-worker msg {id} missing on receive (thread/ordering bug in the \
+                 fast-send path)"
+            )
+        })
+    })
+}
+
+/// Deep-clone `v` into a fresh `Value` tree suitable for handing directly
+/// to a colocated receiver, reusing symbol ids where — and only where —
+/// that's sound (see the module doc above).
+///
+/// - `Ok(Some(clone))`: fast path is safe, here's the clone.
+/// - `Ok(None)`: `v` contains a non-base (per-actor-private) symbol;
+///   caller should fall back to `to_sendable_in`/`from_sendable`.
+/// - `Err(_)`: `v` contains something that can never cross an actor
+///   boundary at all (procedure/hashtable/port/promise) — same rejects as
+///   `to_sendable_in`.
+fn deep_clone_same_worker(v: &Value, syms: &SymbolTable) -> Result<Option<Value>, String> {
+    macro_rules! recur {
+        ($e:expr) => {
+            match deep_clone_same_worker($e, syms)? {
+                Some(cloned) => cloned,
+                None => return Ok(None),
+            }
+        };
+    }
+    Ok(Some(match v {
+        Value::Null => Value::Null,
+        Value::Unspecified => Value::Unspecified,
+        Value::Eof => Value::Eof,
+        Value::Boolean(b) => Value::Boolean(*b),
+        Value::Character(c) => Value::Character(*c),
+        Value::Fixnum(n) => Value::Fixnum(*n),
+        Value::Flonum(f) => Value::Flonum(*f),
+        // Immutable (no interior mutability) boxed numbers — an `Rc`
+        // clone is a legitimate deep-clone-equivalent, same as sharing
+        // any other immutable value.
+        Value::BigNumber(b) => Value::BigNumber(b.clone()),
+        Value::Rational(r) => Value::Rational(r.clone()),
+        Value::String(s) => Value::string(s.borrow().clone()),
+        Value::Symbol(sym) => {
+            if syms.is_base(*sym) {
+                Value::Symbol(*sym)
+            } else {
+                return Ok(None);
+            }
+        }
+        Value::Identifier { name, mark } => {
+            if syms.is_base(*name) {
+                // Mirrors `to_sendable_in`: mark doesn't survive the
+                // boundary, identifiers degrade to plain symbols.
+                let _ = mark;
+                Value::Symbol(*name)
+            } else {
+                return Ok(None);
+            }
+        }
+        Value::Pair(p) => {
+            let car = recur!(&p.car.borrow());
+            let cdr = recur!(&p.cdr.borrow());
+            Value::Pair(Pair::new(car, cdr))
+        }
+        Value::Vector(items) => {
+            let mut cloned = Vec::with_capacity(items.borrow().len());
+            for e in items.borrow().iter() {
+                cloned.push(recur!(e));
+            }
+            Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(cloned)))
+        }
+        Value::ByteVector(bv) => Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(
+            bv.borrow().clone(),
+        ))),
+        Value::Procedure(_) => {
+            return Err(
+                "to_sendable: procedures cannot cross actor boundaries (also blocks procedures \
+                 as `load-module!` exports — see ADR 0034 for the architectural prerequisite)"
+                    .into(),
+            )
+        }
+        Value::Hashtable(_) => {
+            return Err(
+                "to_sendable: hashtables are per-actor; use cs-table for shared state".into(),
+            )
+        }
+        Value::Port(_) => return Err("to_sendable: ports cannot cross actor boundaries".into()),
+        Value::Promise(_) => {
+            return Err("to_sendable: promises cannot cross actor boundaries".into())
+        }
+    }))
+}
+
+/// Try the same-worker fast path for `(send pid v)`: if `target_worker`
+/// is `Some` and matches the current thread's `LocalWorkerPool` worker
+/// id, deep-clone `v` directly and return a `SendableValue::Local` handle
+/// for it. Returns `Ok(None)` whenever the fast path doesn't apply
+/// (different/unknown worker, or a non-base symbol in the tree) so the
+/// caller can fall back to `to_sendable_in` unchanged. `Err` propagates a
+/// genuine not-sendable rejection (procedure/hashtable/port/promise).
+fn try_send_same_worker(
+    v: &Value,
+    syms: &SymbolTable,
+    target_worker: Option<usize>,
+) -> Result<Option<SendableValue>, String> {
+    let same_worker = matches!(
+        (target_worker, cs_actor::current_worker_id()),
+        (Some(a), Some(b)) if a == b
+    );
+    if !same_worker {
+        return Ok(None);
+    }
+    let Some(cloned) = deep_clone_same_worker(v, syms)? else {
+        return Ok(None);
+    };
+    let id = NEXT_LOCAL_MSG_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    SAME_WORKER_MSGS.with(|m| m.borrow_mut().insert(id, cloned));
+    SAME_WORKER_FAST_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(SendableValue::Local(id)))
 }
 
 fn num_to_sendable(n: &Number) -> Result<SendableValue, String> {
@@ -1077,6 +1260,17 @@ fn sendable_to_datum(s: &SendableValue, out: &mut String) -> Result<(), String> 
         SendableValue::Unspecified => {
             return Err("the unspecified value cannot be a spawn-source argument".into());
         }
+        // cs-845.1: `Local` is an internal same-worker-mailbox handle,
+        // produced only by `try_send_same_worker` and consumed only by
+        // `from_sendable`. It should never reach datum serialization
+        // (spawn-source args always go through `to_sendable_in`, not the
+        // fast-send path).
+        SendableValue::Local(_) => {
+            return Err(
+                "internal error: a same-worker message handle escaped into datum serialization"
+                    .into(),
+            );
+        }
         SendableValue::Eof => {
             return Err("the eof object cannot be a spawn-source argument".into());
         }
@@ -1785,7 +1979,15 @@ fn value_to_str<'a>(v: &'a Value, syms: &'a SymbolTable, who: &str) -> Result<St
 pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("send", args, 2)?;
     let pid = value_to_pid(&args[0], syms, "send")?;
-    let sv = to_sendable_in(&args[1], syms)?;
+    // cs-845.1: try the same-worker fast path first — skips the
+    // SendableValue projection/rebuild round-trip when sender and
+    // receiver are colocated on the same LocalWorkerPool worker. Falls
+    // back to the general to_sendable_in path unchanged otherwise.
+    let target_worker = beam_state().actors.local_worker_of(pid);
+    let sv = match try_send_same_worker(&args[1], syms, target_worker)? {
+        Some(sv) => sv,
+        None => to_sendable_in(&args[1], syms)?,
+    };
     primop_send(pid, sv)?;
     Ok(Value::Unspecified)
 }
@@ -3661,6 +3863,114 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("green whole-body actor never wrote its result");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn same_worker_send_deep_clones_not_aliases() {
+        // cs-845.1: two spawn-source-green actors colocated on the same
+        // LocalWorkerPool worker take the fast same-worker send path
+        // (`try_send_same_worker`) instead of the SendableValue
+        // projection round-trip. Prove it preserves copy semantics: the
+        // sender mutates its list *after* sending it, and the receiver's
+        // copy must be unaffected.
+        let table = "same-worker-send-test";
+        primop_make_table(table, "set").expect("make table");
+
+        // The receiver just files whatever it's handed under the given
+        // key — a LocalWorkerPool actor so it's eligible for colocation.
+        let receiver_body = r#"
+            (define (recv)
+              (let loop ()
+                (let ((msg (raw-receive)))
+                  (table-insert! 'same-worker-send-test (car msg) (cdr msg))
+                  (loop))))
+        "#;
+        let receiver =
+            primop_spawn_source_green(receiver_body.to_string(), "recv".to_string(), vec![])
+                .expect("spawn receiver");
+
+        // The sender: waits to be handed the receiver's pid (a PID can't
+        // ride as a spawn arg — the datum bridge rejects it — so it
+        // arrives as a message, same as `ping_pong_two_actors` below),
+        // then builds a mutable list, sends it, and mutates the ORIGINAL
+        // *after* sending. If the fast path aliased instead of
+        // deep-cloning, the receiver would observe the post-mutation
+        // value (1 999 3) instead of the pre-send value (1 2 3). Also a
+        // `spawn-source-green` (LocalWorkerPool) actor, so it's eligible
+        // for colocation with `receiver`.
+        // Fixnum table keys (1 = pre-mutation copy, 2 = post-mutation
+        // original) keep the messages symbol-free, so the fast path never
+        // bails on a per-actor extension symbol — letting the counter
+        // assertion below prove the fast path really fired.
+        let sender_body = r#"
+            (define (run)
+              (let ((rpid (raw-receive)))
+                (let ((original (list 1 2 3)))
+                  (send rpid (cons 1 original))
+                  (set-car! (cdr original) 999)
+                  (send rpid (cons 2 original)))))
+        "#;
+
+        // Find a sender colocated with `receiver` by pigeonhole: spawn
+        // candidates (round-robin dispatched) until one lands on the same
+        // worker. 512 candidates comfortably exceeds any real machine's
+        // `available_parallelism()` worker count. Every candidate but the
+        // chosen one just parks forever on its `raw-receive` — harmless,
+        // torn down at process exit.
+        let mut sender = None;
+        for _ in 0..512 {
+            let candidate =
+                primop_spawn_source_green(sender_body.to_string(), "run".to_string(), vec![])
+                    .expect("spawn candidate");
+            if beam_state().actors.local_worker_of(candidate)
+                == beam_state().actors.local_worker_of(receiver)
+            {
+                sender = Some(candidate);
+                break;
+            }
+        }
+        let sender = sender.expect("failed to find a worker-colocated sender candidate");
+        let fast_sends_before = same_worker_fast_send_count();
+        primop_send(sender, SendableValue::Pid(receiver)).expect("kick off sender");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let copy = primop_table_lookup(table, &SendableValue::Fixnum(1)).expect("lookup copy");
+            let mutated = primop_table_lookup(table, &SendableValue::Fixnum(2))
+                .expect("lookup mutated-original");
+            if let (Some(copy), Some(mutated)) = (copy, mutated) {
+                let list123 = SendableValue::Pair(
+                    Box::new(SendableValue::Fixnum(1)),
+                    Box::new(SendableValue::Pair(
+                        Box::new(SendableValue::Fixnum(2)),
+                        Box::new(SendableValue::Pair(
+                            Box::new(SendableValue::Fixnum(3)),
+                            Box::new(SendableValue::Null),
+                        )),
+                    )),
+                );
+                assert_eq!(
+                    copy, list123,
+                    "receiver's copy must reflect the list as it was AT SEND TIME"
+                );
+                assert_ne!(
+                    mutated, list123,
+                    "sanity: the original really was mutated after sending"
+                );
+                // Both sends were colocated + symbol-free, so both must
+                // have taken the fast path (>= tolerates other actor
+                // tests bumping the process-wide counter concurrently).
+                assert!(
+                    same_worker_fast_send_count() >= fast_sends_before + 2,
+                    "expected the colocated sends to take the same-worker fast path"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("same-worker send/receive never completed");
             }
             std::thread::sleep(Duration::from_millis(5));
         }

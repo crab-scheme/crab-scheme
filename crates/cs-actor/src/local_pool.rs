@@ -31,11 +31,29 @@
 //! crosses back — exactly mirroring how `spawn-source` actors build their
 //! `Rc` heap on the spawned thread (`beam.rs::run_scheme_body`).
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
+
+thread_local! {
+    /// This worker's index within its `LocalWorkerPool`, set once at
+    /// `worker_main` startup. `None` on any thread that isn't a
+    /// `LocalWorkerPool` worker (e.g. the test harness thread, or a
+    /// `spawn_sync_body_on_task` blocking thread).
+    static WORKER_ID: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The current thread's `LocalWorkerPool` worker index, if any. Actor
+/// bodies dispatched via `LocalWorkerPool::dispatch` run with this set for
+/// the lifetime of the worker thread — used by cs-runtime's same-worker
+/// fast-send path to check colocation before skipping the `SendableValue`
+/// projection round-trip.
+pub fn current_worker_id() -> Option<usize> {
+    WORKER_ID.with(|w| w.get())
+}
 
 /// A unit of work handed to a worker thread. It runs **on** the worker,
 /// inside the `LocalSet` context, so it may call
@@ -79,7 +97,7 @@ impl LocalWorkerPool {
                 // runs on; a small bump over the 2 MiB default is cheap
                 // (lazily-committed virtual) defense-in-depth.
                 .stack_size(16 * 1024 * 1024)
-                .spawn(move || worker_main(job_rx))
+                .spawn(move || worker_main(i, job_rx))
                 .expect("spawn cs-actor local worker thread");
             workers.push(Worker {
                 job_tx: Some(job_tx),
@@ -94,16 +112,18 @@ impl LocalWorkerPool {
 
     /// Hand `job` to the next worker (round-robin). The job runs on that
     /// worker's thread, inside its `LocalSet`, so it may `spawn_local` a
-    /// `!Send` future. Returns `false` if the chosen worker has already
+    /// `!Send` future. Returns `None` if the chosen worker has already
     /// shut down (its channel is closed) — the caller should treat that
-    /// as the actor never having started.
-    pub fn dispatch(&self, job: WorkerJob) -> bool {
+    /// as the actor never having started. On success, returns the index
+    /// of the worker the job was dispatched to (for actor→worker
+    /// colocation tracking).
+    pub fn dispatch(&self, job: WorkerJob) -> Option<usize> {
         let n = self.workers.len();
         // `% n` with n ≥ 1 (guaranteed by `new`) is always valid.
         let idx = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
         match &self.workers[idx].job_tx {
-            Some(tx) => tx.send(job).is_ok(),
-            None => false,
+            Some(tx) if tx.send(job).is_ok() => Some(idx),
+            _ => None,
         }
     }
 
@@ -136,7 +156,8 @@ impl Drop for LocalWorkerPool {
 /// futures that the same `block_on` continues to poll concurrently with
 /// the receive loop. When the channel closes (pool drop), the loop ends
 /// and `block_on` returns, dropping the runtime.
-fn worker_main(mut job_rx: mpsc::UnboundedReceiver<WorkerJob>) {
+fn worker_main(idx: usize, mut job_rx: mpsc::UnboundedReceiver<WorkerJob>) {
+    WORKER_ID.with(|w| w.set(Some(idx)));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -183,7 +204,10 @@ mod tests {
                     }
                 });
             }));
-            assert!(ok, "dispatch should succeed while the pool is alive");
+            assert!(
+                ok.is_some(),
+                "dispatch should succeed while the pool is alive"
+            );
         }
         // Spin until every future has completed (or time out). The pool's
         // workers drive the futures on their own threads.
@@ -209,10 +233,11 @@ mod tests {
         // by dispatching a no-op many times without panicking and that
         // the pool reports the right width.
         assert_eq!(pool.worker_count(), 4);
-        for _ in 0..16 {
-            assert!(pool.dispatch(Box::new(|| {
+        for i in 0..16 {
+            let idx = pool.dispatch(Box::new(|| {
                 tokio::task::spawn_local(async {});
-            })));
+            }));
+            assert_eq!(idx, Some(i % 4));
         }
     }
 
