@@ -848,6 +848,14 @@ impl Actor {
     ///
     /// If called more than once, the last message wins (bodies are
     /// expected to terminate immediately after calling this).
+    ///
+    /// Note for Rust-bodied actors: a body that merely `break`s/returns on
+    /// a `receive()` `Err` (or any internal failure) still exits `Normal`
+    /// unless it calls this first — opting into error-exit semantics is
+    /// the body's responsibility. Also note link cascades are transitive:
+    /// a non-trapping linked actor killed by this Error re-propagates an
+    /// `Exit` to *its* links (reason strings nest per hop), matching
+    /// Erlang's exit-signal propagation.
     pub fn set_error_exit(&self, msg: impl Into<String>) {
         *self
             .state

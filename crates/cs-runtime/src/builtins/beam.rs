@@ -491,20 +491,27 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
     // Cached per source per worker — activation actors sharing a handler body
     // reuse the compiled bytecode (closures share the cached code chunks).
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-activation>", &source) {
-        eprintln!("spawn-activation: loading actor source failed: {d:?}");
+        let msg = format!("spawn-activation: loading actor source failed: {d:?}");
+        eprintln!("{msg}");
+        // cs-845.8: load-phase failure is an abnormal exit too — chain it.
+        actor.set_error_exit(msg);
         return;
     }
     let handler_proc = match rt.lookup(&handler) {
         Some(v @ Value::Procedure(_)) => v,
         Some(other) => {
-            eprintln!(
+            let msg = format!(
                 "spawn-activation: top-level `{handler}` is {}, not a procedure",
                 other.type_name()
             );
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
         None => {
-            eprintln!("spawn-activation: no top-level `{handler}` defined in the source");
+            let msg = format!("spawn-activation: no top-level `{handler}` defined in the source");
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
     };
@@ -792,13 +799,18 @@ async fn green_source_body(
     // chunks); only the closures + overlay bindings are per-actor. Mirrors
     // `run_scheme_body` otherwise.
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-source-green>", &source) {
-        eprintln!("spawn-source(green): loading actor source failed: {d:?}");
+        let msg = format!("spawn-source(green): loading actor source failed: {d:?}");
+        eprintln!("{msg}");
+        // cs-845.8: load-phase failure is an abnormal exit too — chain it.
+        actor.set_error_exit(msg);
         return;
     }
     let call = match resolve_and_build_call(&rt, &entry, &args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("spawn-source(green): {e}");
+            let msg = format!("spawn-source(green): {e}");
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
     };

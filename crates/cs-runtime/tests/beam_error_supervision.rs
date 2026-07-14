@@ -300,6 +300,149 @@ fn dedicated_normal_exit_still_reports_normal() {
     assert_eq!(reason, "normal");
 }
 
+// ---------------------------------------------------------------------
+// (a') activation × link — links tested on all three Scheme paths
+// ---------------------------------------------------------------------
+
+#[test]
+fn activation_handler_error_chains_error_exit_to_link() {
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_collector("test:cs845-link-activation-col", 2, out.clone());
+    let col = primop_spawn("test:cs845-link-activation-col", vec![]).expect("spawn collector");
+
+    // Activation handler: raises on 'boom.
+    let source = r#"
+        (define (handler msg)
+          (cond
+            ((eq? msg 'boom) (car 5))
+            (else #t)))
+    "#;
+    let peer =
+        primop_spawn_activation(source.to_string(), "handler".to_string()).expect("spawn peer");
+
+    let watcher =
+        primop_spawn_source_green(LINK_WATCHER_SRC.to_string(), "watcher".to_string(), vec![])
+            .expect("spawn watcher");
+
+    arm_and_report(watcher, col, peer, &out);
+    primop_send(peer, sym("boom")).unwrap();
+
+    let reason = wait_for_second_report(
+        &out,
+        "link never received *exit* for the errored activation",
+    );
+    assert!(
+        reason.starts_with("error:"),
+        "expected an error: exit reason, got {reason:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// load/resolve-phase errors (invalid source / missing entry) also chain
+// ---------------------------------------------------------------------
+
+/// Register a Rust-proc watcher: receives a Pid, arms a monitor on it, then
+/// waits for the `*down*` and records its reason string. Records "noproc" if
+/// the target already died before the monitor could be armed (the caller
+/// retries — the target errors at *spawn* here, so there is an inherent race
+/// that a Scheme-level watcher cannot win reliably).
+fn register_load_watcher(name: &'static str, out: Arc<Mutex<Vec<String>>>) {
+    beam_state().procs.register(
+        name,
+        Arc::new(move |actor, _args| {
+            let target = match primop_raw_receive(actor, None) {
+                Ok(Some(SendableValue::Pid(p))) => p,
+                _ => return,
+            };
+            if actor.monitor(target).is_err() {
+                out.lock().unwrap().push("noproc".into());
+                return;
+            }
+            loop {
+                match primop_raw_receive(actor, Some(10_000)) {
+                    Ok(Some(msg)) => {
+                        // (*down* ref-id pid reason) — walk to the 4th element.
+                        let rendered = format!("{msg:?}");
+                        if rendered.contains("*down*") {
+                            out.lock().unwrap().push(rendered);
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        }),
+    );
+}
+
+#[test]
+fn green_load_phase_error_delivers_down_with_error_reason() {
+    // Invalid source: the green body never runs — eval_str_via_vm_cached fails
+    // at load. That must still be an Error exit (previously: silent Normal).
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_load_watcher("test:cs845-load-green-watcher", out.clone());
+
+    for attempt in 0..5 {
+        let watcher = primop_spawn("test:cs845-load-green-watcher", vec![]).expect("spawn watcher");
+        let target =
+            primop_spawn_source_green("(this is not scheme".to_string(), "g".to_string(), vec![])
+                .expect("spawn target");
+        primop_send(watcher, SendableValue::Pid(target)).unwrap();
+
+        wait_until(
+            Duration::from_secs(10),
+            "load-phase watcher never reported",
+            || !out.lock().unwrap().is_empty(),
+        );
+        let got = out.lock().unwrap().pop().unwrap();
+        if got == "noproc" {
+            // Lost the arming race (target died before monitor) — retry.
+            assert!(attempt < 4, "monitor lost the arming race 5 times in a row");
+            continue;
+        }
+        assert!(
+            got.contains("error:"),
+            "expected an error: DOWN reason for the load-phase failure, got {got:?}"
+        );
+        return;
+    }
+}
+
+#[test]
+fn green_missing_entry_delivers_down_with_error_reason() {
+    // Valid source but no such entry procedure: resolve_and_build_call fails.
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    register_load_watcher("test:cs845-entry-green-watcher", out.clone());
+
+    for attempt in 0..5 {
+        let watcher =
+            primop_spawn("test:cs845-entry-green-watcher", vec![]).expect("spawn watcher");
+        let target = primop_spawn_source_green(
+            "(define (g) 1)".to_string(),
+            "no-such-entry".to_string(),
+            vec![],
+        )
+        .expect("spawn target");
+        primop_send(watcher, SendableValue::Pid(target)).unwrap();
+
+        wait_until(
+            Duration::from_secs(10),
+            "missing-entry watcher never reported",
+            || !out.lock().unwrap().is_empty(),
+        );
+        let got = out.lock().unwrap().pop().unwrap();
+        if got == "noproc" {
+            assert!(attempt < 4, "monitor lost the arming race 5 times in a row");
+            continue;
+        }
+        assert!(
+            got.contains("error:"),
+            "expected an error: DOWN reason for the missing entry, got {got:?}"
+        );
+        return;
+    }
+}
+
 #[test]
 fn green_normal_exit_still_reports_normal() {
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
