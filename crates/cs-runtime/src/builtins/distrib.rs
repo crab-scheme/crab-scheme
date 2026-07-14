@@ -742,6 +742,14 @@ pub fn encode_sendable(v: &SendableValue, out: &mut Vec<u8>) -> Result<(), Strin
             out.push(9);
             put_bytes(out, s.as_bytes());
         }
+        // cs-845.2: symbol ids are node-local (per-process base-image
+        // indices) and never cross nodes — encode by name, byte-identical
+        // to the plain Symbol arm above. The receiver decodes to
+        // `Symbol(String)` (tag 9) and re-interns.
+        SendableValue::SymbolId { name, .. } => {
+            out.push(9);
+            put_bytes(out, name.as_bytes());
+        }
         SendableValue::Pair(a, b) => {
             out.push(10);
             encode_sendable(a, out)?;
@@ -761,6 +769,17 @@ pub fn encode_sendable(v: &SendableValue, out: &mut Vec<u8>) -> Result<(), Strin
         SendableValue::Pid(_) => {
             return Err(
                 "node-send: a PID cannot cross nodes; address the peer by node name".into(),
+            );
+        }
+        // cs-845.1: `Local` is a same-worker mailbox handle (the parked
+        // Value lives in a thread-local on the worker that produced it) —
+        // it must never cross a node boundary. Should be unreachable in
+        // practice (try_send_same_worker only fires for colocated actors),
+        // but reject it explicitly like the Pid arm rather than silently
+        // encoding a meaningless handle.
+        SendableValue::Local { .. } => {
+            return Err(
+                "node-send: internal error: a same-worker message handle cannot cross nodes".into(),
             );
         }
     }
@@ -1095,6 +1114,40 @@ mod tests {
         for c in &cases {
             assert_eq!(&round_trip(c), c);
         }
+    }
+
+    #[test]
+    fn codec_symbol_id_encodes_as_plain_symbol() {
+        // cs-845.2: SymbolId ids are node-local (per-process base-image
+        // indices), so the codec drops the id and ships the name as wire
+        // tag 9 — byte-identical to a plain Symbol, decoding back to
+        // Symbol(String) on the peer.
+        let mut a = Vec::new();
+        encode_sendable(
+            &SendableValue::SymbolId {
+                id: 42,
+                name: "car".into(),
+            },
+            &mut a,
+        )
+        .expect("encode SymbolId");
+        let mut b = Vec::new();
+        encode_sendable(&SendableValue::Symbol("car".into()), &mut b).expect("encode Symbol");
+        assert_eq!(a, b, "SymbolId must be wire-identical to Symbol");
+        let (decoded, _) = decode_sendable(&a).expect("decode");
+        assert_eq!(decoded, SendableValue::Symbol("car".into()));
+    }
+
+    #[test]
+    fn codec_rejects_local_handle() {
+        // cs-845.1's same-worker handle is thread-local state; it must be
+        // rejected at the node boundary, not encoded.
+        let mut out = Vec::new();
+        let pid = cs_actor::ActorPid {
+            node: 0,
+            local_id: 1,
+        };
+        assert!(encode_sendable(&SendableValue::Local { recv: pid, seq: 0 }, &mut out).is_err());
     }
 
     #[test]
