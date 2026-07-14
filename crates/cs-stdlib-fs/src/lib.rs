@@ -32,11 +32,25 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cs_core::Value;
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
+
+// ----- cooperative blocking hook (inverted dependency, cs-845.3) -----
+//
+// cs-stdlib-fs can't depend on the actor layer, so cs-runtime installs a hook
+// (when the actor layer is present) that lets a coroutine driver run a
+// blocking read/write on a `spawn_blocking` thread instead of freezing the
+// shared green worker. Same shape as `cs_stdlib_time::install_cooperative_sleep`.
+static COOPERATIVE_BLOCKING: OnceLock<cs_ffi::blocking::BlockingHook> = OnceLock::new();
+
+/// Install the cooperative-blocking hook (idempotent; first wins). Called by
+/// cs-runtime at startup when the actor layer is built.
+pub fn install_cooperative_blocking(hook: cs_ffi::blocking::BlockingHook) {
+    let _ = COOPERATIVE_BLOCKING.set(hook);
+}
 
 /// Every `(crab fs)` procedure as a Vec of `HostProcedure`
 /// factories. cs-runtime iterates this and calls
@@ -115,63 +129,75 @@ fn io_fail(name: &str, path: &str, e: std::io::Error) -> FfiError {
 // ----- read -----
 
 fn read_file_string(args: &[Value]) -> Result<Value, FfiError> {
-    let p = expect_string("read-file-string", args, 0)?;
-    match fs::read_to_string(&p) {
-        Ok(s) => Ok(string_value(s)),
-        Err(e) => Err(io_fail("read-file-string", &p, e)),
-    }
+    let path = expect_string("read-file-string", args, 0)?;
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    cs_ffi::blocking::run_blocking(hook, move || {
+        fs::read_to_string(&path).map_err(|e| format!("read-file-string: {}: {}", path, e))
+    })
+    .map(string_value)
+    .map_err(FfiError::HostFailure)
 }
 
 fn read_file_bytes(args: &[Value]) -> Result<Value, FfiError> {
-    let p = expect_string("read-file-bytes", args, 0)?;
-    match fs::read(&p) {
-        Ok(b) => Ok(bytevector_value(b)),
-        Err(e) => Err(io_fail("read-file-bytes", &p, e)),
-    }
+    let path = expect_string("read-file-bytes", args, 0)?;
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    cs_ffi::blocking::run_blocking(hook, move || {
+        fs::read(&path).map_err(|e| format!("read-file-bytes: {}: {}", path, e))
+    })
+    .map(bytevector_value)
+    .map_err(FfiError::HostFailure)
 }
 
 // ----- write -----
 
 fn write_file_string(args: &[Value]) -> Result<Value, FfiError> {
-    let p = expect_string("write-file-string", args, 0)?;
+    let path = expect_string("write-file-string", args, 0)?;
     let s = expect_string("write-file-string", args, 1)?;
-    match fs::write(&p, s.as_bytes()) {
-        Ok(()) => Ok(Value::Unspecified),
-        Err(e) => Err(io_fail("write-file-string", &p, e)),
-    }
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    cs_ffi::blocking::run_blocking(hook, move || {
+        fs::write(&path, s.as_bytes()).map_err(|e| format!("write-file-string: {}: {}", path, e))
+    })
+    .map(|()| Value::Unspecified)
+    .map_err(FfiError::HostFailure)
 }
 
 fn write_file_bytes(args: &[Value]) -> Result<Value, FfiError> {
-    let p = expect_string("write-file-bytes", args, 0)?;
+    let path = expect_string("write-file-bytes", args, 0)?;
     let b = expect_bytevector("write-file-bytes", args, 1)?;
-    match fs::write(&p, &b) {
-        Ok(()) => Ok(Value::Unspecified),
-        Err(e) => Err(io_fail("write-file-bytes", &p, e)),
-    }
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    cs_ffi::blocking::run_blocking(hook, move || {
+        fs::write(&path, &b).map_err(|e| format!("write-file-bytes: {}: {}", path, e))
+    })
+    .map(|()| Value::Unspecified)
+    .map_err(FfiError::HostFailure)
 }
 
 fn append_file_string(args: &[Value]) -> Result<Value, FfiError> {
     let p = expect_string("append-file-string", args, 0)?;
     let s = expect_string("append-file-string", args, 1)?;
-    append_bytes("append-file-string", &p, s.as_bytes())
+    append_bytes("append-file-string", p, s.into_bytes())
 }
 
 fn append_file_bytes(args: &[Value]) -> Result<Value, FfiError> {
     let p = expect_string("append-file-bytes", args, 0)?;
     let b = expect_bytevector("append-file-bytes", args, 1)?;
-    append_bytes("append-file-bytes", &p, &b)
+    append_bytes("append-file-bytes", p, b)
 }
 
-fn append_bytes(name: &str, path: &str, data: &[u8]) -> Result<Value, FfiError> {
+fn append_bytes(name: &'static str, path: String, data: Vec<u8>) -> Result<Value, FfiError> {
     use std::io::Write;
-    let mut f = match fs::OpenOptions::new().create(true).append(true).open(path) {
-        Ok(f) => f,
-        Err(e) => return Err(io_fail(name, path, e)),
-    };
-    match f.write_all(data) {
-        Ok(()) => Ok(Value::Unspecified),
-        Err(e) => Err(io_fail(name, path, e)),
-    }
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    cs_ffi::blocking::run_blocking(hook, move || {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {}: {}", name, path, e))?;
+        f.write_all(&data)
+            .map_err(|e| format!("{}: {}: {}", name, path, e))
+    })
+    .map(|()| Value::Unspecified)
+    .map_err(FfiError::HostFailure)
 }
 
 // ----- file ops -----

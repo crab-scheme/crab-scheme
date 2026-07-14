@@ -712,6 +712,16 @@ async fn pump_coroutine(
             CoroutineResult::Yield(CoYield::IoWrite { handle, bytes }) => {
                 resume_input = CoResume::IoWrite(driver_tcp_send(handle, bytes).await);
             }
+            #[cfg(feature = "ffi-trait")]
+            CoroutineResult::Yield(CoYield::Blocking(op)) => {
+                // Run the blocking stdlib op (file I/O, subprocess wait,
+                // DNS/connect) on tokio's blocking threadpool instead of
+                // blocking this worker — releasing it for co-located actors.
+                resume_input = CoResume::Blocking(match tokio::task::spawn_blocking(op).await {
+                    Ok(res) => res,
+                    Err(e) => Err(format!("blocking op panicked: {e}")),
+                });
+            }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
                 checkin_stack(co.into_stack(), stack_class);
@@ -1283,6 +1293,12 @@ enum CoYield {
     /// worker), then resume with `IoWrite(..)`. See [`cooperative_tcp_send_hook`].
     #[cfg(feature = "stdlib-net")]
     IoWrite { handle: i64, bytes: Vec<u8> },
+    /// A generic blocking stdlib op (file I/O, subprocess wait, DNS/connect) —
+    /// cs-845.3. Run `op` on a `spawn_blocking` thread (releasing the worker)
+    /// instead of blocking it in place, then resume with `Blocking(..)`. See
+    /// [`cooperative_blocking_hook`] and `cs_ffi::blocking`.
+    #[cfg(feature = "ffi-trait")]
+    Blocking(cs_ffi::blocking::BlockingOp),
 }
 
 /// What the driver passes back *into* the coroutine on resume — the coroutine's
@@ -1302,6 +1318,10 @@ enum CoResume {
     /// Resume value after an `IoWrite`: success or the write error.
     #[cfg(feature = "stdlib-net")]
     IoWrite(Result<(), String>),
+    /// Resume value after a `Blocking` op: the erased result `spawn_blocking`
+    /// produced (or a panic message if the blocking task panicked).
+    #[cfg(feature = "ffi-trait")]
+    Blocking(Result<Box<dyn std::any::Any + Send>, String>),
 }
 
 std::thread_local! {
@@ -2856,6 +2876,34 @@ pub fn cooperative_tcp_send_hook(handle: i64, bytes: &[u8]) -> Option<Result<(),
         CoResume::IoWrite(res) => Some(res),
         _ => Some(Err(
             "tcp-send: internal error (resumed without an ack)".into()
+        )),
+    }
+}
+
+/// Cooperative-blocking hook (cs-845.3) — the generic counterpart of
+/// [`cooperative_sleep_hook`]/[`cooperative_tcp_recv_hook`] for stdlib ops
+/// that don't have a bespoke async equivalent (file I/O, subprocess wait,
+/// DNS/connect). Matches `cs_ffi::blocking::BlockingHook`'s signature exactly
+/// so it installs directly into `cs-stdlib-fs`/`cs-stdlib-process`/
+/// `cs-stdlib-net`'s `install_cooperative_blocking`.
+///
+/// Unlike the other cooperative hooks this always returns `Some`: with no
+/// coroutine driver active on this thread (no [`YIELDER`]), it just runs
+/// `op` inline — identical to the caller doing the blocking call directly —
+/// rather than pushing that decision back onto the caller.
+#[cfg(feature = "ffi-trait")]
+pub fn cooperative_blocking_hook(
+    op: cs_ffi::blocking::BlockingOp,
+) -> Option<Result<Box<dyn std::any::Any + Send>, String>> {
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        return Some(op());
+    }
+    // Sound: see `cooperative_sleep_hook`.
+    match unsafe { (*yielder).suspend(CoYield::Blocking(op)) } {
+        CoResume::Blocking(res) => Some(res),
+        _ => Some(Err(
+            "blocking op: internal error (resumed without a result)".into(),
         )),
     }
 }

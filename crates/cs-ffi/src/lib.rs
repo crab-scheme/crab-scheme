@@ -22,6 +22,7 @@
 #![deny(unsafe_code)]
 
 pub mod abi;
+pub mod blocking;
 pub mod error;
 pub mod host;
 pub mod marshal;
@@ -30,6 +31,7 @@ pub use abi::{
     EvalOutput, EvalStatus, HostProcCall, HostProcDecl, RegHandle, RuntimeFfi, ValueRef,
     CRABSCHEME_FFI_API_VERSION,
 };
+pub use blocking::{run_blocking, BlockingHook, BlockingOp};
 pub use error::FfiError;
 pub use host::{HostProcedure, UntypedProc};
 pub use marshal::{FromValue, IntoValue};
