@@ -677,7 +677,30 @@ async fn pump_coroutine(
         YIELDER.with(|y| y.set(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
 
+        // cs-845.7: load THIS actor's own saved reduction countdown into
+        // the shared cs-vm thread_local before resuming it, so a
+        // co-located actor's leftover countdown never bleeds in. A
+        // fresh actor (no saved slice yet) gets a full budget.
+        let actor_ref = unsafe { &*actor_ptr };
+        cs_vm::vm::set_ticks_remaining(
+            actor_ref
+                .reduction_slice()
+                .unwrap_or_else(|| cs_vm::vm::reduction_budget().saturating_sub(1)),
+        );
+
         let result = co.resume(resume_input);
+
+        // cs-845.7: save the countdown back into THIS actor's state right
+        // after it suspends/returns, before a co-located actor's resume
+        // can observe (or overwrite) the shared thread_local. Budget
+        // exhaustion (`CoYield::Yield`) means the slice was fully spent —
+        // refill to a fresh full budget rather than saving the just-
+        // reloaded near-zero value, matching "your slice is spent".
+        if matches!(result, CoroutineResult::Yield(CoYield::Yield)) {
+            actor_ref.set_reduction_slice(cs_vm::vm::reduction_budget().saturating_sub(1));
+        } else {
+            actor_ref.set_reduction_slice(cs_vm::vm::ticks_remaining());
+        }
 
         // Capture the yielder the closure published on the first resume.
         if cached_yielder.is_null() {
