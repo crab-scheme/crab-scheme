@@ -118,6 +118,20 @@ pub fn install_async_send(hook: AsyncSendHook) {
     let _ = ASYNC_SEND.set(hook);
 }
 
+/// Cooperative-blocking hook for `dns-resolve` / `tcp-connect` (cs-845.3):
+/// these do real (possibly slow) DNS + connect syscalls that, run inline on
+/// a green actor's shared worker, would freeze every co-tenant actor. Same
+/// generic erased-closure shape as `cs_ffi::blocking` — see that module's
+/// docs. `None` (hook not installed, e.g. no actor layer) means the caller
+/// runs the op as a plain blocking call.
+static COOPERATIVE_BLOCKING: OnceLock<cs_ffi::blocking::BlockingHook> = OnceLock::new();
+
+/// Install the cooperative-blocking hook (idempotent; first wins). Called by
+/// cs-runtime at startup when the actor layer is built.
+pub fn install_cooperative_blocking(hook: cs_ffi::blocking::BlockingHook) {
+    let _ = COOPERATIVE_BLOCKING.set(hook);
+}
+
 /// Clone the underlying std `TcpStream` for socket handle `id`, so a cooperative
 /// driver can build a tokio stream for the async read. `None` if `id` is not a
 /// live TCP socket. No tokio types cross this crate boundary.
@@ -204,21 +218,30 @@ fn io_fail(name: &str, e: std::io::Error) -> FfiError {
 
 fn dns_resolve(args: &[Value]) -> Result<Value, FfiError> {
     let host = expect_string("dns-resolve", args, 0)?;
-    // `to_socket_addrs` accepts either "host:port" or bare "host"
-    // (the latter needs a synthetic port; std requires one). Try
-    // bare first; if that fails, append ":0".
-    let addrs = if host.contains(':') {
-        host.to_socket_addrs()
-    } else {
-        format!("{}:0", host).to_socket_addrs()
-    };
-    let iter = addrs.map_err(|e| FfiError::HostFailure(format!("dns-resolve: {}: {}", host, e)))?;
+    let host_has_port = host.contains(':');
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    let lookup_host = host.clone();
+    let iter: Vec<std::net::SocketAddr> = cs_ffi::blocking::run_blocking(hook, move || {
+        // `to_socket_addrs` accepts either "host:port" or bare "host" (the
+        // latter needs a synthetic port; std requires one). Try bare first;
+        // if that fails, append ":0".
+        let addrs = if host_has_port {
+            lookup_host.to_socket_addrs()
+        } else {
+            format!("{}:0", lookup_host).to_socket_addrs()
+        };
+        addrs
+            .map(|it| it.collect::<Vec<_>>())
+            .map_err(|e| format!("dns-resolve: {}: {}", lookup_host, e))
+    })
+    .map_err(FfiError::HostFailure)?;
     let strings: Vec<Value> = iter
+        .into_iter()
         .map(|sa| {
             // Strip the dummy `:0` if we added it; otherwise keep
             // the host:port shape so callers can distinguish IPv4
             // vs IPv6 mapped addresses with explicit ports.
-            if host.contains(':') {
+            if host_has_port {
                 string_value(sa.to_string())
             } else {
                 string_value(sa.ip().to_string())
@@ -234,7 +257,12 @@ fn tcp_connect(args: &[Value]) -> Result<Value, FfiError> {
     let host = expect_string("tcp-connect", args, 0)?;
     let port = expect_fixnum("tcp-connect", args, 1)?;
     let addr = format!("{}:{}", host, port);
-    let s = TcpStream::connect(&addr).map_err(|e| io_fail("tcp-connect", e))?;
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    let connect_addr = addr.clone();
+    let s = cs_ffi::blocking::run_blocking(hook, move || {
+        TcpStream::connect(&connect_addr).map_err(|e| format!("tcp-connect: {}", e))
+    })
+    .map_err(FfiError::HostFailure)?;
     Ok(Value::fixnum(insert(Slot::Tcp(s))?))
 }
 
