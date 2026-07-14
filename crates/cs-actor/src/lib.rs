@@ -70,6 +70,7 @@
 
 #![allow(dead_code)] // some types are public for B3+ consumers; trim later.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -611,11 +612,35 @@ pub struct Actor {
     /// (link / monitor / trap_exit) reach the same cells the
     /// terminator reads from in `spawn_async`'s cleanup path.
     pub(crate) state: Arc<ActorState>,
+    /// cs-845.7: this actor's own remaining cs-vm reduction-budget
+    /// countdown, saved across coroutine suspends on a shared green
+    /// worker so co-located actors no longer share (and bleed into)
+    /// one thread_local countdown. `None` means "not yet started a
+    /// slice" — the driver loads the full budget on first resume.
+    /// See `pump_coroutine` in cs-runtime's beam.rs for the
+    /// save/restore switch points; this cell is otherwise untouched
+    /// (dedicated-thread / non-green actors never read or write it).
+    reduction_slice: Cell<Option<u32>>,
 }
 
 impl Actor {
     pub fn pid(&self) -> ActorPid {
         self.pid
+    }
+
+    /// cs-845.7: this actor's saved reduction countdown (the cs-vm
+    /// `VM_TICKS_REMAINING` value at the moment it last suspended), or
+    /// `None` if it hasn't run a slice yet. Read by the green-actor
+    /// driver (`pump_coroutine`) to restore the countdown before
+    /// resuming this actor's coroutine.
+    pub fn reduction_slice(&self) -> Option<u32> {
+        self.reduction_slice.get()
+    }
+
+    /// cs-845.7: save this actor's reduction countdown, read back from
+    /// cs-vm's thread_local right after it suspends.
+    pub fn set_reduction_slice(&self, remaining: u32) {
+        self.reduction_slice.set(Some(remaining));
     }
 
     /// Blocking receive — returns the next message in the
@@ -1146,6 +1171,7 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
+                reduction_slice: Cell::new(None),
             };
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut actor)));
@@ -1243,6 +1269,7 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
+                reduction_slice: Cell::new(None),
             };
             // Wrap in AssertUnwindSafe + catch_unwind so a panic in
             // body() doesn't poison the whole runtime. Tokio's
@@ -1295,6 +1322,7 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state,
+                reduction_slice: Cell::new(None),
             };
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let _ = futures::FutureExt::catch_unwind(fut).await;
@@ -1326,6 +1354,20 @@ impl ActorSystem {
     fn local_pool(&self) -> &LocalWorkerPool {
         self.local_pool
             .get_or_init(|| LocalWorkerPool::new(Self::local_worker_count()))
+    }
+
+    /// cs-845.7 (diagnostic/test seam): run `job` on one of the
+    /// local-pool worker threads, inside its `LocalSet` context. Jobs
+    /// interleave with — never preempt — the green-actor task polls on
+    /// that thread, so a job observes/mutates the worker's thread-locals
+    /// (e.g. cs-vm's reduction countdown) only at task boundaries.
+    /// Round-robin across workers; with
+    /// `CRABSCHEME_ACTOR_LOCAL_WORKERS=1` it deterministically targets
+    /// THE green worker, which the per-actor reduction-accounting tests
+    /// rely on. Returns `false` if the chosen worker has shut down.
+    #[doc(hidden)]
+    pub fn run_on_local_worker(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        self.local_pool().dispatch(Box::new(job))
     }
 
     /// Spawn an actor whose body future may be **`!Send`** — it can hold
@@ -1389,6 +1431,7 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
+                reduction_slice: Cell::new(None),
             };
             tokio::task::spawn_local(async move {
                 // Mirror `spawn_async`'s panic capture: a panicking actor

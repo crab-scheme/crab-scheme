@@ -10715,6 +10715,27 @@ pub fn reduction_budget() -> u32 {
     VM_REDUCTION_BUDGET.with(|c| c.get())
 }
 
+/// Read the current thread's reduction countdown
+/// ([`VM_TICKS_REMAINING`]) without touching the budget. cs-845.7:
+/// used by the green-actor driver (cs-runtime's `pump_coroutine`) to
+/// save a suspending actor's in-progress countdown into its own
+/// per-actor state, so a co-located actor sharing this worker thread
+/// doesn't inherit (or clobber) it. Not on the dispatch hot path —
+/// only called at coroutine switch points.
+pub fn ticks_remaining() -> u32 {
+    VM_TICKS_REMAINING.with(|c| c.get())
+}
+
+/// Set the current thread's reduction countdown
+/// ([`VM_TICKS_REMAINING`]) without changing the budget. cs-845.7:
+/// used by the green-actor driver to restore a resuming actor's own
+/// saved countdown before running its coroutine, instead of letting
+/// it inherit whatever a co-located actor left behind. Not on the
+/// dispatch hot path — only called at coroutine switch points.
+pub fn set_ticks_remaining(n: u32) {
+    VM_TICKS_REMAINING.with(|c| c.set(n));
+}
+
 /// Diagnostic: how many times the yield hook has fired on this
 /// thread since the last [`reset_yield_count`]. Useful for asserting
 /// preemption in tests.
