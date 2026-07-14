@@ -138,6 +138,9 @@ impl LocalWorkerPool {
     {
         let n = self.workers.len();
         // `% n` with n ≥ 1 (guaranteed by `new`) is always valid.
+        // Candidates are the adjacent (cursor, cursor+1) pair — weaker
+        // than textbook random two-choice sampling, but cheap,
+        // deterministic, and good enough for placement-only balancing.
         let c1 = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
         let c2 = (c1 + 1) % n;
         let idx = if self.workers[c2].load.load(Ordering::Relaxed)
@@ -147,17 +150,18 @@ impl LocalWorkerPool {
         } else {
             c1
         };
-        let load = Arc::clone(&self.workers[idx].load);
+        let load = &self.workers[idx].load;
         load.fetch_add(1, Ordering::Relaxed);
-        let job = build_job(LoadGuard(Arc::clone(&load)));
-        let sent = match &self.workers[idx].job_tx {
+        let job = build_job(LoadGuard(Arc::clone(load)));
+        // On failure (channel closed or already torn down) the unsent
+        // `job` is dropped right here, which drops the `LoadGuard` it
+        // captured — that Drop is the SOLE decrement path. No explicit
+        // fetch_sub: that would decrement twice for one increment and
+        // wrap the counter.
+        match &self.workers[idx].job_tx {
             Some(tx) => tx.send(job).is_ok(),
             None => false,
-        };
-        if !sent {
-            load.fetch_sub(1, Ordering::Relaxed);
         }
-        sent
     }
 
     /// Number of worker threads in the pool.
@@ -267,7 +271,7 @@ mod tests {
 
     /// Dispatch spreads load across workers (power-of-two-choices).
     #[test]
-    fn dispatch_is_round_robin() {
+    fn dispatch_keeps_succeeding_across_workers() {
         let pool = LocalWorkerPool::new(4);
         // We can't observe the index directly, but we can confirm
         // dispatch keeps succeeding and the pool reports the right
@@ -366,5 +370,72 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let loads = pool.worker_loads();
         assert_eq!(loads, vec![0, 0, 0, 0], "expected all counters to drain");
+    }
+
+    /// A failed dispatch (channels already closed) must return `false`
+    /// and leave the load counters exactly where they were — the unsent
+    /// job's dropped `LoadGuard` is the sole decrement, so there is no
+    /// double-decrement wrapping the counter to ~usize::MAX.
+    #[test]
+    fn failed_dispatch_leaves_counters_unchanged() {
+        let mut pool = LocalWorkerPool::new(2);
+        // Simulate shutdown: close every worker's channel (what `Drop`
+        // does first) so any dispatch target is already gone. The recv
+        // loops exit; threads are joined by `Drop` at the end.
+        for w in &mut pool.workers {
+            w.job_tx = None;
+        }
+        for _ in 0..4 {
+            let ok = pool.dispatch(|guard| {
+                Box::new(move || {
+                    tokio::task::spawn_local(async move {
+                        let _guard = guard;
+                    });
+                })
+            });
+            assert!(!ok, "dispatch must fail once channels are closed");
+        }
+        assert_eq!(
+            pool.worker_loads(),
+            vec![0, 0],
+            "failed dispatch must not leave (or wrap) load counts"
+        );
+    }
+
+    /// Distinguishes power-of-two-choices from blind round-robin: seed
+    /// worker 0 with a large artificial load, then dispatch a fresh
+    /// batch. Under P2C worker 0 loses every comparison it appears in
+    /// (pairs (3,0) and (0,1)) and receives nothing; round-robin would
+    /// have handed it ~1/4 of the batch.
+    #[test]
+    fn p2c_avoids_preloaded_worker() {
+        let pool = LocalWorkerPool::new(4);
+        let seeded = 1000usize;
+        pool.workers[0].load.fetch_add(seeded, Ordering::Relaxed);
+        let batch = 100usize;
+        for _ in 0..batch {
+            let ok = pool.dispatch(|guard| {
+                Box::new(move || {
+                    tokio::task::spawn_local(async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                    });
+                })
+            });
+            assert!(ok);
+        }
+        let loads = pool.worker_loads();
+        assert_eq!(
+            loads[0], seeded,
+            "preloaded worker must receive no new actors, got {loads:?}"
+        );
+        assert_eq!(
+            loads.iter().sum::<usize>(),
+            seeded + batch,
+            "loads: {loads:?}"
+        );
+        // Undo the artificial seed so the pool's Drop (and any debug
+        // tooling) sees a consistent count.
+        pool.workers[0].load.fetch_sub(seeded, Ordering::Relaxed);
     }
 }
