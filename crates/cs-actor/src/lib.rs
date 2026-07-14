@@ -1382,30 +1382,38 @@ impl ActorSystem {
 
         // The job closure is `Send` (captures only `Send` data); it runs
         // on the worker thread, where it builds the `!Send` future and
-        // `spawn_local`s it. The future never crosses back.
-        let dispatched = self.local_pool().dispatch(Box::new(move || {
-            let actor = Actor {
-                pid,
-                mailbox: mailbox_for_actor,
-                system: system_for_actor,
-                state: state_for_actor,
-            };
-            tokio::task::spawn_local(async move {
-                // Mirror `spawn_async`'s panic capture: a panicking actor
-                // logs + deregisters rather than aborting the worker.
-                let fut = std::panic::AssertUnwindSafe(body(actor));
-                let result = futures::FutureExt::catch_unwind(fut).await;
-                let reason = match &result {
-                    Ok(()) => ExitReason::Normal,
-                    Err(payload) => {
-                        let msg = panic_message(payload);
-                        eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
-                        ExitReason::Error(msg)
-                    }
+        // `spawn_local`s it. The future never crosses back. `dispatch`
+        // hands us a `LoadGuard` for whichever worker it placed us on
+        // (power-of-two-choices); moving it into the spawned future
+        // keeps that worker's live-actor count accurate until this
+        // actor exits (or panics — `LoadGuard::drop` runs either way).
+        let dispatched = self.local_pool().dispatch(move |load_guard| {
+            Box::new(move || {
+                let actor = Actor {
+                    pid,
+                    mailbox: mailbox_for_actor,
+                    system: system_for_actor,
+                    state: state_for_actor,
                 };
-                inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
-            });
-        }));
+                tokio::task::spawn_local(async move {
+                    let _load_guard = load_guard;
+                    // Mirror `spawn_async`'s panic capture: a panicking
+                    // actor logs + deregisters rather than aborting the
+                    // worker.
+                    let fut = std::panic::AssertUnwindSafe(body(actor));
+                    let result = futures::FutureExt::catch_unwind(fut).await;
+                    let reason = match &result {
+                        Ok(()) => ExitReason::Normal,
+                        Err(payload) => {
+                            let msg = panic_message(payload);
+                            eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
+                            ExitReason::Error(msg)
+                        }
+                    };
+                    inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
+                });
+            })
+        });
 
         if !dispatched {
             // Only reachable if the pool has shut down (system teardown).
