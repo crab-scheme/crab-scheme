@@ -587,7 +587,7 @@ pub fn b_web_server_start(args: &[Value], _syms: &mut SymbolTable) -> Result<Val
     let bound = primop_server_start(sid)?;
     // Return the bound address as a string — useful when the
     // caller passed `127.0.0.1:0` to let the OS pick a port.
-    let g = cs_gc::Gc::new(std::cell::RefCell::new(bound));
+    let g = cs_gc::Gc::new(std::cell::RefCell::new(bound.into()));
     Ok(Value::String(g))
 }
 
@@ -846,7 +846,7 @@ pub fn b_web_request_path(args: &[Value], _syms: &mut SymbolTable) -> Result<Val
     check_arity("web-request-path", args, 1)?;
     let h = value_to_i64(&args[0], "web-request-path")?;
     let p = primop_request_path(h)?;
-    let g = cs_gc::Gc::new(std::cell::RefCell::new(p));
+    let g = cs_gc::Gc::new(std::cell::RefCell::new(p.into()));
     Ok(Value::String(g))
 }
 
@@ -854,15 +854,15 @@ pub fn b_web_request_body(args: &[Value], _syms: &mut SymbolTable) -> Result<Val
     check_arity("web-request-body", args, 1)?;
     let h = value_to_i64(&args[0], "web-request-body")?;
     let b = primop_request_body(h)?;
-    let g = cs_gc::Gc::new(std::cell::RefCell::new(b));
+    let g = cs_gc::Gc::new(std::cell::RefCell::new(b.into()));
     Ok(Value::String(g))
 }
 
 fn alist_to_scheme(pairs: Vec<(String, String)>) -> Value {
     let mut acc = Value::Null;
     for (k, v) in pairs.into_iter().rev() {
-        let k_g = cs_gc::Gc::new(std::cell::RefCell::new(k));
-        let v_g = cs_gc::Gc::new(std::cell::RefCell::new(v));
+        let k_g = cs_gc::Gc::new(std::cell::RefCell::new(k.into()));
+        let v_g = cs_gc::Gc::new(std::cell::RefCell::new(v.into()));
         let pair = Value::Pair(cs_core::Pair::new(Value::String(k_g), Value::String(v_g)));
         acc = Value::Pair(cs_core::Pair::new(pair, acc));
     }
@@ -882,7 +882,7 @@ pub fn b_web_request_param(args: &[Value], syms: &mut SymbolTable) -> Result<Val
     let name = value_to_str(&args[1], syms, "web-request-param")?;
     match primop_request_param(h, &name)? {
         Some(v) => {
-            let g = cs_gc::Gc::new(std::cell::RefCell::new(v));
+            let g = cs_gc::Gc::new(std::cell::RefCell::new(v.into()));
             Ok(Value::String(g))
         }
         None => Ok(Value::Boolean(false)),
@@ -902,7 +902,7 @@ pub fn b_web_request_header(args: &[Value], syms: &mut SymbolTable) -> Result<Va
     let name = value_to_str(&args[1], syms, "web-request-header")?;
     match primop_request_header(h, &name)? {
         Some(v) => {
-            let g = cs_gc::Gc::new(std::cell::RefCell::new(v));
+            let g = cs_gc::Gc::new(std::cell::RefCell::new(v.into()));
             Ok(Value::String(g))
         }
         None => Ok(Value::Boolean(false)),

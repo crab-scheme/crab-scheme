@@ -48,6 +48,7 @@ pub fn etcdpb_syms_builtins() -> Vec<(
         ("etcd-pb-decode-range", b_decode_range),
         ("etcd-pb-encode-put-resp", b_encode_put_resp),
         ("etcd-pb-encode-range-resp", b_encode_range_resp),
+        ("etcd-pb-encode-range-resp-pb", b_encode_range_resp_pb),
     ]
 }
 
@@ -387,6 +388,37 @@ fn b_encode_range_resp(args: &[Value], _syms: &mut SymbolTable) -> Result<Value,
         let kv = encode_keyvalue(t, WHO)?;
         put_msg(&mut out, 2, &kv);
     }
+    if more {
+        put_tag(&mut out, 3, 0);
+        put_varint(&mut out, 1);
+    }
+    put_int(&mut out, 4, count);
+    Ok(bv_value(out))
+}
+
+/// `(etcd-pb-encode-range-resp-pb cluster-id member-id rev term kvs-bytes more count)`
+///
+/// Splice variant (cw-2au LIST-scan wall): `kvs-bytes` is the CONCATENATED,
+/// already field-2-tagged `repeated KeyValue` bytes produced by cs-store's
+/// `store-range-latest-pb`, so a big LIST response is assembled without
+/// materializing per-row Scheme tuples at all.
+fn b_encode_range_resp_pb(args: &[Value], _syms: &mut SymbolTable) -> Result<Value, String> {
+    const WHO: &str = "etcd-pb-encode-range-resp-pb";
+    if args.len() != 7 {
+        return Err(format!("{}: expected 7 arguments, got {}", WHO, args.len()));
+    }
+    let header = encode_header(
+        expect_i64(&args[0], WHO)?,
+        expect_i64(&args[1], WHO)?,
+        expect_i64(&args[2], WHO)?,
+        expect_i64(&args[3], WHO)?,
+    );
+    let kvs = expect_bv(&args[4], WHO)?;
+    let more = args[5].is_truthy();
+    let count = expect_i64(&args[6], WHO)?;
+    let mut out = Vec::with_capacity(header.len() + 16 + kvs.len());
+    put_msg(&mut out, 1, &header);
+    out.extend_from_slice(&kvs);
     if more {
         put_tag(&mut out, 3, 0);
         put_varint(&mut out, 1);

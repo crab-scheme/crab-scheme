@@ -27,6 +27,23 @@
   '(0 10 20 30 0)
   (bytevector->u8-list bv-dest))
 
+; bytevector-nul-unescape (cw-71k): 0x00 0xFF -> 0x00, terminated by 0x00 0x00
+(test-equal "bv-nul-unescape-no-escapes"
+  '(1 2 3)
+  (bytevector->u8-list (bytevector-nul-unescape (bytevector 1 2 3 0 0) 0)))
+(test-equal "bv-nul-unescape-one-escape"
+  '(1 0 2)
+  (bytevector->u8-list (bytevector-nul-unescape (bytevector 1 0 255 2 0 0) 0)))
+(test-equal "bv-nul-unescape-leading-run"
+  '(0 0 1)
+  (bytevector->u8-list (bytevector-nul-unescape (bytevector 0 255 0 255 1 0 0) 0)))
+(test-equal "bv-nul-unescape-empty"
+  '()
+  (bytevector->u8-list (bytevector-nul-unescape (bytevector 0 0) 0)))
+(test-equal "bv-nul-unescape-start-offset"
+  '(9 8)
+  (bytevector->u8-list (bytevector-nul-unescape (bytevector 1 1 9 8 0 0) 2)))
+
 ; string-copy!
 (define s-dest (make-string 5 #\.))
 (string-copy! s-dest 1 "abc")
