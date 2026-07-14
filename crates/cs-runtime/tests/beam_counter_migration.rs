@@ -125,10 +125,13 @@ fn counter_state_migration_v1_to_v2() {
                     SendableValue::Symbol(s) => {
                         (SendableValue::Symbol(s.clone()), SendableValue::Null)
                     }
+                    // cs-845.2: a base-image symbol crosses as `{id, name}`.
+                    sid @ SendableValue::SymbolId { .. } => (sid.clone(), SendableValue::Null),
                     _ => continue,
                 };
                 let tag_name = match &tag {
                     SendableValue::Symbol(s) => s.clone(),
+                    SendableValue::SymbolId { name, .. } => name.clone(),
                     _ => continue,
                 };
 

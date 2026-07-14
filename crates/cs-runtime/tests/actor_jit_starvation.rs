@@ -58,10 +58,16 @@ fn jit_enabled_actor_tail_loop_does_not_starve_peer_post_tier_up() {
                 // load-bearing on its own) and a post-tier-up ping (the
                 // actual assertion).
                 for _ in 0..2 {
-                    if let Ok(Some(SendableValue::Symbol(s))) = primop_raw_receive(actor, None) {
-                        order.lock().unwrap().push(s.to_string());
-                    } else {
-                        break;
+                    match primop_raw_receive(actor, None) {
+                        Ok(Some(SendableValue::Symbol(s))) => {
+                            order.lock().unwrap().push(s.to_string())
+                        }
+                        // cs-845.2: a base-image symbol crosses as `{id,
+                        // name}`.
+                        Ok(Some(SendableValue::SymbolId { name, .. })) => {
+                            order.lock().unwrap().push(name)
+                        }
+                        _ => break,
                     }
                 }
             }

@@ -61,6 +61,9 @@ fn register_order_collector(name: &'static str, n: usize, out: Arc<Mutex<Vec<Str
 fn render(sv: &SendableValue) -> String {
     match sv {
         SendableValue::Symbol(s) => s.to_string(),
+        // cs-845.2: a base-image symbol crosses as `{id, name}`; render
+        // the name the same as the plain `Symbol` arm above.
+        SendableValue::SymbolId { name, .. } => name.clone(),
         other => format!("{other:?}"),
     }
 }

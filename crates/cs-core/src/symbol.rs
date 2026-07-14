@@ -84,6 +84,24 @@ impl SymbolTable {
         &self.by_id[(sym.0 - self.base_offset) as usize]
     }
 
+    /// Like [`Self::name`], but returns `None` instead of panicking when
+    /// `sym` is out of range for this table. Used by cross-worker consumers
+    /// that received an id minted by a *different* table's base image and
+    /// must verify it before trusting it — see cs-runtime's
+    /// `SendableValue::SymbolId` (cs-845.2), which discovered that two
+    /// independently-built base images sharing the same construction can
+    /// still end up different lengths (observed in practice, not just a
+    /// theoretical concern), so an id valid in one is not guaranteed valid
+    /// in the other.
+    pub fn name_checked(&self, sym: Symbol) -> Option<&str> {
+        if sym.0 < self.base_offset {
+            return self.base.as_ref().and_then(|b| b.name_checked(sym));
+        }
+        self.by_id
+            .get((sym.0 - self.base_offset) as usize)
+            .map(|s| s.as_ref())
+    }
+
     pub fn len(&self) -> usize {
         self.base_offset as usize + self.by_id.len()
     }
