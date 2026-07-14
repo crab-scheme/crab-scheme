@@ -1144,10 +1144,10 @@ fn diff_jit_cons_pair_return() {
         let walker = walker_eval(defines, expr);
         match (&jit, &walker) {
             (Value::Pair(jp), Value::Pair(wp)) => {
-                let jc = jp.car.borrow().clone();
-                let jd = jp.cdr.borrow().clone();
-                let wc = wp.car.borrow().clone();
-                let wd = wp.cdr.borrow().clone();
+                let jc = jp.car();
+                let jd = jp.cdr();
+                let wc = wp.car();
+                let wd = wp.cdr();
                 match (&jc, &wc, &jd, &wd) {
                     (Value::Fixnum(a), Value::Fixnum(b), Value::Fixnum(c), Value::Fixnum(d)) => {
                         assert_eq!(a, b);
@@ -5853,7 +5853,7 @@ fn diff_jit_bytevector_utf8_conversion() {
     let _ = cs_vm::vm::jit_call_count();
     match &lst {
         Value::Pair(p) => {
-            assert!(matches!(p.car.borrow().clone(), Value::Fixnum(65)));
+            assert!(matches!(p.car(), Value::Fixnum(65)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
@@ -6799,7 +6799,7 @@ fn diff_jit_port_subtype_predicates_and_list_head() {
     // list-head of 5-element list, n=3 => (10 20 30)
     match &lh {
         Value::Pair(p) => {
-            assert!(matches!(p.car.borrow().clone(), Value::Fixnum(10)));
+            assert!(matches!(p.car(), Value::Fixnum(10)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
@@ -7113,7 +7113,7 @@ fn diff_jit_equal_hash_and_hashtable_to_alist() {
     assert!(h1 >= 0);
     assert!(matches!(&h_list, Value::Fixnum(v) if *v >= 0));
     match &alist {
-        Value::Pair(p) => match p.car.borrow().clone() {
+        Value::Pair(p) => match p.car() {
             Value::Pair(_) => (),
             other => panic!("expected pair entry, got {:?}", other),
         },
@@ -7216,7 +7216,7 @@ fn diff_jit_bytevector_list_r7rs_aliases() {
         .unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match &lst {
-        Value::Pair(p) => assert!(matches!(p.car.borrow().clone(), Value::Fixnum(10))),
+        Value::Pair(p) => assert!(matches!(p.car(), Value::Fixnum(10))),
         other => panic!("expected pair, got {:?}", other),
     }
     match &bv {
@@ -7250,13 +7250,13 @@ fn diff_jit_append_reverse() {
     match &r {
         Value::Pair(p) => {
             // First element should be 3
-            assert!(matches!(p.car.borrow().clone(), Value::Fixnum(3)));
+            assert!(matches!(p.car(), Value::Fixnum(3)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
     match &empty {
         Value::Pair(p) => {
-            assert!(matches!(p.car.borrow().clone(), Value::Symbol(_)));
+            assert!(matches!(p.car(), Value::Symbol(_)));
         }
         other => panic!("expected pair, got {:?}", other),
     }
@@ -7286,8 +7286,8 @@ fn diff_jit_alist_copy() {
     let nil = rt.eval_str_via_vm("<diff>", "(ac '())").unwrap();
     let _ = cs_vm::vm::jit_call_count();
     match &copied {
-        Value::Pair(p) => match p.car.borrow().clone() {
-            Value::Pair(pe) => match pe.car.borrow().clone() {
+        Value::Pair(p) => match p.car() {
+            Value::Pair(pe) => match pe.car() {
                 Value::Symbol(_) => (),
                 other => panic!("expected symbol in first key, got {:?}", other),
             },
@@ -7441,10 +7441,10 @@ fn diff_jit_delete_and_delete_duplicates() {
         loop {
             match cur {
                 Value::Pair(p) => {
-                    if let Value::Fixnum(n) = p.car.borrow().clone() {
+                    if let Value::Fixnum(n) = p.car() {
                         out.push(n);
                     }
-                    cur = p.cdr.borrow().clone();
+                    cur = p.cdr();
                 }
                 _ => break,
             }
@@ -9002,8 +9002,8 @@ fn diff_jit_vector_to_list_slice() {
             match v {
                 Value::Null => return out,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     match car {
                         Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
@@ -9046,8 +9046,8 @@ fn diff_jit_string_to_list_slice() {
             match v {
                 Value::Null => return out,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     match car {
                         Value::Character(c) => out.push(c),
                         other => panic!("unexpected car: {:?}", other),
@@ -9103,8 +9103,8 @@ fn diff_jit_bytevector_to_list_slice() {
             match v {
                 Value::Null => return out,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     match car {
                         Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
@@ -9219,7 +9219,7 @@ fn diff_jit_make_list_1arg() {
             match v {
                 Value::Null => return n,
                 Value::Pair(p) => {
-                    let cdr = p.cdr.borrow().clone();
+                    let cdr = p.cdr();
                     n += 1;
                     v = cdr;
                 }
@@ -9232,8 +9232,8 @@ fn diff_jit_make_list_1arg() {
             match v {
                 Value::Null => return true,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     if !matches!(car, Value::Unspecified) {
                         return false;
                     }
@@ -9277,8 +9277,8 @@ fn diff_jit_vector_to_list_slice_from() {
             match v {
                 Value::Null => return out,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     match car {
                         Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
@@ -9321,8 +9321,8 @@ fn diff_jit_string_to_list_slice_from() {
             match v {
                 Value::Null => return out,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     match car {
                         Value::Character(c) => out.push(c),
                         other => panic!("unexpected car: {:?}", other),
@@ -9378,8 +9378,8 @@ fn diff_jit_bytevector_to_list_slice_from() {
             match v {
                 Value::Null => return out,
                 Value::Pair(p) => {
-                    let car = p.car.borrow().clone();
-                    let cdr = p.cdr.borrow().clone();
+                    let car = p.car();
+                    let cdr = p.cdr();
                     match car {
                         Value::Fixnum(n) => out.push(n),
                         other => panic!("unexpected car: {:?}", other),
@@ -10301,8 +10301,8 @@ fn diff_jit_ic_dispatch_fires_with_guards() {
     // (dup (list 7)) = (cons '(7) '(7)) = ((7) 7)
     match &result {
         Value::Pair(p) => {
-            let car = p.car.borrow().clone();
-            let cdr = p.cdr.borrow().clone();
+            let car = p.car();
+            let cdr = p.cdr();
             match (&car, &cdr) {
                 (Value::Pair(_), Value::Pair(_)) => {}
                 other => panic!("expected ((7) 7) shape, got {:?}", other),

@@ -94,8 +94,8 @@ impl Iterator for ListIter {
     fn next(&mut self) -> Option<Value> {
         match &self.cur.clone() {
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 self.cur = cdr;
                 Some(car)
             }

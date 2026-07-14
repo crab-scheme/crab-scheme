@@ -99,7 +99,7 @@ fn make_channel_value(id: ChannelId, syms: &mut SymbolTable) -> Value {
 /// other shape (non-pair, wrong tag, wrong cdr).
 fn channel_value_to_id(v: &Value, syms: &SymbolTable, who: &str) -> Result<ChannelId, String> {
     let (head, tail) = match v {
-        Value::Pair(p) => (p.car.borrow(), p.cdr.borrow()),
+        Value::Pair(p) => (p.car(), p.cdr()),
         other => {
             return Err(format!(
                 "{}: expected a channel value, got {}",
@@ -108,15 +108,15 @@ fn channel_value_to_id(v: &Value, syms: &SymbolTable, who: &str) -> Result<Chann
             ));
         }
     };
-    match &*head {
+    match &head {
         Value::Symbol(s) if syms.name(*s) == "channel" => {}
         _ => return Err(format!("{}: not a channel value (wrong tag)", who)),
     }
-    let (id, rest) = match &*tail {
-        Value::Pair(p) => (p.car.borrow(), p.cdr.borrow()),
+    let (id, rest) = match &tail {
+        Value::Pair(p) => (p.car(), p.cdr()),
         _ => return Err(format!("{}: malformed channel value (no id slot)", who)),
     };
-    match (&*id, &*rest) {
+    match (&id, &rest) {
         (Value::Fixnum(n), Value::Null) => {
             if *n < 0 {
                 Err(format!(
@@ -366,8 +366,8 @@ fn collect_list(who: &str, v: &Value) -> Result<Vec<Value>, String> {
         let next = match cur {
             Value::Null => return Ok(out),
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
-                let cdr = p.cdr.borrow().clone();
+                let car = p.car();
+                let cdr = p.cdr();
                 out.push(car);
                 cdr
             }
@@ -495,7 +495,7 @@ fn value_to_tagged_id(
     who: &str,
 ) -> Result<u64, String> {
     let (head, tail) = match v {
-        Value::Pair(p) => (p.car.borrow(), p.cdr.borrow()),
+        Value::Pair(p) => (p.car(), p.cdr()),
         other => {
             return Err(format!(
                 "{}: expected a {} value, got {}",
@@ -505,12 +505,12 @@ fn value_to_tagged_id(
             ));
         }
     };
-    match &*head {
+    match &head {
         Value::Symbol(s) if syms.name(*s) == expected_tag => {}
         _ => return Err(format!("{}: not a {} value (wrong tag)", who, expected_tag)),
     }
-    let (id, rest) = match &*tail {
-        Value::Pair(p) => (p.car.borrow(), p.cdr.borrow()),
+    let (id, rest) = match &tail {
+        Value::Pair(p) => (p.car(), p.cdr()),
         _ => {
             return Err(format!(
                 "{}: malformed {} value (no id slot)",
@@ -518,7 +518,7 @@ fn value_to_tagged_id(
             ))
         }
     };
-    match (&*id, &*rest) {
+    match (&id, &rest) {
         (Value::Fixnum(n), Value::Null) if *n >= 0 => Ok(*n as u64),
         _ => Err(format!(
             "{}: malformed {} value (bad id)",

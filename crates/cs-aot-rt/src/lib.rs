@@ -20,6 +20,12 @@
 //! needed. The `archive_resolves_all_jit_symbols` design note in
 //! `docs/user/aot.md` records the proof.
 
+// cs-vnf.2 — mimalloc as the global allocator for the AOT-built binary
+// that links this archive. Set here (not in the generated C `main`) so
+// every allocation cs-vm/cs-runtime make inside the archive uses it too.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// NB-encode a host `i64` as a Fixnum `NanboxValue` carrier. The generated
 /// C `main` calls this to turn parsed argv integers into the NB ABI the
 /// emitted entry function consumes (keeps the nan-box encoding in Rust so

@@ -36,11 +36,25 @@
 //! | `which` | string | string or #f | First PATH match for `cmd`; `#f` if not found. |
 
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cs_core::Value;
 use cs_ffi::error::FfiError;
 use cs_ffi::host::{HostProcedure, UntypedProc};
+
+// ----- cooperative blocking hook (inverted dependency, cs-845.3) -----
+//
+// cs-stdlib-process can't depend on the actor layer, so cs-runtime installs a
+// hook (when the actor layer is present) that lets a coroutine driver run
+// `wait`/`status` on a `spawn_blocking` thread instead of freezing the
+// shared green worker. Same shape as `cs_stdlib_time::install_cooperative_sleep`.
+static COOPERATIVE_BLOCKING: OnceLock<cs_ffi::blocking::BlockingHook> = OnceLock::new();
+
+/// Install the cooperative-blocking hook (idempotent; first wins). Called by
+/// cs-runtime at startup when the actor layer is built.
+pub fn install_cooperative_blocking(hook: cs_ffi::blocking::BlockingHook) {
+    let _ = COOPERATIVE_BLOCKING.set(hook);
+}
 
 pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
     vec![
@@ -128,34 +142,40 @@ fn run_proc(args: &[Value]) -> Result<Value, FfiError> {
         None
     };
 
-    let mut command = Command::new(&cmd);
-    command.args(&argv);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    if stdin_payload.is_some() {
-        command.stdin(Stdio::piped());
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| FfiError::HostFailure(format!("run: spawn {}: {}", cmd, e)))?;
-
-    if let Some(payload) = stdin_payload {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(payload.as_bytes())
-                .map_err(|e| FfiError::HostFailure(format!("run: write stdin {}: {}", cmd, e)))?;
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    let op_cmd = cmd.clone();
+    let (exit_code, stdout, stderr) = cs_ffi::blocking::run_blocking(hook, move || {
+        let mut command = Command::new(&op_cmd);
+        command.args(&argv);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        if stdin_payload.is_some() {
+            command.stdin(Stdio::piped());
         }
-    }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| FfiError::HostFailure(format!("run: wait {}: {}", cmd, e)))?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("run: spawn {}: {}", op_cmd, e))?;
 
-    let exit_code = output.status.code().unwrap_or(-1) as i64;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if let Some(payload) = stdin_payload {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(payload.as_bytes())
+                    .map_err(|e| format!("run: write stdin {}: {}", op_cmd, e))?;
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("run: wait {}: {}", op_cmd, e))?;
+
+        let exit_code = output.status.code().unwrap_or(-1) as i64;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        Ok((exit_code, stdout, stderr))
+    })
+    .map_err(FfiError::HostFailure)?;
 
     Ok(Value::list([
         Value::fixnum(exit_code),
@@ -174,11 +194,17 @@ fn run_status_proc(args: &[Value]) -> Result<Value, FfiError> {
     }
     let cmd = expect_string("run/status", args, 0)?;
     let argv = expect_string_list("run/status", args, 1)?;
-    let status = Command::new(&cmd)
-        .args(&argv)
-        .status()
-        .map_err(|e| FfiError::HostFailure(format!("run/status: {}: {}", cmd, e)))?;
-    Ok(Value::fixnum(status.code().unwrap_or(-1) as i64))
+    let hook = COOPERATIVE_BLOCKING.get().copied();
+    let op_cmd = cmd.clone();
+    let exit_code = cs_ffi::blocking::run_blocking(hook, move || {
+        Command::new(&op_cmd)
+            .args(&argv)
+            .status()
+            .map(|status| status.code().unwrap_or(-1) as i64)
+            .map_err(|e| format!("run/status: {}: {}", op_cmd, e))
+    })
+    .map_err(FfiError::HostFailure)?;
+    Ok(Value::fixnum(exit_code))
 }
 
 // ----- which -----
