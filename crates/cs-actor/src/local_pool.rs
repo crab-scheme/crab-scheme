@@ -31,6 +31,7 @@
 //! crosses back — exactly mirroring how `spawn-source` actors build their
 //! `Rc` heap on the spawned thread (`beam.rs::run_scheme_body`).
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
@@ -38,6 +39,23 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
+
+thread_local! {
+    /// This worker's index within its `LocalWorkerPool`, set once at
+    /// `worker_main` startup. `None` on any thread that isn't a
+    /// `LocalWorkerPool` worker (e.g. the test harness thread, or a
+    /// `spawn_sync_body_on_task` blocking thread).
+    static WORKER_ID: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The current thread's `LocalWorkerPool` worker index, if any. Actor
+/// bodies dispatched via `LocalWorkerPool::dispatch` run with this set for
+/// the lifetime of the worker thread — used by cs-runtime's same-worker
+/// fast-send path to check colocation before skipping the `SendableValue`
+/// projection round-trip.
+pub fn current_worker_id() -> Option<usize> {
+    WORKER_ID.with(|w| w.get())
+}
 
 use crate::ActorPid;
 
@@ -265,7 +283,7 @@ impl LocalWorkerPool {
                 // runs on; a small bump over the 2 MiB default is cheap
                 // (lazily-committed virtual) defense-in-depth.
                 .stack_size(16 * 1024 * 1024)
-                .spawn(move || worker_main(job_rx, worker_heartbeat))
+                .spawn(move || worker_main(i, job_rx, worker_heartbeat))
                 .expect("spawn cs-actor local worker thread");
             workers.push(Worker {
                 job_tx: Some(job_tx),
@@ -312,10 +330,11 @@ impl LocalWorkerPool {
     /// counter — rebalancing a running actor needs a `Send` actor heap,
     /// which is the iter-2b wall (see the module doc).
     ///
-    /// Returns `false` if the chosen worker has already shut down (its
+    /// Returns `None` if the chosen worker has already shut down (its
     /// channel is closed) — the caller should treat that as the actor
-    /// never having started.
-    pub fn dispatch<F>(&self, build_job: F) -> bool
+    /// never having started. On success, returns the index of the worker
+    /// the job was dispatched to (for actor→worker colocation tracking).
+    pub fn dispatch<F>(&self, build_job: F) -> Option<usize>
     where
         F: FnOnce(LoadGuard) -> WorkerJob,
     {
@@ -342,8 +361,8 @@ impl LocalWorkerPool {
         // fetch_sub: that would decrement twice for one increment and
         // wrap the counter.
         match &self.workers[idx].job_tx {
-            Some(tx) => tx.send(job).is_ok(),
-            None => false,
+            Some(tx) if tx.send(job).is_ok() => Some(idx),
+            _ => None,
         }
     }
 
@@ -523,7 +542,12 @@ fn watchdog_main(
 /// futures that the same `block_on` continues to poll concurrently with
 /// the receive loop. When the channel closes (pool drop), the loop ends
 /// and `block_on` returns, dropping the runtime.
-fn worker_main(mut job_rx: mpsc::UnboundedReceiver<WorkerJob>, heartbeat: Arc<WorkerHeartbeat>) {
+fn worker_main(
+    idx: usize,
+    mut job_rx: mpsc::UnboundedReceiver<WorkerJob>,
+    heartbeat: Arc<WorkerHeartbeat>,
+) {
+    WORKER_ID.with(|w| w.set(Some(idx)));
     install_heartbeat(heartbeat);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -578,7 +602,10 @@ mod tests {
                     });
                 })
             });
-            assert!(ok, "dispatch should succeed while the pool is alive");
+            assert!(
+                ok.is_some(),
+                "dispatch should succeed while the pool is alive"
+            );
         }
         // Spin until every future has completed (or time out). The pool's
         // workers drive the futures on their own threads.
@@ -604,11 +631,21 @@ mod tests {
         // width.
         assert_eq!(pool.worker_count(), 4);
         for _ in 0..16 {
-            assert!(pool.dispatch(|guard| Box::new(move || {
-                tokio::task::spawn_local(async move {
-                    let _guard = guard;
-                });
-            })));
+            // Placement is now power-of-two-choices, so the chosen worker
+            // isn't a fixed round-robin index — but dispatch must still
+            // succeed and name a valid worker within the pool.
+            let idx = pool.dispatch(|guard| {
+                Box::new(move || {
+                    tokio::task::spawn_local(async move {
+                        let _guard = guard;
+                    });
+                })
+            });
+            let idx = idx.expect("dispatch should succeed while the pool is alive");
+            assert!(
+                idx < pool.worker_count(),
+                "worker index out of range: {idx}"
+            );
         }
     }
 
@@ -663,7 +700,10 @@ mod tests {
                 heartbeat_idle();
             })
         });
-        assert!(ok, "dispatch should succeed while the pool is alive");
+        assert!(
+            ok.is_some(),
+            "dispatch should succeed while the pool is alive"
+        );
     }
 
     /// (a) A worker blocked non-cooperatively for longer than `stall_ms`
@@ -718,7 +758,7 @@ mod tests {
                     });
                 })
             });
-            assert!(ok);
+            assert!(ok.is_some());
         }
         // Give the watchdog several poll cycles (poll_every = 100ms) to have
         // had a chance to (wrongly) fire.
@@ -792,7 +832,7 @@ mod tests {
                     });
                 })
             });
-            assert!(ok);
+            assert!(ok.is_some());
         }
         // Give the workers a moment to actually spawn_local each job
         // (dispatch only sends to the channel; the recv loop drives
@@ -825,7 +865,7 @@ mod tests {
                     });
                 })
             });
-            assert!(ok);
+            assert!(ok.is_some());
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while done.load(Ordering::Relaxed) < total {
@@ -860,7 +900,7 @@ mod tests {
                     });
                 })
             });
-            assert!(!ok, "dispatch must fail once channels are closed");
+            assert!(ok.is_none(), "dispatch must fail once channels are closed");
         }
         assert_eq!(
             pool.worker_loads(),
@@ -889,7 +929,7 @@ mod tests {
                     });
                 })
             });
-            assert!(ok);
+            assert!(ok.is_some());
         }
         let loads = pool.worker_loads();
         assert_eq!(

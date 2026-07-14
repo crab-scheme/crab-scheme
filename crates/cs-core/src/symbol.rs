@@ -88,6 +88,25 @@ impl SymbolTable {
         self.base_offset as usize + self.by_id.len()
     }
 
+    /// True if `sym` resolves through the shared `base` chain (id below
+    /// this table's `base_offset`) rather than this table's own extension.
+    ///
+    /// ## Why base ids are cross-table-stable
+    ///
+    /// Every per-actor table on a worker is built with [`with_base`] over the
+    /// *same* `Rc<SymbolTable>` base image (the worker's shared builtin +
+    /// bundled-library symbols). A base id `k < base_offset` is simply an index
+    /// into that one shared base, so it names the identical symbol in any table
+    /// layered over it — no re-interning required. Extension ids (`≥
+    /// base_offset`) are private to the table that minted them: the same id
+    /// means different (or no) symbols in a sibling table. So base ids may be
+    /// copied verbatim between two such tables, extension ids may not. Used by
+    /// cs-runtime's same-worker actor fast-send path (cs-845.1), which copies a
+    /// message's symbols by id only when every one of them `is_base`.
+    pub fn is_base(&self, sym: Symbol) -> bool {
+        sym.0 < self.base_offset
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
