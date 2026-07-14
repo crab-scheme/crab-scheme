@@ -73,8 +73,8 @@ fn equal_rec(a: &Value, b: &Value, visited: &mut HashSet<(usize, usize)>, fuel: 
                 }
             }
             let next_fuel = fuel.saturating_sub(1);
-            equal_rec(&x.car.borrow(), &y.car.borrow(), visited, next_fuel)
-                && equal_rec(&x.cdr.borrow(), &y.cdr.borrow(), visited, next_fuel)
+            equal_rec(&x.car(), &y.car(), visited, next_fuel)
+                && equal_rec(&x.cdr(), &y.cdr(), visited, next_fuel)
         }
         (Value::Vector(x), Value::Vector(y)) => {
             let xb = x.borrow();

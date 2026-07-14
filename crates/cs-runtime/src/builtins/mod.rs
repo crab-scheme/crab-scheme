@@ -2771,8 +2771,8 @@ fn strip_identifier_marks(v: &Value) -> Value {
     match v {
         Value::Identifier { name, .. } => Value::Symbol(*name),
         Value::Pair(p) => {
-            let car_new = strip_identifier_marks(&p.car.borrow());
-            let cdr_new = strip_identifier_marks(&p.cdr.borrow());
+            let car_new = strip_identifier_marks(&p.car());
+            let cdr_new = strip_identifier_marks(&p.cdr());
             Value::Pair(Pair::new(car_new, cdr_new))
         }
         Value::Vector(vec_) => {
@@ -2815,8 +2815,8 @@ fn stamp_datum_with_mark(v: &Value, mark: u64) -> Value {
     match v {
         Value::Symbol(name) => Value::Identifier { name: *name, mark },
         Value::Pair(p) => {
-            let car_new = stamp_datum_with_mark(&p.car.borrow(), mark);
-            let cdr_new = stamp_datum_with_mark(&p.cdr.borrow(), mark);
+            let car_new = stamp_datum_with_mark(&p.car(), mark);
+            let cdr_new = stamp_datum_with_mark(&p.cdr(), mark);
             Value::Pair(Pair::new(car_new, cdr_new))
         }
         Value::Vector(vec_) => {
@@ -2982,7 +2982,7 @@ fn b_generate_temporaries_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value,
             Value::Null => break,
             Value::Pair(p) => {
                 n += 1;
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             _ => return Err(type_err("generate-temporaries", "list", &args[0])),
         }
@@ -4591,10 +4591,11 @@ fn b_vector_ref(args: &[Value]) -> Result<Value, String> {
         return Err("vector-ref: negative index".into());
     }
     match &args[0] {
-        Value::Vector(v) => v
-            .borrow()
-            .get(i as usize)
-            .cloned()
+        // cs-i6p.2: `vector_get` transparently upgrades a weak
+        // slot-cycle tombstone (see cs_core::value's vector
+        // tombstone doc) — the canonical `vector-ref` observation
+        // channel for a demoted self-referential slot.
+        Value::Vector(v) => cs_core::value::vector_get(v, i as usize)
             .ok_or_else(|| "vector-ref: index out of range".into()),
         v => Err(type_err("vector-ref", "vector", v)),
     }
@@ -4610,13 +4611,12 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
     }
     match &args[0] {
         Value::Vector(v) => {
-            {
-                let mut vw = v.borrow_mut();
-                if (i as usize) >= vw.len() {
-                    return Err("vector-set!: index out of range".into());
-                }
-                vw[i as usize] = args[2].clone();
+            if (i as usize) >= v.borrow().len() {
+                return Err("vector-set!: index out of range".into());
             }
+            // cs-i6p.2: `vector_set` clears any stale tombstone on
+            // this slot before writing the fresh strong value.
+            cs_core::value::vector_set(v, i as usize, args[2].clone());
             // Region-memory iter 5 (FR-8): see b_set_car.
             #[cfg(feature = "regions")]
             if cs_gc::Gc::is_region(v) {
@@ -4627,6 +4627,12 @@ fn b_vector_set(args: &[Value]) -> Result<Value, String> {
             if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
                 cs_gc::cycle::check_and_break(v, |v| {
                     crate::countable_memory_cycle::record_cycle_with_candidate(v);
+                    // cs-i6p.2: baseline=3, same reasoning as
+                    // b_set_car's `(set-car! p p)` case — see
+                    // `vector_break_slot_cycle`'s doc.
+                    if cs_core::value::vector_break_slot_cycle(v, i as usize, 3) {
+                        crate::countable_memory_cycle::record_cycle_broken();
+                    }
                 });
             }
             Ok(Value::Unspecified)
@@ -6977,9 +6983,15 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
         return Err(arity_err("hashtable-set!", "3", args.len()));
     }
     let h = as_ht("hashtable-set!", &args[0])?.clone();
+    // cs-i6p.2: track the just-written index so the cycle-break
+    // callback below knows which slot to demote.
+    let written_idx;
     match ht_find_index(&h, &args[1], ctx)? {
         Some(i) => {
-            h.items.borrow_mut()[i].1 = args[2].clone();
+            // `set_value_at` clears any stale tombstone on this
+            // slot before writing the fresh strong value.
+            h.set_value_at(i, args[2].clone());
+            written_idx = i;
         }
         None => {
             let hash = ht_hash_ctx(&h, &args[1], ctx)?;
@@ -6988,6 +7000,7 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
                 .borrow_mut()
                 .push((args[1].clone(), args[2].clone()));
             h.index_insert(hash, idx);
+            written_idx = idx as usize;
         }
     }
     // Region-memory iter 5 (FR-8): see b_set_car.
@@ -7000,6 +7013,14 @@ fn b_hashtable_set(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     if !cs_core::value::value_is_acyclic_leaf(&args[2]) {
         cs_gc::cycle::check_and_break(&h, |h| {
             crate::countable_memory_cycle::record_cycle_with_candidate(h);
+            // cs-i6p.2: baseline=3, same reasoning as b_set_car's
+            // `(set-car! p p)` case — see
+            // `Hashtable::break_value_cycle`'s doc. Values only;
+            // keys are never tombstoned (see
+            // HASHTABLE_VALUE_TOMBSTONES's doc for why).
+            if Hashtable::break_value_cycle(h, written_idx, 3) {
+                crate::countable_memory_cycle::record_cycle_broken();
+            }
         });
     }
     Ok(Value::Unspecified)
@@ -7011,7 +7032,10 @@ fn b_hashtable_ref(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String> {
     }
     let h = as_ht("hashtable-ref", &args[0])?.clone();
     match ht_find_index(&h, &args[1], ctx)? {
-        Some(i) => Ok(h.items.borrow()[i].1.clone()),
+        // cs-i6p.2: `value_at` transparently upgrades a weak
+        // value-cycle tombstone — the canonical `hashtable-ref`
+        // observation channel for a demoted self-referential value.
+        Some(i) => Ok(h.value_at(i).unwrap_or(Value::Unspecified)),
         None => Ok(args[2].clone()),
     }
 }
@@ -7030,7 +7054,10 @@ fn b_hashtable_delete(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, String
     }
     let h = as_ht("hashtable-delete!", &args[0])?.clone();
     if let Some(idx) = ht_find_index(&h, &args[1], ctx)? {
-        h.items.borrow_mut().swap_remove(idx);
+        // cs-i6p.2: `swap_remove_item` also migrates/clears any
+        // value tombstone affected by the swap-remove's index
+        // shift (see its doc).
+        h.swap_remove_item(idx);
         // Delete is rare; a full reindex is simpler and cheaper to keep
         // correct than fixing up the swap_remove's moved element by hand.
         ht_reindex_all(&h, ctx)?;
@@ -7159,7 +7186,9 @@ fn b_hashtable_clear(args: &[Value]) -> Result<Value, String> {
         return Err(arity_err("hashtable-clear!", "1 or 2", args.len()));
     }
     let h = as_ht("hashtable-clear!", &args[0])?;
-    h.items.borrow_mut().clear();
+    // cs-i6p.2: `clear_items` also drops any value tombstones for
+    // this table.
+    h.clear_items();
     h.index.borrow_mut().clear();
     Ok(Value::Unspecified)
 }
@@ -7175,7 +7204,9 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     // user's equiv proc instead of routing through ht_eq (which panics on
     // the Custom kind) — matches set!/ref/contains!/delete!.
     let current = match ht_find_index(&h, &args[1], ctx)? {
-        Some(i) => h.items.borrow()[i].1.clone(),
+        // cs-i6p.2: read through `value_at` so a previously-demoted
+        // slot's tombstone upgrades transparently here too.
+        Some(i) => h.value_at(i).unwrap_or(Value::Unspecified),
         None => args[3].clone(),
     };
     let new_val =
@@ -7183,7 +7214,8 @@ fn b_hashtable_update_ho(args: &[Value], ctx: &mut EvalCtx) -> Result<Value, Str
     // Re-locate after the update proc runs — it may have mutated the table.
     match ht_find_index(&h, &args[1], ctx)? {
         Some(i) => {
-            h.items.borrow_mut()[i].1 = new_val;
+            // cs-i6p.2: clears any stale tombstone on this slot.
+            h.set_value_at(i, new_val);
         }
         None => {
             let hash = ht_hash_ctx(&h, &args[1], ctx)?;
@@ -11430,11 +11462,11 @@ pub(crate) fn decode_environment(
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
-                let tail = p.cdr.borrow().clone();
+                let head = p.car();
+                let tail = p.cdr();
                 if let Value::Pair(kv) = head {
-                    if let Value::Symbol(s) = kv.car.borrow().clone() {
-                        map.insert(s, kv.cdr.borrow().clone());
+                    if let Value::Symbol(s) = kv.car() {
+                        map.insert(s, kv.cdr());
                     }
                 }
                 cur = tail;
@@ -11572,13 +11604,13 @@ fn namespace_update(
     loop {
         match cur {
             Value::Pair(p) => {
-                let head = p.car.borrow().clone();
+                let head = p.car();
                 if let Value::Pair(kv) = head {
-                    if let Value::Symbol(s) = kv.car.borrow().clone() {
-                        entries.push((s, kv.cdr.borrow().clone()));
+                    if let Value::Symbol(s) = kv.car() {
+                        entries.push((s, kv.cdr()));
                     }
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             _ => break,
         }
@@ -13854,18 +13886,28 @@ fn b_jit_stats(args: &[Value]) -> Result<Value, String> {
 /// ```
 ///
 /// Under `feature = "countable-memory"` (default): the tracing
-/// heap is retired. The integer counters report cycle-detector
-/// activity from `countable_memory_cycle` (allocations aren't
-/// tracked at the GC layer — Rc::new doesn't have a hook —
-/// so bytes-allocated-total + alloc-count-total + live-slots
-/// stay 0). Timings stay 0.0. collect-count reports
+/// heap is retired. Timings stay 0.0. collect-count reports
 /// `cycle_broken_count()`. The alist shape is preserved so
 /// benchmark scripts portable across Chez/CrabScheme don't
 /// fail-fast on missing keys.
+///
+/// `bytes-allocated-total` / `alloc-count-total` come from
+/// `cs_gc::alloc_telemetry` (Gap A-1). `live-slots` (cs-i6p.1)
+/// is that module's `live_count()` — `alloc_count_total -
+/// dealloc_count_total`, i.e. `Gc<T>` handles whose last strong
+/// reference hasn't dropped yet. It only covers Rc-backed
+/// `Gc<T>` (the default heap arm); region-backed allocations
+/// were never counted on the alloc side either, so they don't
+/// skew this number — see the module doc on
+/// `cs_gc::alloc_telemetry` for why.
 fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if !args.is_empty() {
         return Err(arity_err("gc-stats", "0", args.len()));
     }
+    // Built ahead of the `pair` closure below: it needs its own
+    // `&mut SymbolTable` borrow, which can't interleave with
+    // `pair`'s borrow for the rest of the function.
+    let histogram_val = gc_stats_histogram_value(syms);
     let mut pair = |k: &str, v: Value| -> Value {
         let key_sym = syms.intern(k);
         Value::Pair(cs_core::Pair::new(Value::Symbol(key_sym), v))
@@ -13879,6 +13921,12 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
         // always-zero stub.
         let bytes = cs_gc::alloc_telemetry::bytes_allocated_total();
         let allocs = cs_gc::alloc_telemetry::alloc_count_total();
+        // cs-i6p.1: live = alloc - dealloc (Rc-arm only; see
+        // the alloc_telemetry module doc).
+        let live = cs_gc::alloc_telemetry::live_count();
+        let live_b = cs_gc::alloc_telemetry::live_bytes();
+        let dealloc_bytes = cs_gc::alloc_telemetry::bytes_deallocated_total();
+        let dealloc_count = cs_gc::alloc_telemetry::dealloc_count_total();
         // parallel-runtime C4.4: surface the layer-4 BR sweep
         // counters from `cs_gc::cycle_registry`. Three keys:
         //
@@ -13916,7 +13964,7 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
             pair("bytes-allocated-total", fixnum_or_bigint(bytes)),
             pair("alloc-count-total", fixnum_or_bigint(allocs)),
             pair("collect-count", Value::fixnum(cycles_broken as i64)),
-            pair("live-slots", Value::fixnum(0)),
+            pair("live-slots", fixnum_or_bigint(live)),
             pair("collect-time-ms", Value::flonum(0.0)),
             pair("last-pause-ms", Value::flonum(0.0)),
             pair("max-pause-ms", Value::flonum(0.0)),
@@ -13934,8 +13982,45 @@ fn b_gc_stats(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
             pair("sweep-cycles-collected", Value::fixnum(sweep_cycles as i64)),
             pair("sweep-time-us", fixnum_or_bigint(sweep_time_us)),
             pair("sweep-broken-total", fixnum_or_bigint(sweep_total)),
+            // cs-i6p.1: deallocation + live-byte telemetry,
+            // symmetric with the alloc-side keys above.
+            pair("bytes-deallocated-total", fixnum_or_bigint(dealloc_bytes)),
+            pair("dealloc-count-total", fixnum_or_bigint(dealloc_count)),
+            pair("live-bytes", fixnum_or_bigint(live_b)),
+            // cs-i6p.1: per-type histogram, only populated
+            // under `feature = "alloc-histogram"` (off by
+            // default). Shape: a list of (type count bytes)
+            // triples, one per bucket. Empty list when the
+            // feature is off, so callers that don't care can
+            // just ignore the key.
+            pair("alloc-histogram", histogram_val),
         ]))
     }
+}
+
+/// Build the `alloc-histogram` value for [`b_gc_stats`]: a list
+/// of `(type count bytes)` triples under `feature =
+/// "alloc-histogram"`, or `'()` when the feature is off (the
+/// histogram module isn't compiled in at all in that case).
+#[cfg(feature = "alloc-histogram")]
+fn gc_stats_histogram_value(syms: &mut SymbolTable) -> Value {
+    Value::list(
+        cs_gc::alloc_telemetry::histogram::snapshot()
+            .into_iter()
+            .map(|(name, count, bytes)| {
+                Value::list(vec![
+                    Value::Symbol(syms.intern(name)),
+                    fixnum_or_bigint(count),
+                    fixnum_or_bigint(bytes),
+                ])
+            })
+            .collect(),
+    )
+}
+
+#[cfg(not(feature = "alloc-histogram"))]
+fn gc_stats_histogram_value(_syms: &mut SymbolTable) -> Value {
+    Value::Null
 }
 
 /// `(gc-allocator v)` — parallel-runtime C5.2. Returns a

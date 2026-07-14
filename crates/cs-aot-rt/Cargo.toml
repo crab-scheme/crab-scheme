@@ -19,3 +19,7 @@ crate-type = ["staticlib", "rlib"]
 # features being off — see workspace Cargo.toml).
 cs-vm = { workspace = true }
 cs-runtime = { workspace = true }
+# cs-vnf.2 — global allocator for AOT-built native binaries linking this
+# archive. Plain crates.io dep with no feature coupling to cs-vm/cs-runtime,
+# so it doesn't disturb the archive's isolated-build feature unification.
+mimalloc = { workspace = true }

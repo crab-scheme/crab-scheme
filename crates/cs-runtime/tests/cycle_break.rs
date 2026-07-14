@@ -50,7 +50,10 @@ fn detector_fires_on_self_loop_observability_preserved() {
     assert!(
         matches!(
             result,
-            cs_core::Value::Fixnum(_) | cs_core::Value::Flonum(_) | cs_core::Value::BigNumber(_) | cs_core::Value::Rational(_)
+            cs_core::Value::Fixnum(_)
+                | cs_core::Value::Flonum(_)
+                | cs_core::Value::BigNumber(_)
+                | cs_core::Value::Rational(_)
         ),
         "(car x) returned {result:?}, expected Number(1)"
     );
@@ -172,7 +175,10 @@ fn iter_7_1_x_y_top_bound_self_cycle_actually_breaks() {
     assert!(
         matches!(
             car_val,
-            cs_core::Value::Fixnum(_) | cs_core::Value::Flonum(_) | cs_core::Value::BigNumber(_) | cs_core::Value::Rational(_)
+            cs_core::Value::Fixnum(_)
+                | cs_core::Value::Flonum(_)
+                | cs_core::Value::BigNumber(_)
+                | cs_core::Value::Rational(_)
         ),
         "(car x) returned {car_val:?}, expected Number"
     );

@@ -122,6 +122,28 @@ pub struct Lowerer<M: Module = JITModule> {
     /// lowering.
     #[allow(dead_code)]
     pair_cdr_func: cranelift_module::FuncId,
+    /// FuncId of `vm_cons_nb_gc(car, car_tag, cdr, cdr_tag) -> i64`
+    /// (cs-vnf.4). Same 4-arg shape as `alloc_pair_func` (tag args
+    /// unused) but skips the `Value` decode/encode round trip —
+    /// `Inst::Cons` lowers to a call against this instead of
+    /// `alloc_pair_func`.
+    cons_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_pair_car_nb_gc(pair) -> i64` (cs-vnf.4).
+    /// `Inst::Car` lowers to a call against this instead of
+    /// `pair_car_func`.
+    pair_car_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_pair_cdr_nb_gc(pair) -> i64` (cs-vnf.4).
+    /// `Inst::Cdr` lowers to a call against this instead of
+    /// `pair_cdr_func`.
+    pair_cdr_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_set_car_nb_gc(p, v) -> i64` (cs-vnf.4).
+    /// `Inst::SetCar` lowers to a call against this instead of
+    /// `set_car_func`.
+    set_car_nb_func: cranelift_module::FuncId,
+    /// FuncId of `vm_set_cdr_nb_gc(p, v) -> i64` (cs-vnf.4).
+    /// `Inst::SetCdr` lowers to a call against this instead of
+    /// `set_cdr_func`.
+    set_cdr_nb_func: cranelift_module::FuncId,
     /// FuncId of `vm_pair_p(v) -> i64`. `Inst::PairP` lowers to a
     /// Cranelift call against this. Helper consumes the Any-tagged
     /// operand box.
@@ -872,6 +894,24 @@ impl Lowerer<JITModule> {
         );
         builder.symbol("vm_pair_car_gc", cs_vm::vm::vm_pair_car_gc as *const u8);
         builder.symbol("vm_pair_cdr_gc", cs_vm::vm::vm_pair_cdr_gc as *const u8);
+        // cs-vnf.4 — NB-native car/cdr/cons/set-car!/set-cdr! fast
+        // path: same consume-on-use / deopt-on-type-miss contract as
+        // the `_gc` siblings above, but skip the `Value` round trip
+        // (see each helper's doc comment in cs-vm for the rationale).
+        // Registered under distinct symbol names so the `_gc`
+        // originals stay untouched for any other caller (e.g. cs-aot
+        // registers its own copy of the `_gc` names independently).
+        builder.symbol(
+            "vm_pair_car_nb_gc",
+            cs_vm::vm::vm_pair_car_nb_gc as *const u8,
+        );
+        builder.symbol(
+            "vm_pair_cdr_nb_gc",
+            cs_vm::vm::vm_pair_cdr_nb_gc as *const u8,
+        );
+        builder.symbol("vm_cons_nb_gc", cs_vm::vm::vm_cons_nb_gc as *const u8);
+        builder.symbol("vm_set_car_nb_gc", cs_vm::vm::vm_set_car_nb_gc as *const u8);
+        builder.symbol("vm_set_cdr_nb_gc", cs_vm::vm::vm_set_cdr_nb_gc as *const u8);
         builder.symbol("vm_pair_p_gc", cs_vm::vm::vm_pair_p_gc as *const u8);
         builder.symbol("vm_null_p_gc", cs_vm::vm::vm_null_p_gc as *const u8);
         builder.symbol(
@@ -1978,6 +2018,33 @@ impl<M: Module> Lowerer<M> {
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_cdr: {e}")))?;
 
+        // cs-vnf.4 — NB-native car/cdr/cons/set-car!/set-cdr! fast
+        // path. `vm_cons_nb_gc` keeps `vm_alloc_pair_gc`'s 4-arg
+        // (car, car_tag, cdr, cdr_tag) shape (tags unused) so it
+        // reuses `alloc_pair_sig`; the accessor/mutator pair reuse
+        // `pair_accessor_sig`/`set_car_sig` shaped signatures below.
+        let cons_nb_func = module
+            .declare_function(
+                "vm_cons_nb_gc",
+                cranelift_module::Linkage::Import,
+                &alloc_pair_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_cons_nb_gc: {e}")))?;
+        let pair_car_nb_func = module
+            .declare_function(
+                "vm_pair_car_nb_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_car_nb_gc: {e}")))?;
+        let pair_cdr_nb_func = module
+            .declare_function(
+                "vm_pair_cdr_nb_gc",
+                cranelift_module::Linkage::Import,
+                &pair_accessor_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_pair_cdr_nb_gc: {e}")))?;
+
         // vm_pair_p / vm_null_p — same shape as the accessors: a
         // single Any-tagged i64 in, an i64 (0/1) out. Both consume
         // the input box.
@@ -2416,6 +2483,23 @@ impl<M: Module> Lowerer<M> {
                 &vector_ref_sig,
             )
             .map_err(|e| JitError::Codegen(format!("declare_function vm_set_cdr_gc: {e}")))?;
+
+        // cs-vnf.4 — vm_set_car_nb_gc / vm_set_cdr_nb_gc. Same
+        // (i64, i64) -> i64 shape as vm_set_car_gc.
+        let set_car_nb_func = module
+            .declare_function(
+                "vm_set_car_nb_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_set_car_nb_gc: {e}")))?;
+        let set_cdr_nb_func = module
+            .declare_function(
+                "vm_set_cdr_nb_gc",
+                cranelift_module::Linkage::Import,
+                &vector_ref_sig,
+            )
+            .map_err(|e| JitError::Codegen(format!("declare_function vm_set_cdr_nb_gc: {e}")))?;
 
         // ADR 0012 D-2 (iter CG) — vm_memv_gc / vm_assv_gc.
         // Same shape as memq/assq.
@@ -4412,6 +4496,11 @@ impl<M: Module> Lowerer<M> {
             alloc_pair_region_func,
             pair_car_func,
             pair_cdr_func,
+            cons_nb_func,
+            pair_car_nb_func,
+            pair_cdr_nb_func,
+            set_car_nb_func,
+            set_cdr_nb_func,
             pair_p_func,
             null_p_func,
             value_clone_func,
@@ -5326,6 +5415,15 @@ impl<M: Module> Lowerer<M> {
                 pair_cdr: self
                     .module
                     .declare_func_in_func(self.pair_cdr_func, builder.func),
+                cons_nb: self
+                    .module
+                    .declare_func_in_func(self.cons_nb_func, builder.func),
+                pair_car_nb: self
+                    .module
+                    .declare_func_in_func(self.pair_car_nb_func, builder.func),
+                pair_cdr_nb: self
+                    .module
+                    .declare_func_in_func(self.pair_cdr_nb_func, builder.func),
                 pair_p: self
                     .module
                     .declare_func_in_func(self.pair_p_func, builder.func),
@@ -5985,6 +6083,12 @@ impl<M: Module> Lowerer<M> {
                 set_cdr: self
                     .module
                     .declare_func_in_func(self.set_cdr_func, builder.func),
+                set_car_nb: self
+                    .module
+                    .declare_func_in_func(self.set_car_nb_func, builder.func),
+                set_cdr_nb: self
+                    .module
+                    .declare_func_in_func(self.set_cdr_nb_func, builder.func),
                 length: self
                     .module
                     .declare_func_in_func(self.length_func, builder.func),
@@ -6679,11 +6783,22 @@ struct NbHelpers {
     #[allow(dead_code)]
     ge: cranelift_codegen::ir::FuncRef,
     // Pair primitives.
+    // cs-vnf.4: `Inst::Cons`/`Car`/`Cdr` now lower to the `_nb`
+    // FuncRefs below instead of these; kept declared (unused) so the
+    // helper-registration plumbing doesn't need to shrink, matching
+    // the `le`/`gt`/`ge` precedent above.
+    #[allow(dead_code)]
     alloc_pair: cranelift_codegen::ir::FuncRef,
     #[cfg(feature = "regions")]
     alloc_pair_region: cranelift_codegen::ir::FuncRef,
+    #[allow(dead_code)]
     pair_car: cranelift_codegen::ir::FuncRef,
+    #[allow(dead_code)]
     pair_cdr: cranelift_codegen::ir::FuncRef,
+    // cs-vnf.4 — NB-native fast path.
+    cons_nb: cranelift_codegen::ir::FuncRef,
+    pair_car_nb: cranelift_codegen::ir::FuncRef,
+    pair_cdr_nb: cranelift_codegen::ir::FuncRef,
     pair_p: cranelift_codegen::ir::FuncRef,
     null_p: cranelift_codegen::ir::FuncRef,
     // Vector primitives.
@@ -6949,8 +7064,15 @@ struct NbHelpers {
     equal_hash: cranelift_codegen::ir::FuncRef,
     fixnum_to_nb: cranelift_codegen::ir::FuncRef,
     // #50 — pair mutate / list / conversions / port / time builtins.
+    // cs-vnf.4: `Inst::SetCar`/`SetCdr` now lower to the `_nb`
+    // FuncRefs below instead of these; kept declared (unused).
+    #[allow(dead_code)]
     set_car: cranelift_codegen::ir::FuncRef,
+    #[allow(dead_code)]
     set_cdr: cranelift_codegen::ir::FuncRef,
+    // cs-vnf.4 — NB-native fast path.
+    set_car_nb: cranelift_codegen::ir::FuncRef,
+    set_cdr_nb: cranelift_codegen::ir::FuncRef,
     length: cranelift_codegen::ir::FuncRef,
     last: cranelift_codegen::ir::FuncRef,
     append_buf: cranelift_codegen::ir::FuncRef,
@@ -7193,16 +7315,20 @@ fn lower_inst_uniform_nb(
                 map.insert(dst, result);
             }
             &Inst::Cons(dst, car, _car_tag, cdr, _cdr_tag) => {
-                // Uniform-NB ignores the per-operand tags emitted by the
-                // specialized-tier translator: both operands are NB i64,
-                // so we pass `JIT_RT_ANY` (which `vm_alloc_pair_gc`
-                // routes through `gc_i64_to_value` = `to_value`).
+                // cs-vnf.4: both operands are already NB i64 in the
+                // uniform-NB tier, so route through `vm_cons_nb_gc`,
+                // which stores them directly into the fresh `Pair`'s
+                // raw `Cell<u64>` slots instead of round-tripping
+                // through `Value` (`vm_alloc_pair_gc`'s `gc_i64_to_value`
+                // + `Pair::new`'s `encode_owned`). The tag args are
+                // unused by the nb helper but kept in the call shape
+                // to match its declared 4-arg signature.
                 let car_v = lookup(map, car)?;
                 let cdr_v = lookup(map, cdr)?;
                 let any_tag = b.ins().iconst(I64, cs_vm::vm::JIT_RT_ANY as i64);
                 let call = b
                     .ins()
-                    .call(helpers.alloc_pair, &[car_v, any_tag, cdr_v, any_tag]);
+                    .call(helpers.cons_nb, &[car_v, any_tag, cdr_v, any_tag]);
                 let result = b.inst_results(call)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(dst, result);
@@ -7227,18 +7353,24 @@ fn lower_inst_uniform_nb(
                 map.insert(dst, result);
             }
             &Inst::Car(dst, src) => {
-                // `vm_pair_car_gc` already decodes via `NanboxValue::to_value`
-                // so it accepts NB_TAG_PAIR inputs natively. Returns an NB
-                // (encoded via `value_to_gc_i64`).
+                // cs-vnf.4: `vm_pair_car_nb_gc` accepts NB_TAG_PAIR
+                // inputs natively (same as `vm_pair_car_gc`) but
+                // returns the car slot's raw NB bits directly via
+                // `Pair::car_raw_nb` — no `Value` round trip. Both
+                // still fall back to the deopt sentinel on a type
+                // miss or a tombstoned slot (handled inside the
+                // helper, not here — see its doc comment for why an
+                // out-of-line call, not raw Cranelift field loads, is
+                // the correctness-preserving choice for this case).
                 let v = lookup(map, src)?;
-                let call = b.ins().call(helpers.pair_car, &[v]);
+                let call = b.ins().call(helpers.pair_car_nb, &[v]);
                 let result = b.inst_results(call)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(dst, result);
             }
             &Inst::Cdr(dst, src) => {
                 let v = lookup(map, src)?;
-                let call = b.ins().call(helpers.pair_cdr, &[v]);
+                let call = b.ins().call(helpers.pair_cdr_nb, &[v]);
                 let result = b.inst_results(call)[0];
                 b.declare_value_needs_stack_map(result);
                 map.insert(dst, result);
@@ -8950,11 +9082,14 @@ fn lower_inst_uniform_nb(
             }
             // #50 — pair mutate / list / conversion / port / time.
             &Inst::SetCar(dst, p, v) => {
-                let r = nb_ptr_call(b, helpers.set_car, &[lookup(map, p)?, lookup(map, v)?]);
+                // cs-vnf.4: `vm_set_car_nb_gc` keeps `v` as a raw NB
+                // payload the whole way through (no decode/re-encode);
+                // see its doc comment in cs-vm.
+                let r = nb_ptr_call(b, helpers.set_car_nb, &[lookup(map, p)?, lookup(map, v)?]);
                 map.insert(dst, r);
             }
             &Inst::SetCdr(dst, p, v) => {
-                let r = nb_ptr_call(b, helpers.set_cdr, &[lookup(map, p)?, lookup(map, v)?]);
+                let r = nb_ptr_call(b, helpers.set_cdr_nb, &[lookup(map, p)?, lookup(map, v)?]);
                 map.insert(dst, r);
             }
             &Inst::Length(dst, lst) => {
