@@ -82,7 +82,7 @@ use rustc_hash::FxBuildHasher;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-mod local_pool;
+pub mod local_pool;
 use local_pool::LocalWorkerPool;
 
 // ---------- Mailbox backing strategy ----------

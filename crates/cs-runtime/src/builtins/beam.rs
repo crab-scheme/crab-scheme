@@ -650,6 +650,12 @@ async fn pump_coroutine(
         YIELDER.with(|y| y.set(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
 
+        // cs-845.4: bump this worker's heartbeat and record which actor is
+        // about to run — the resume/suspend transition the watchdog blames a
+        // stall on. Sound: `actor_ptr` is valid for the same reason ACTOR_CTX
+        // above is (one worker, control strictly alternates).
+        cs_actor::local_pool::heartbeat_running(unsafe { &*actor_ptr }.pid());
+
         let result = co.resume(resume_input);
 
         // Capture the yielder the closure published on the first resume.
@@ -660,6 +666,10 @@ async fn pump_coroutine(
         // run a co-located actor, and it must never observe our stale pointers.
         ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
         YIELDER.with(|y| y.set(std::ptr::null()));
+        // The resume returned (suspend or completion): this worker is no
+        // longer doing CPU-bound actor work, so it should never be blamed
+        // for a stall while cooperatively parked below.
+        cs_actor::local_pool::heartbeat_idle();
 
         // Region-park guard (P0.1): the TLS region stack is shared by every actor
         // co-located on this worker, so suspending (any Yield arm awaits) with an
