@@ -105,28 +105,91 @@ wiring anything in. Two yield paths exist:
   JIT-compiled or walked/VM-interpreted.
 
   I did not find any documented invariant that JIT-compiled frames
-  violate at a suspend point. The empirical test below (a JIT-tiered
-  tail loop suspending mid-loop on a green worker, then resuming and
-  completing the loop from where it suspended) is a **real, functional**
-  test of this — it isn't just a smoke test; it's exactly the failure
-  mode reported (a JIT'd actor loop on a shared coroutine worker).
+  violate at a suspend point.
+
+- **Non-tail self-recursion consumes NATIVE stack, not heap frames.**
+  A separate, distinct risk: green actors run on a corosensei stackful
+  coroutine sized `GREEN_STACK_BYTES` (1 MiB —
+  `crates/cs-runtime/src/builtins/beam.rs`). The VM interpreter's own
+  recursion (e.g. evaluating a non-tail-recursive Scheme call) mostly
+  grows *heap*-allocated VM frames, not the OS/coroutine stack, so
+  recursion depths that are safe under the VM tier are not automatically
+  safe once JIT-compiled: non-tail self-recursion (explicitly untouched
+  by ADR 0031 — see above) compiles to ordinary native `call`
+  instructions, which consume the coroutine's 1 MiB native stack directly,
+  frame by frame. A recursion depth that was fine on the VM tier's heap
+  frames can smash a 1 MiB green stack once JIT-compiled under
+  `CRABSCHEME_ACTOR_JIT=1`. So the realistic failure mode for a
+  non-terminating *non-tail* recursive actor body is a stack overflow
+  (a hard crash), not the permanent-starvation hang this bead
+  investigated. This is a real, separate risk introduced by opting into
+  `CRABSCHEME_ACTOR_JIT=1` and is not mitigated by anything in this fix —
+  flagging it rather than silently leaving it undocumented.
+
+- **Mutual tail recursion is coarser-grained but not a starvation hole.**
+  `drive_jit_tailcalls` (`crates/cs-vm/src/vm.rs:10504`, the ADR-0019
+  proper-tail-call trampoline for tail-position `Call`/`CallGeneral` —
+  i.e. mutual/non-self tail recursion, as opposed to the tail-*self*
+  back-edge ADR 0031 ticks) has no reduction tick in its re-dispatch
+  loop. Preemption still happens (each bounce falls through to the VM's
+  own per-op tick once it re-enters bytecode dispatch, or to the
+  tail-self tick if the bounce target is itself a self-tail-call), but
+  markedly coarser: per exec-actorjit (judge), ~266 yields per 50k
+  iterations of a two-function mutual tail loop vs ~1147 for an
+  equivalent single-function tail-self loop over the same run — roughly
+  4x coarser preemption granularity (I have not independently
+  re-measured these two figures), not a hole that lets a
+  mutual-recursion loop monopolize the worker indefinitely.
+
+  The empirical repro test below (a JIT-tiered tail-*self* loop
+  suspending mid-loop on a green worker, well after tier-up, then
+  resuming and letting a co-located peer run) is a **real, functional**
+  test of the tail-self case specifically — it isn't just a smoke test
+  for that scope; it directly measures the failure mode reported (a
+  JIT'd actor loop on a shared coroutine worker), and empirically fails
+  when the tail-self tick is disabled (see "Verification the test
+  actually catches a regression" below). It does NOT cover the
+  mutual-tail-recursion or non-tail-recursion cases discussed above.
 
 ## Repro test
 
 `crates/cs-runtime/tests/actor_jit_starvation.rs`
-(`jit_enabled_actor_tail_loop_does_not_starve_peer`): forces
-`CRABSCHEME_ACTOR_JIT=1` and `CRABSCHEME_ACTOR_LOCAL_WORKERS=1`, spawns
-two green (`spawn-source-green`) actors on the single forced worker — one
-runs a `busy-loop` tail-recursive self-call to 200,000,000 (far past the
-1024-call JIT tier-up threshold) with no `receive`/`sleep` inside it, the
-other immediately sends a `ping-ok` marker to a collector — and asserts
-the marker arrives within a 10s timeout.
+(`jit_enabled_actor_tail_loop_does_not_starve_peer_post_tier_up`): forces
+`CRABSCHEME_ACTOR_JIT=1` and `CRABSCHEME_ACTOR_LOCAL_WORKERS=1`, spawns a
+green (`spawn-source-green`) `busy-loop` actor (tail-recursive self-call to
+5e10 — chosen so that even running solidly at native speed to completion
+would take far longer than the test's 10s timeouts) alongside an
+immediate "early" ping actor, then — **after a real 300ms wall-clock
+delay**, long enough to guarantee the busy loop has already crossed the
+~1024-self-call JIT tier-up threshold and is executing JIT-compiled
+machine code — spawns a second "post-tier-up" ping actor and asserts
+*that* marker also arrives, within a further 10s timeout.
 
-**Result: passes in 0.02s** (immediate — no starvation observed) with the
-fix in place. This is strong evidence the existing ADR-0031 tick +
-`green_yield_hook` combination correctly preempts a JIT-tiered tail loop
-on a shared green worker once the JIT is actually installed on the actor
-runtime.
+The 300ms delay + second ping is the load-bearing part: an initial
+revision of this test sent only one immediate ping, which the judge
+(exec-actorjit) proved empirically could be — and was — satisfied by an
+ordinary **pre-tier-up VM-tier** reduction tick (the default 2000-op
+budget fires before the loop's self-call count reaches the ~1024 tier-up
+threshold), so it passed even with the JIT-side tick physically removed
+from the codegen. The current version only asserts on the *second*
+(post-tier-up) ping.
+
+**Result: passes in ~0.3-0.35s** with the fix in place (both markers
+delivered, in order).
+
+### Verification the test actually catches a regression
+
+Per the judge's request, I temporarily commented out the
+`vm_jit_tick_reductions` call at the tail-self back-edge
+(`crates/cs-jit-cranelift/src/lowering.rs:6201-6204`), reran the test, and
+confirmed it **fails** (times out after 10s waiting for the
+post-tier-up ping — the busy loop, once tiered up, never yields again and
+monopolizes the worker for the rest of its ~5e10-iteration run, exactly
+the starvation this bead investigates). I then restored the original code
+(`git diff` on `lowering.rs` is now empty) and reran the test to confirm
+it passes again. So the test's assertion is load-bearing for the
+tail-self tick specifically, not a smoke test that would pass
+regardless.
 
 ## What this does NOT prove
 
@@ -167,7 +230,12 @@ process via `OnceLock` in `crates/cs-runtime/src/builtins/beam.rs`.
   failed.
 - `cargo test -p cs-runtime --test jit_conformance`: 8 passed / 0 failed.
 - `cargo test -p cs-runtime --features actor --test actor_jit_starvation`:
-  1 passed / 0 failed (new repro test, JIT forced on).
+  1 passed / 0 failed (repro test, JIT forced on) — and confirmed to FAIL
+  (1 failed / 0 passed) with the tail-self tick temporarily neutered,
+  restored before committing (see "Verification the test actually
+  catches a regression" above).
+- `cargo test -p cs-runtime --test jit_preemption`: 2 passed / 0 failed
+  (threshold bumped from 100 to 500 per judge nit).
 - `cargo test -p cs-runtime --features actor,channel,web` (full suite):
   all visible test binaries green (0 failed across `web_builtins`,
   `walker_tail_depth`, doc-tests, and the rest of the run); no `FAILED`
