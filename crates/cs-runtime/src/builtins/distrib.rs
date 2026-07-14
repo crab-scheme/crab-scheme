@@ -545,6 +545,27 @@ pub fn b_node_poll_ch(args: &[Value], syms: &mut SymbolTable) -> Result<Value, S
     Ok(list)
 }
 
+/// `(node-poll-ch-wait NODE CH TIMEOUT-MS)` — like node-poll-ch, but blocks up
+/// to TIMEOUT-MS for inbound traffic when the channel is empty. Dedicated-thread
+/// actors only.
+pub fn b_node_poll_ch_wait(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("node-poll-ch-wait: expected (node-poll-ch-wait NODE CH TIMEOUT-MS)".into());
+    }
+    let node = name_of(&args[0], syms, "node-poll-ch-wait")?;
+    let ch = chan_of(&args[1], "node-poll-ch-wait")?;
+    let timeout_ms = match &args[2] {
+        Value::Fixnum(n) if *n >= 0 => *n as u64,
+        _ => return Err("node-poll-ch-wait: TIMEOUT-MS must be a non-negative integer".into()),
+    };
+    let msgs = primop_node_poll_ch_wait_value(&node, ch, timeout_ms, syms)?;
+    let mut list = Value::Null;
+    for v in msgs.into_iter().rev() {
+        list = Value::Pair(Pair::new(v, list));
+    }
+    Ok(list)
+}
+
 /// `(node-poll NODE)` — returns a list of the messages delivered to NODE.
 pub fn b_node_poll(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     if args.len() != 1 {
@@ -670,6 +691,7 @@ pub fn distrib_syms_builtins() -> Vec<(
         ("node-poll", b_node_poll),
         ("node-send-ch", b_node_send_ch),
         ("node-poll-ch", b_node_poll_ch),
+        ("node-poll-ch-wait", b_node_poll_ch_wait),
     ]
 }
 
@@ -990,6 +1012,33 @@ pub fn primop_node_poll_ch_value(
     router
         .poll_channel(ch)
         .map_err(|e| format!("node-poll-ch: {e}"))?;
+    let mut out = Vec::new();
+    while let Some((_target, payload)) = router.recv_local_channel(ch) {
+        let mut c = Dec {
+            b: &payload,
+            pos: 0,
+        };
+        out.push(decode_value(&mut c, syms)?);
+    }
+    Ok(out)
+}
+
+/// Blocking variant of [`primop_node_poll_ch_value`]: when channel `ch` has
+/// nothing queued, wait up to `timeout_ms` for ANY inbound frame instead of
+/// returning empty — so a poll loop needs no sleep and mesh hop latency is
+/// delivery latency, not polling granularity (crab-watchstore cw-xq9).
+/// BLOCKS the calling thread: use only from dedicated-thread actors
+/// (`spawn-source-dedicated`), never a shared LocalSet worker.
+pub fn primop_node_poll_ch_wait_value(
+    node: &str,
+    ch: u8,
+    timeout_ms: u64,
+    syms: &mut SymbolTable,
+) -> Result<Vec<Value>, String> {
+    let router = lookup_router(node, "node-poll-ch-wait")?;
+    router
+        .poll_channel_wait(ch, timeout_ms)
+        .map_err(|e| format!("node-poll-ch-wait: {e}"))?;
     let mut out = Vec::new();
     while let Some((_target, payload)) = router.recv_local_channel(ch) {
         let mut c = Dec {

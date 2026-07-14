@@ -61,10 +61,12 @@ pub fn procs() -> Vec<Arc<dyn HostProcedure>> {
         UntypedProc::new("store-cf-create", store_cf_create),
         UntypedProc::new("store-get", store_get),
         UntypedProc::new("store-put", store_put),
+        UntypedProc::new("store-put-many", store_put_many),
         UntypedProc::new("store-delete", store_delete),
         UntypedProc::new("store-write-batch", store_write_batch),
         UntypedProc::new("store-iter", store_iter),
         UntypedProc::new("store-iter-range", store_iter_range),
+        UntypedProc::new("store-range-latest-pb", store_range_latest_pb),
         UntypedProc::new("store-iter-next", store_iter_next),
         UntypedProc::new("store-iter-close", store_iter_close),
         UntypedProc::new("store-seek", store_seek),
@@ -316,6 +318,79 @@ fn store_put(args: &[Value]) -> Result<Value, FfiError> {
     }
     .map_err(|e| FfiError::HostFailure(format!("store-put: {}", e)))?;
     Ok(Value::Unspecified)
+}
+
+/// (store-put-many ID CF ((K . V) ...) [SYNC]) — cw-65x: write a whole
+/// apply-batch as ONE RocksDB WriteBatch + one write. The hot consensus
+/// apply path writes 2 rows per PUT; per-row store-put paid a WriteBatch
+/// alloc + write + FFI round-trip each.
+fn store_put_many(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(arity_err("store-put-many", "3 or 4", args.len()));
+    }
+    let id = expect_fixnum("store-put-many", args, 0)?;
+    let cf_name = expect_string("store-put-many", args, 1)?;
+    let sync = opt_bool(args, 3);
+    let db = db_get(id, "store-put-many")?;
+    let mut batch = WriteBatch::default();
+    let cf = if cf_name == "default" {
+        None
+    } else {
+        Some(db.cf_handle(&cf_name).ok_or_else(|| {
+            FfiError::HostFailure(format!("store-put-many: unknown CF {:?}", cf_name))
+        })?)
+    };
+    let mut cur = args[2].clone();
+    let mut n: i64 = 0;
+    loop {
+        match cur {
+            Value::Null => break,
+            Value::Pair(p) => {
+                let (head, tail) = (p.car(), p.cdr());
+                match &head {
+                    Value::Pair(kv) => {
+                        let k = match &kv.car() {
+                            Value::ByteVector(b) => b.borrow().clone(),
+                            v => {
+                                return Err(FfiError::HostFailure(format!(
+                                    "store-put-many: key not a bytevector: {:?}",
+                                    v.type_name()
+                                )))
+                            }
+                        };
+                        let v = match &kv.cdr() {
+                            Value::ByteVector(b) => b.borrow().clone(),
+                            v => {
+                                return Err(FfiError::HostFailure(format!(
+                                    "store-put-many: value not a bytevector: {:?}",
+                                    v.type_name()
+                                )))
+                            }
+                        };
+                        match &cf {
+                            Some(cf) => batch.put_cf(cf, &k, &v),
+                            None => batch.put(&k, &v),
+                        }
+                        n += 1;
+                    }
+                    _ => {
+                        return Err(FfiError::HostFailure(
+                            "store-put-many: entry not a (K . V) pair".into(),
+                        ))
+                    }
+                }
+                cur = tail;
+            }
+            _ => {
+                return Err(FfiError::HostFailure(
+                    "store-put-many: entries must be a proper list".into(),
+                ))
+            }
+        }
+    }
+    db.write_opt(batch, &write_opts(sync))
+        .map_err(|e| FfiError::HostFailure(format!("store-put-many: {}", e)))?;
+    Ok(Value::Fixnum(n))
 }
 
 fn store_delete(args: &[Value]) -> Result<Value, FfiError> {
@@ -609,6 +684,193 @@ fn store_iter_range(args: &[Value]) -> Result<Value, FfiError> {
     ir.next_id += 1;
     ir.slots.insert(iter_id, IterState { entries, pos: 0 });
     Ok(Value::fixnum(iter_id))
+}
+
+// ---- store-range-latest-pb (cw-2au / LIST-scan wall) ----------------------
+//
+// The etcd-compatible KEY-CF "latest version per user key" range scan, fused
+// scan+decode+protobuf-encode in one native pass. The interpreted per-row loop
+// (Scheme scan -> tuple list -> cross-actor copy -> per-row pb encode) costs
+// ~0.33ms/row, which caps a k8s cluster near 40k pods (a full LIST blows the
+// apiserver's boot deadline). This walks RocksDB directly and returns the
+// CONCATENATED field-2-tagged `repeated KeyValue kvs` submessages of an etcd
+// RangeResponse, so Scheme splices ONE bytevector instead of touching rows.
+//
+// KEY-CF layout (crab-watchstore src/mvcc.scm, cw-zf7):
+//   key   = 0x01 || esc(K) || 0x00 0x00 || INV(u64be(main) || u64be(sub))
+//           esc: each 0x00 in K -> 0x00 0xFF; INV = per-byte complement
+//           (versions sort newest-first within a key group)
+//   value = tag(1: 0=value 1=tombstone) || cr(8) || mr(8) || ver(8) ||
+//           lease(8) || vlen(8) || val    (all u64 big-endian)
+//
+// (store-range-latest-pb db cf start-fk end-fk rev limit keys-only? count-only?)
+//   rev = 0: latest version per key; rev > 0: latest with main <= rev
+//   -> (count more? pb-bytes)   count = live keys in range IGNORING limit;
+//      more? = limit > 0 and count > emitted. Compaction floor checks stay in
+//      Scheme (caller rejects reads below compact-rev before calling).
+fn pb_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            break;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn pb_bytes_field(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+    pb_varint(out, ((field as u64) << 3) | 2);
+    pb_varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+fn pb_uint_field(out: &mut Vec<u8>, field: u32, v: u64) {
+    if v != 0 {
+        pb_varint(out, (field as u64) << 3);
+        pb_varint(out, v);
+    }
+}
+
+fn be64(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for &x in &b[..8] {
+        v = (v << 8) | x as u64;
+    }
+    v
+}
+
+fn store_range_latest_pb(args: &[Value]) -> Result<Value, FfiError> {
+    if args.len() != 8 {
+        return Err(arity_err("store-range-latest-pb", "8", args.len()));
+    }
+    let id = expect_fixnum("store-range-latest-pb", args, 0)?;
+    let cf_name = expect_string("store-range-latest-pb", args, 1)?;
+    let start = expect_bv("store-range-latest-pb", args, 2)?;
+    let end = expect_bv("store-range-latest-pb", args, 3)?;
+    let rev = expect_fixnum("store-range-latest-pb", args, 4)?;
+    let limit = expect_fixnum("store-range-latest-pb", args, 5)?;
+    let keys_only = opt_bool(args, 6);
+    let count_only = opt_bool(args, 7);
+
+    let db = db_get(id, "store-range-latest-pb")?;
+    let mut raw = if cf_name == "default" {
+        db.raw_iterator()
+    } else {
+        let cf = db.cf_handle(&cf_name).ok_or_else(|| {
+            FfiError::HostFailure(format!("store-range-latest-pb: unknown CF {:?}", cf_name))
+        })?;
+        db.raw_iterator_cf(&cf)
+    };
+
+    // find the 0x00 0x00 terminator in a full KEY-CF key (0x00 0xFF = escaped
+    // null mid-key). Returns byte offset of the terminator's first 0x00.
+    fn find_term(fk: &[u8]) -> Option<usize> {
+        let mut i = 1; // skip the NS byte
+        while i + 1 < fk.len() {
+            if fk[i] == 0 {
+                if fk[i + 1] == 0 {
+                    return Some(i);
+                }
+                i += 2; // escaped null
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
+
+    let mut kvs: Vec<u8> = Vec::new();
+    let mut count: i64 = 0;
+    let mut emitted: i64 = 0;
+    let mut user_key: Vec<u8> = Vec::new();
+    let mut kv_buf: Vec<u8> = Vec::new();
+
+    raw.seek(&start);
+    while raw.valid() {
+        let fk = match raw.key() {
+            Some(k) if k < end.as_slice() => k,
+            _ => break,
+        };
+        let term = match find_term(fk) {
+            Some(t) if fk.len() >= t + 2 + 16 => t,
+            _ => {
+                raw.next();
+                continue;
+            }
+        };
+        // group prefix = everything through the terminator; owned so we can
+        // advance the iterator while comparing against it.
+        let prefix: Vec<u8> = fk[..term + 2].to_vec();
+
+        // pick the candidate row: rev==0 -> first (newest); rev>0 -> first
+        // with main <= rev (rows are newest-first).
+        let mut candidate: Option<(u64, Vec<u8>)> = None; // (main, record)
+        loop {
+            let fk = match raw.key() {
+                Some(k) if k < end.as_slice() && k.starts_with(&prefix) => k,
+                _ => break,
+            };
+            let inv = &fk[term + 2..term + 2 + 8];
+            let main = !be64(inv);
+            if rev == 0 || main <= rev as u64 {
+                candidate = Some((main, raw.value().unwrap_or(&[]).to_vec()));
+                break;
+            }
+            raw.next();
+        }
+
+        if let Some((_, rec)) = candidate {
+            // record: tag(1) cr(8) mr(8) ver(8) lease(8) vlen(8) val
+            if rec.len() >= 41 && rec[0] == 0 {
+                let cr = be64(&rec[1..9]);
+                let mr = be64(&rec[9..17]);
+                let ver = be64(&rec[17..25]);
+                let lease = be64(&rec[25..33]);
+                let vlen = be64(&rec[33..41]) as usize;
+                count += 1;
+                if !count_only && (limit == 0 || emitted < limit) {
+                    // unescape the user key: 0x00 0xFF -> 0x00
+                    user_key.clear();
+                    let esc = &prefix[1..term];
+                    let mut i = 0;
+                    while i < esc.len() {
+                        user_key.push(esc[i]);
+                        if esc[i] == 0 {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    kv_buf.clear();
+                    pb_bytes_field(&mut kv_buf, 1, &user_key);
+                    pb_uint_field(&mut kv_buf, 2, cr);
+                    pb_uint_field(&mut kv_buf, 3, mr);
+                    pb_uint_field(&mut kv_buf, 4, ver);
+                    if !keys_only && vlen > 0 && rec.len() >= 41 + vlen {
+                        pb_bytes_field(&mut kv_buf, 5, &rec[41..41 + vlen]);
+                    }
+                    pb_uint_field(&mut kv_buf, 6, lease);
+                    pb_bytes_field(&mut kvs, 2, &kv_buf); // RangeResponse.kvs
+                    emitted += 1;
+                }
+            }
+            // tombstone (rec[0]==1) or malformed: key is dead at this rev — skip.
+        }
+
+        // skip the rest of this key group; the outer `k < end` check ends the
+        // whole scan if the next group starts past the range bound.
+        while matches!(raw.key(), Some(k) if k.starts_with(&prefix)) {
+            raw.next();
+        }
+    }
+
+    let more = limit > 0 && count > emitted;
+    Ok(cons_value(
+        Value::fixnum(count),
+        cons_value(Value::Boolean(more), cons_value(bv_value(kvs), Value::Null)),
+    ))
 }
 
 fn store_iter_next(args: &[Value]) -> Result<Value, FfiError> {

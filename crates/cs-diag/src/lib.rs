@@ -101,7 +101,9 @@ impl SourceMap {
     }
 
     pub fn name(&self, file: FileId) -> &str {
-        if file == FileId::DUMMY {
+        // cw-l5h: same foreign-FileId bounds check as contents()/line_col() — a
+        // cross-actor Diagnostic's FileId may not exist in this actor's map.
+        if file == FileId::DUMMY || (file.0 as usize) >= self.files.len() {
             return "<unknown>";
         }
         &self.files[file.0 as usize].name
