@@ -62,16 +62,22 @@ pub enum SendableValue {
     // dedicated variant needed. cs-runtime/builtins/channel.rs
     // recognizes the shape on inspection and looks the ID up in
     // the process-global ChannelRegistry.
-    /// cs-845.1 same-worker fast-send path: a key into this OS
-    /// thread's `SAME_WORKER_MSGS` table, where the real (already
-    /// deep-cloned) `Value` sits. Only ever produced by
+    /// cs-845.1 same-worker fast-send path: a marker for a real
+    /// (already deep-cloned) `Value` parked in this OS thread's
+    /// `SAME_WORKER_MSGS` side-table, keyed by the receiver's PID.
+    /// `recv` is the receiving actor's PID (the queue key); `seq` is
+    /// a per-receiver monotonic stamp used only to sanity-check FIFO
+    /// order on the pop side. Only ever produced by
     /// [`try_send_same_worker`] and only ever consumed by
     /// [`from_sendable`] running on the *same* worker thread (the
-    /// sender checked colocation before picking this path) — the id
-    /// is `Send`/`Sync` (it's a plain `u64`) so it satisfies
-    /// `Payload`'s bound, but it's meaningless off the thread that
-    /// produced it.
-    Local(u64),
+    /// sender checked colocation before picking this path) — both
+    /// fields are plain `Copy` integers, so this satisfies `Payload`'s
+    /// `Send`/`Sync` bound, but the referenced `Value` lives in a
+    /// thread-local and is meaningless off the thread that produced it.
+    Local {
+        recv: ActorPid,
+        seq: u64,
+    },
 }
 
 /// Project a Scheme `Value` onto a `SendableValue`. Symbols
@@ -184,7 +190,7 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
             let s = format!("<pid:{}>", _pid);
             Value::Symbol(syms.intern(&s))
         }
-        SendableValue::Local(id) => take_same_worker_msg(*id),
+        SendableValue::Local { recv, seq } => take_same_worker_msg(*recv, *seq, syms),
     }
 }
 
@@ -213,10 +219,40 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
 // access to intern it correctly at send time. When the clone hits such a
 // symbol it bails out (`Ok(None)`) and the caller falls back to the
 // general `to_sendable_in`/`from_sendable` path, unchanged.
+/// Per-receiver side-queue for the same-worker fast path. `next_seq` stamps
+/// each parked message with a monotonic id (FIFO sanity check on pop);
+/// `msgs` holds the `(seq, Value)` pairs in send order. Popped front-first on
+/// receive — mailbox marker order matches queue push order on this one thread,
+/// so FIFO relative to cross-worker messages is preserved.
+#[derive(Default)]
+struct SameWorkerQueue {
+    next_seq: u64,
+    msgs: std::collections::VecDeque<(u64, Value)>,
+}
+
 std::thread_local! {
-    static SAME_WORKER_MSGS: std::cell::RefCell<std::collections::HashMap<u64, Value>> =
+    static SAME_WORKER_MSGS: std::cell::RefCell<std::collections::HashMap<ActorPid, SameWorkerQueue>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
-    static NEXT_LOCAL_MSG_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII cleanup for one actor's same-worker fast-path side-queue, keyed by the
+/// actor's own PID (the receiver key). Registered at the top of every actor
+/// body that runs on a `LocalWorkerPool` worker ([`activation_body`] and
+/// [`green_source_body`]), so its `Drop` runs on *every* exit path — normal
+/// return, a Scheme-level error, a panic-unwind, or the future being dropped on
+/// shutdown. Dropping removes the actor's whole queue, so any fast-path
+/// messages parked for it but never received (the actor died with `Local` mail
+/// still queued) are freed instead of leaking for the worker's lifetime. It
+/// only touches the thread-local map — never `rt`/`actor` heap — so its drop
+/// order relative to `co`/`rt`/`actor` is immaterial.
+struct SameWorkerGuard(ActorPid);
+
+impl Drop for SameWorkerGuard {
+    fn drop(&mut self) {
+        SAME_WORKER_MSGS.with(|m| {
+            m.borrow_mut().remove(&self.0);
+        });
+    }
 }
 
 /// Process-wide count of sends that took the same-worker fast path.
@@ -229,19 +265,38 @@ pub fn same_worker_fast_send_count() -> u64 {
     SAME_WORKER_FAST_SENDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Pull a same-worker message back out by id. Only called from
-/// `from_sendable` for a `SendableValue::Local`, which — per the module
-/// doc above — is only ever handed to a receiver running on the same OS
-/// thread that produced it, so the entry is always present exactly once.
-fn take_same_worker_msg(id: u64) -> Value {
-    SAME_WORKER_MSGS.with(|m| {
-        m.borrow_mut().remove(&id).unwrap_or_else(|| {
-            panic!(
-                "cs-845.1: same-worker msg {id} missing on receive (thread/ordering bug in the \
-                 fast-send path)"
-            )
-        })
-    })
+/// Pull a same-worker message back out for receiver `recv`. Only called from
+/// `from_sendable` for a `SendableValue::Local`, which — per the module doc
+/// above — is only ever handed to a receiver running on the same OS thread that
+/// produced it, so the front of `recv`'s queue is normally the matching message
+/// (`seq` confirms FIFO). Any deviation is an *unforeseen* edge, not a
+/// correctness invariant we can abort the whole worker thread over: we
+/// degrade-and-log (a benign opaque `same-worker-message-lost` symbol) so the
+/// blast radius is one dropped/garbled message, never a worker-thread panic.
+fn take_same_worker_msg(recv: ActorPid, seq: u64, syms: &mut SymbolTable) -> Value {
+    let popped = SAME_WORKER_MSGS.with(|m| {
+        m.borrow_mut()
+            .get_mut(&recv)
+            .and_then(|q| q.msgs.pop_front())
+    });
+    match popped {
+        Some((got_seq, v)) => {
+            if got_seq != seq {
+                eprintln!(
+                    "cs-845.1: same-worker message for {recv} out of order (marker seq {seq}, \
+                     queue front seq {got_seq}); FIFO invariant violated — delivering front anyway"
+                );
+            }
+            v
+        }
+        None => {
+            eprintln!(
+                "cs-845.1: same-worker message for {recv} (seq {seq}) missing on receive \
+                 (guard/ordering bug in the fast-send path); dropping message"
+            );
+            Value::Symbol(syms.intern("same-worker-message-lost"))
+        }
+    }
 }
 
 /// Deep-clone `v` into a fresh `Value` tree suitable for handing directly
@@ -328,18 +383,22 @@ fn deep_clone_same_worker(v: &Value, syms: &SymbolTable) -> Result<Option<Value>
     }))
 }
 
-/// Try the same-worker fast path for `(send pid v)`: if `target_worker`
-/// is `Some` and matches the current thread's `LocalWorkerPool` worker
-/// id, deep-clone `v` directly and return a `SendableValue::Local` handle
-/// for it. Returns `Ok(None)` whenever the fast path doesn't apply
-/// (different/unknown worker, or a non-base symbol in the tree) so the
-/// caller can fall back to `to_sendable_in` unchanged. `Err` propagates a
-/// genuine not-sendable rejection (procedure/hashtable/port/promise).
+/// Try the same-worker fast path for `(send pid v)`: if `target_worker` is
+/// `Some` and matches the current thread's `LocalWorkerPool` worker id,
+/// deep-clone `v` directly and reserve a per-receiver FIFO `seq`. Returns
+/// `Ok(Some((recv, seq, cloned)))` — the caller sends the `Local { recv, seq }`
+/// marker and then, *only on send success*, commits `cloned` into `recv`'s
+/// side-queue via [`commit_same_worker_msg`] (so a failed send never parks an
+/// orphan value). Returns `Ok(None)` whenever the fast path doesn't apply
+/// (different/unknown worker, or a non-base symbol in the tree) so the caller
+/// can fall back to `to_sendable_in` unchanged. `Err` propagates a genuine
+/// not-sendable rejection (procedure/hashtable/port/promise).
 fn try_send_same_worker(
     v: &Value,
     syms: &SymbolTable,
+    recv: ActorPid,
     target_worker: Option<usize>,
-) -> Result<Option<SendableValue>, String> {
+) -> Result<Option<(ActorPid, u64, Value)>, String> {
     let same_worker = matches!(
         (target_worker, cs_actor::current_worker_id()),
         (Some(a), Some(b)) if a == b
@@ -350,14 +409,32 @@ fn try_send_same_worker(
     let Some(cloned) = deep_clone_same_worker(v, syms)? else {
         return Ok(None);
     };
-    let id = NEXT_LOCAL_MSG_ID.with(|c| {
-        let id = c.get();
-        c.set(id + 1);
-        id
+    // Reserve the seq now so the marker and the (later) committed queue entry
+    // agree. A reserved-but-never-committed seq (send failed) just leaves a
+    // harmless gap; the pop side matches on the front entry, not on a dense id.
+    let seq = SAME_WORKER_MSGS.with(|m| {
+        let mut m = m.borrow_mut();
+        let q = m.entry(recv).or_default();
+        let seq = q.next_seq;
+        q.next_seq += 1;
+        seq
     });
-    SAME_WORKER_MSGS.with(|m| m.borrow_mut().insert(id, cloned));
+    Ok(Some((recv, seq, cloned)))
+}
+
+/// Commit a deep-cloned fast-path message into receiver `recv`'s side-queue
+/// after its `Local { recv, seq }` marker was successfully delivered. Bumps the
+/// fast-send telemetry counter. Kept separate from [`try_send_same_worker`] so
+/// the parking happens strictly *after* `primop_send` succeeds.
+fn commit_same_worker_msg(recv: ActorPid, seq: u64, cloned: Value) {
+    SAME_WORKER_MSGS.with(|m| {
+        m.borrow_mut()
+            .entry(recv)
+            .or_default()
+            .msgs
+            .push_back((seq, cloned));
+    });
     SAME_WORKER_FAST_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(Some(SendableValue::Local(id)))
 }
 
 fn num_to_sendable(n: &Number) -> Result<SendableValue, String> {
@@ -660,6 +737,9 @@ pub fn primop_spawn_activation(source: String, handler: String) -> Result<ActorP
 /// invoke the handler with `ACTOR_CTX` pointing at this actor for the
 /// duration of that synchronous call only.
 async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: String) {
+    // cs-845.1: free any same-worker fast-path mail still queued for this
+    // actor on every exit path (return / error / panic-unwind / shutdown drop).
+    let _sw_guard = SameWorkerGuard(actor.pid());
     // cs-tds: see the matching comment in `green_source_body` — this
     // future is pinned to one actor-dedicated `LocalWorkerPool` worker
     // thread for its whole life, so disabling JIT tiering here needs no
@@ -950,6 +1030,9 @@ async fn green_source_body(
     entry: String,
     args: Vec<SendableValue>,
 ) {
+    // cs-845.1: free any same-worker fast-path mail still queued for this
+    // actor on every exit path (return / error / panic-unwind / shutdown drop).
+    let _sw_guard = SameWorkerGuard(actor.pid());
     // cs-tds: this whole future lives on one `LocalWorkerPool` worker
     // thread for its entire life (tokio pins `spawn_local` tasks to the
     // thread that owns their `LocalSet`), and that pool is dedicated to
@@ -1265,7 +1348,7 @@ fn sendable_to_datum(s: &SendableValue, out: &mut String) -> Result<(), String> 
         // `from_sendable`. It should never reach datum serialization
         // (spawn-source args always go through `to_sendable_in`, not the
         // fast-send path).
-        SendableValue::Local(_) => {
+        SendableValue::Local { .. } => {
             return Err(
                 "internal error: a same-worker message handle escaped into datum serialization"
                     .into(),
@@ -1984,11 +2067,20 @@ pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, Stri
     // receiver are colocated on the same LocalWorkerPool worker. Falls
     // back to the general to_sendable_in path unchanged otherwise.
     let target_worker = beam_state().actors.local_worker_of(pid);
-    let sv = match try_send_same_worker(&args[1], syms, target_worker)? {
-        Some(sv) => sv,
-        None => to_sendable_in(&args[1], syms)?,
-    };
-    primop_send(pid, sv)?;
+    match try_send_same_worker(&args[1], syms, pid, target_worker)? {
+        Some((recv, seq, cloned)) => {
+            // Send the marker first; only park the value once the marker was
+            // actually delivered. If `primop_send` errors (target just
+            // terminated), we return without committing, so no orphan value is
+            // left in the side-queue.
+            primop_send(pid, SendableValue::Local { recv, seq })?;
+            commit_same_worker_msg(recv, seq, cloned);
+        }
+        None => {
+            let sv = to_sendable_in(&args[1], syms)?;
+            primop_send(pid, sv)?;
+        }
+    }
     Ok(Value::Unspecified)
 }
 
@@ -3974,6 +4066,112 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // cs-845.1 judge fixes: direct unit coverage of the fast-path internals
+    // (no actor runtime needed — these exercise the thread-local side-queue,
+    // the base-symbol gating, and the RAII guard on the calling thread).
+
+    fn as_fixnum(v: &Value) -> i64 {
+        match v {
+            Value::Fixnum(n) => *n,
+            other => panic!("expected fixnum, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn deep_clone_bails_on_nested_non_base_symbol() {
+        // A symbol that resolves through the shared Rc base is safe to copy
+        // verbatim (`is_base` → true); one interned into a table's private
+        // extension is not, and must force the whole clone to bail (`Ok(None)`)
+        // even when buried inside a pair or vector.
+        let base = std::rc::Rc::new({
+            let mut t = SymbolTable::new();
+            t.intern("shared-base-sym");
+            t
+        });
+        let mut ext = SymbolTable::with_base(base);
+        let base_sym = ext.intern("shared-base-sym"); // resolves in base
+        let priv_sym = ext.intern("actor-private-sym"); // extension-only
+        assert!(ext.is_base(base_sym));
+        assert!(!ext.is_base(priv_sym));
+
+        // Bare base symbol: fast path is safe.
+        assert!(matches!(
+            deep_clone_same_worker(&Value::Symbol(base_sym), &ext),
+            Ok(Some(_))
+        ));
+
+        // Non-base symbol NESTED inside a pair: must bail.
+        let nested_pair = Value::Pair(Pair::new(
+            Value::Symbol(base_sym),
+            Value::Pair(Pair::new(Value::Symbol(priv_sym), Value::Null)),
+        ));
+        assert!(matches!(
+            deep_clone_same_worker(&nested_pair, &ext),
+            Ok(None)
+        ));
+
+        // Non-base symbol NESTED inside a vector: must bail too.
+        let nested_vec = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(vec![
+            Value::Fixnum(1),
+            Value::Symbol(priv_sym),
+        ])));
+        assert!(matches!(
+            deep_clone_same_worker(&nested_vec, &ext),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn same_worker_queue_is_fifo() {
+        // Multiple fast-path messages parked for one receiver come back out in
+        // send order (front-first), with the seq stamps matching the markers.
+        let pid = ActorPid {
+            node: 0,
+            local_id: 0x5A5A_0001,
+        };
+        for n in [10_i64, 20, 30] {
+            let seq = SAME_WORKER_MSGS.with(|m| {
+                let mut m = m.borrow_mut();
+                let q = m.entry(pid).or_default();
+                let seq = q.next_seq;
+                q.next_seq += 1;
+                seq
+            });
+            commit_same_worker_msg(pid, seq, Value::Fixnum(n));
+        }
+        let mut syms = SymbolTable::new();
+        assert_eq!(as_fixnum(&take_same_worker_msg(pid, 0, &mut syms)), 10);
+        assert_eq!(as_fixnum(&take_same_worker_msg(pid, 1, &mut syms)), 20);
+        assert_eq!(as_fixnum(&take_same_worker_msg(pid, 2, &mut syms)), 30);
+        // Queue drained; a further pop degrades to the opaque lost-message
+        // symbol rather than panicking.
+        let lost = take_same_worker_msg(pid, 3, &mut syms);
+        assert!(matches!(&lost, Value::Symbol(s) if syms.name(*s) == "same-worker-message-lost"));
+        // Clean up so we don't leave a stray entry for other tests.
+        SAME_WORKER_MSGS.with(|m| {
+            m.borrow_mut().remove(&pid);
+        });
+    }
+
+    #[test]
+    fn guard_drops_pending_queue_on_actor_death() {
+        // An actor that terminates with fast-path mail still queued must not
+        // leak it: the RAII guard removes the actor's whole side-queue on drop.
+        let pid = ActorPid {
+            node: 0,
+            local_id: 0x5A5A_0002,
+        };
+        commit_same_worker_msg(pid, 0, Value::Fixnum(7));
+        assert!(SAME_WORKER_MSGS.with(|m| m.borrow().contains_key(&pid)));
+        {
+            let _guard = SameWorkerGuard(pid);
+            // guard live: entry still present.
+            assert!(SAME_WORKER_MSGS.with(|m| m.borrow().contains_key(&pid)));
+        }
+        // guard dropped: entry (and its pending value) gone.
+        assert!(!SAME_WORKER_MSGS.with(|m| m.borrow().contains_key(&pid)));
     }
 
     #[test]
