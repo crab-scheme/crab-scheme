@@ -70,6 +70,7 @@
 
 #![allow(dead_code)] // some types are public for B3+ consumers; trim later.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -490,6 +491,15 @@ pub(crate) struct ActorState {
     /// `(send pid …)` primop, which routes through
     /// `send_with_cap`.
     soft_cap: AtomicUsize,
+    /// Set by [`Actor::set_error_exit`] when the actor's body detects a
+    /// *Scheme-level* error (an uncaught condition) rather than a Rust
+    /// panic. Every spawn wrapper's cleanup checks this after a body
+    /// returns normally (`Ok(())`/no panic) and — if set — reports
+    /// `ExitReason::Error` instead of `ExitReason::Normal`, so links and
+    /// monitors see the same abnormal-exit signal a panic would produce
+    /// (cs-845.8). `None` (the default) preserves today's Normal-on-clean-
+    /// return behavior.
+    pending_error: Mutex<Option<String>>,
 }
 
 impl ActorState {
@@ -500,6 +510,30 @@ impl ActorState {
             monitored_by: Mutex::new(HashMap::new()),
             trap_exit: AtomicBool::new(false),
             soft_cap: AtomicUsize::new(0),
+            pending_error: Mutex::new(None),
+        }
+    }
+
+    /// Take (clear) the pending Scheme-error exit reason, if any.
+    fn take_pending_error(&self) -> Option<String> {
+        self.pending_error
+            .lock()
+            .expect("pending_error lock poisoned")
+            .take()
+    }
+
+    /// Resolve the `ExitReason` for a body that finished (`Ok`) or
+    /// panicked (`Err`), folding in any Scheme-level error recorded via
+    /// [`Actor::set_error_exit`]. Shared by every spawn wrapper so the
+    /// four actor-body kinds (dedicated, sync-on-task, async, green
+    /// activation) all chain Scheme errors to links/monitors identically.
+    fn resolve_exit_reason<T>(&self, result: &std::thread::Result<T>) -> ExitReason {
+        match result {
+            Ok(_) => match self.take_pending_error() {
+                Some(msg) => ExitReason::Error(msg),
+                None => ExitReason::Normal,
+            },
+            Err(payload) => ExitReason::Error(panic_message(payload)),
         }
     }
 
@@ -611,11 +645,35 @@ pub struct Actor {
     /// (link / monitor / trap_exit) reach the same cells the
     /// terminator reads from in `spawn_async`'s cleanup path.
     pub(crate) state: Arc<ActorState>,
+    /// cs-845.7: this actor's own remaining cs-vm reduction-budget
+    /// countdown, saved across coroutine suspends on a shared green
+    /// worker so co-located actors no longer share (and bleed into)
+    /// one thread_local countdown. `None` means "not yet started a
+    /// slice" — the driver loads the full budget on first resume.
+    /// See `pump_coroutine` in cs-runtime's beam.rs for the
+    /// save/restore switch points; this cell is otherwise untouched
+    /// (dedicated-thread / non-green actors never read or write it).
+    reduction_slice: Cell<Option<u32>>,
 }
 
 impl Actor {
     pub fn pid(&self) -> ActorPid {
         self.pid
+    }
+
+    /// cs-845.7: this actor's saved reduction countdown (the cs-vm
+    /// `VM_TICKS_REMAINING` value at the moment it last suspended), or
+    /// `None` if it hasn't run a slice yet. Read by the green-actor
+    /// driver (`pump_coroutine`) to restore the countdown before
+    /// resuming this actor's coroutine.
+    pub fn reduction_slice(&self) -> Option<u32> {
+        self.reduction_slice.get()
+    }
+
+    /// cs-845.7: save this actor's reduction countdown, read back from
+    /// cs-vm's thread_local right after it suspends.
+    pub fn set_reduction_slice(&self, remaining: u32) {
+        self.reduction_slice.set(Some(remaining));
     }
 
     /// Blocking receive — returns the next message in the
@@ -802,6 +860,33 @@ impl Actor {
     /// Read the current trap-exit setting without changing it.
     pub fn is_trapping_exits(&self) -> bool {
         self.state.trap_exit.load(Ordering::Relaxed)
+    }
+
+    /// Record that this actor's body hit an uncaught *Scheme-level* error
+    /// (as opposed to a Rust panic). The owning spawn wrapper checks this
+    /// once the body future/closure returns normally and reports
+    /// `ExitReason::Error(msg)` to links/monitors instead of `Normal`
+    /// (cs-845.8 — "silent actor death breaks supervision"). Call this
+    /// just before returning/breaking out of the body on an `Err` from the
+    /// Scheme evaluator; the body itself should still return normally
+    /// afterward (no panic needed).
+    ///
+    /// If called more than once, the last message wins (bodies are
+    /// expected to terminate immediately after calling this).
+    ///
+    /// Note for Rust-bodied actors: a body that merely `break`s/returns on
+    /// a `receive()` `Err` (or any internal failure) still exits `Normal`
+    /// unless it calls this first — opting into error-exit semantics is
+    /// the body's responsibility. Also note link cascades are transitive:
+    /// a non-trapping linked actor killed by this Error re-propagates an
+    /// `Exit` to *its* links (reason strings nest per hop), matching
+    /// Erlang's exit-signal propagation.
+    pub fn set_error_exit(&self, msg: impl Into<String>) {
+        *self
+            .state
+            .pending_error
+            .lock()
+            .expect("pending_error lock poisoned") = Some(msg.into());
     }
 
     // ---- Bounded mailbox ----
@@ -1146,17 +1231,17 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
+                reduction_slice: Cell::new(None),
             };
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut actor)));
-            let reason = match &result {
-                Ok(()) => ExitReason::Normal,
-                Err(payload) => {
-                    let msg = panic_message(payload);
-                    eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
-                    ExitReason::Error(msg)
-                }
-            };
+            if let Err(payload) = &result {
+                eprintln!(
+                    "cs-actor {pid_for_cleanup}: panicked: {}",
+                    panic_message(payload)
+                );
+            }
+            let reason = actor.state.resolve_exit_reason(&result);
             inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
         });
 
@@ -1234,6 +1319,11 @@ impl ActorSystem {
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
         let state_for_actor = Arc::clone(&state);
+        // `body` takes `Actor` by value, so `state_for_actor` above is
+        // consumed building it; keep an independent clone alive across the
+        // `.await` so cleanup can still read the Scheme-error flag it set
+        // (cs-845.8) even though the `Actor` itself is gone by then.
+        let state_for_reason = Arc::clone(&state);
         let mailbox_for_actor = mailbox.clone();
         let pid_for_cleanup = pid;
 
@@ -1243,6 +1333,7 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state: state_for_actor,
+                reduction_slice: Cell::new(None),
             };
             // Wrap in AssertUnwindSafe + catch_unwind so a panic in
             // body() doesn't poison the whole runtime. Tokio's
@@ -1250,14 +1341,13 @@ impl ActorSystem {
             // log-and-deregister semantics as `spawn`.
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let result = futures::FutureExt::catch_unwind(fut).await;
-            let reason = match &result {
-                Ok(()) => ExitReason::Normal,
-                Err(payload) => {
-                    let msg = panic_message(payload);
-                    eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
-                    ExitReason::Error(msg)
-                }
-            };
+            if let Err(payload) = &result {
+                eprintln!(
+                    "cs-actor {pid_for_cleanup}: panicked: {}",
+                    panic_message(payload)
+                );
+            }
+            let reason = state_for_reason.resolve_exit_reason(&result);
             inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
         });
 
@@ -1295,6 +1385,7 @@ impl ActorSystem {
                 mailbox: mailbox_for_actor,
                 system: system_for_actor,
                 state,
+                reduction_slice: Cell::new(None),
             };
             let fut = std::panic::AssertUnwindSafe(body(actor));
             let _ = futures::FutureExt::catch_unwind(fut).await;
@@ -1326,6 +1417,27 @@ impl ActorSystem {
     fn local_pool(&self) -> &LocalWorkerPool {
         self.local_pool
             .get_or_init(|| LocalWorkerPool::new(Self::local_worker_count()))
+    }
+
+    /// cs-845.7 (diagnostic/test seam): run `job` on one of the
+    /// local-pool worker threads, inside its `LocalSet` context. Jobs
+    /// interleave with — never preempt — the green-actor task polls on
+    /// that thread, so a job observes/mutates the worker's thread-locals
+    /// (e.g. cs-vm's reduction countdown) only at task boundaries.
+    /// Round-robin across workers; with
+    /// `CRABSCHEME_ACTOR_LOCAL_WORKERS=1` it deterministically targets
+    /// THE green worker, which the per-actor reduction-accounting tests
+    /// rely on. Returns `false` if the chosen worker has shut down.
+    #[doc(hidden)]
+    pub fn run_on_local_worker(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        self.local_pool().dispatch(|load_guard| {
+            // Not an actor: drop the LoadGuard immediately, which undoes
+            // the increment `dispatch` just made — net-zero effect on the
+            // worker's live-actor count, exactly right for a transient
+            // diagnostic job that shouldn't skew P2C placement.
+            drop(load_guard);
+            Box::new(job)
+        })
     }
 
     /// Spawn an actor whose body future may be **`!Send`** — it can hold
@@ -1377,35 +1489,47 @@ impl ActorSystem {
         let system_for_actor = self.inner.clone();
         let inner_for_cleanup = self.inner.clone();
         let state_for_actor = Arc::clone(&state);
+        // See the matching comment in `spawn_async_with_kind` — `body` takes
+        // `Actor` by value, so keep an independent handle on the state alive
+        // past the `Actor`'s lifetime to read the Scheme-error flag (cs-845.8).
+        let state_for_reason = Arc::clone(&state);
         let mailbox_for_actor = mailbox.clone();
         let pid_for_cleanup = pid;
 
         // The job closure is `Send` (captures only `Send` data); it runs
         // on the worker thread, where it builds the `!Send` future and
-        // `spawn_local`s it. The future never crosses back.
-        let dispatched = self.local_pool().dispatch(Box::new(move || {
-            let actor = Actor {
-                pid,
-                mailbox: mailbox_for_actor,
-                system: system_for_actor,
-                state: state_for_actor,
-            };
-            tokio::task::spawn_local(async move {
-                // Mirror `spawn_async`'s panic capture: a panicking actor
-                // logs + deregisters rather than aborting the worker.
-                let fut = std::panic::AssertUnwindSafe(body(actor));
-                let result = futures::FutureExt::catch_unwind(fut).await;
-                let reason = match &result {
-                    Ok(()) => ExitReason::Normal,
-                    Err(payload) => {
-                        let msg = panic_message(payload);
-                        eprintln!("cs-actor {pid_for_cleanup}: panicked: {msg}");
-                        ExitReason::Error(msg)
-                    }
+        // `spawn_local`s it. The future never crosses back. `dispatch`
+        // hands us a `LoadGuard` for whichever worker it placed us on
+        // (power-of-two-choices); moving it into the spawned future
+        // keeps that worker's live-actor count accurate until this
+        // actor exits (or panics — `LoadGuard::drop` runs either way).
+        let dispatched = self.local_pool().dispatch(move |load_guard| {
+            Box::new(move || {
+                let actor = Actor {
+                    pid,
+                    mailbox: mailbox_for_actor,
+                    system: system_for_actor,
+                    state: state_for_actor,
+                    reduction_slice: Cell::new(None),
                 };
-                inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
-            });
-        }));
+                tokio::task::spawn_local(async move {
+                    let _load_guard = load_guard;
+                    // Mirror `spawn_async`'s panic capture: a panicking
+                    // actor logs + deregisters rather than aborting the
+                    // worker.
+                    let fut = std::panic::AssertUnwindSafe(body(actor));
+                    let result = futures::FutureExt::catch_unwind(fut).await;
+                    if let Err(payload) = &result {
+                        eprintln!(
+                            "cs-actor {pid_for_cleanup}: panicked: {}",
+                            panic_message(payload)
+                        );
+                    }
+                    let reason = state_for_reason.resolve_exit_reason(&result);
+                    inner_for_cleanup.on_actor_termination(pid_for_cleanup, reason);
+                });
+            })
+        });
 
         if !dispatched {
             // Only reachable if the pool has shut down (system teardown).

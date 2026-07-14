@@ -15,6 +15,26 @@ use cs_actor::{ActorPid, Payload};
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 
+/// Whether JIT tiering should stay enabled for actor bodies. Default is
+/// `false` (JIT disabled — see the `set_jit_enabled(false)` call sites in
+/// `activation_body` / `green_source_body` / `run_actor_body`): a prior
+/// perf branch (perf/actor-vm-jit) found a JIT-tiered CPU-bound actor could
+/// starve a co-located peer on a shared `LocalSet` worker, for only a
+/// marginal (~5%) throughput gain.
+///
+/// `CRABSCHEME_ACTOR_JIT=1` opts back in (cs-845.6 investigation). Read
+/// once via `OnceLock` — actor worker threads are long-lived and the value
+/// is fixed for the process, so there's no need to re-read the env on
+/// every body invocation.
+fn actor_jit_enabled_override() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CRABSCHEME_ACTOR_JIT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// A subset of `cs_core::Value` safe to ship across actor
 /// boundaries.
 ///
@@ -88,8 +108,8 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
         // the destination would assign new marks anyway.
         Value::Identifier { name, .. } => Ok(SendableValue::Symbol(syms.name(*name).to_string())),
         Value::Pair(p) => {
-            let head = to_sendable_in(&p.car.borrow(), syms)?;
-            let tail = to_sendable_in(&p.cdr.borrow(), syms)?;
+            let head = to_sendable_in(&p.car(), syms)?;
+            let tail = to_sendable_in(&p.cdr(), syms)?;
             Ok(SendableValue::Pair(Box::new(head), Box::new(tail)))
         }
         Value::Vector(v) => {
@@ -480,31 +500,45 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
     // cs-tds: see the matching comment in `green_source_body` — this
     // future is pinned to one actor-dedicated `LocalWorkerPool` worker
     // thread for its whole life, so disabling JIT tiering here needs no
-    // restore.
-    cs_vm::vm::set_jit_enabled(false);
+    // restore. cs-845.6: `CRABSCHEME_ACTOR_JIT=1` opts back in.
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // Shared-Runtime: overlay this worker's shared base (builtins + bundled libs)
     // instead of a full Runtime::new() per actor (same lever as green_source_body).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
+    // cs-845.6: JIT only tiers a closure up if `install_jit` registered the
+    // tier-up hook on this runtime — `set_jit_enabled` alone (above) just
+    // controls whether the VM dispatch loop *consults* jit_ptr(); without
+    // this the JIT never compiles anything even with the flag on.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // VM bytecode tier for the handler (see run_scheme_body re: no JIT). The
     // handler is loaded as a VM closure; `apply_value` (below, per message)
     // delegates VM closures to the VM caller, so each invocation runs on the VM.
     // Cached per source per worker — activation actors sharing a handler body
     // reuse the compiled bytecode (closures share the cached code chunks).
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-activation>", &source) {
-        eprintln!("spawn-activation: loading actor source failed: {d:?}");
+        let msg = format!("spawn-activation: loading actor source failed: {d:?}");
+        eprintln!("{msg}");
+        // cs-845.8: load-phase failure is an abnormal exit too — chain it.
+        actor.set_error_exit(msg);
         return;
     }
     let handler_proc = match rt.lookup(&handler) {
         Some(v @ Value::Procedure(_)) => v,
         Some(other) => {
-            eprintln!(
+            let msg = format!(
                 "spawn-activation: top-level `{handler}` is {}, not a procedure",
                 other.type_name()
             );
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
         None => {
-            eprintln!("spawn-activation: no top-level `{handler}` defined in the source");
+            let msg = format!("spawn-activation: no top-level `{handler}` defined in the source");
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
     };
@@ -523,7 +557,13 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
             Ok(Value::Boolean(false)) => break, // handler asked to stop
             Ok(_) => {}
             Err(e) => {
-                eprintln!("spawn-activation: handler `{handler}` raised: {e}");
+                let msg = format!("spawn-activation: handler `{handler}` raised: {e}");
+                eprintln!("{msg}");
+                // cs-845.8: an uncaught Scheme error is an abnormal exit —
+                // chain it to links/monitors as ExitReason::Error, same as a
+                // Rust panic would (previously this fell through to a quiet
+                // ExitReason::Normal).
+                actor.set_error_exit(msg);
                 break;
             }
         }
@@ -657,13 +697,36 @@ async fn pump_coroutine(
         YIELDER.with(|y| y.set(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
 
+        // cs-845.7: load THIS actor's own saved reduction countdown into
+        // the shared cs-vm thread_local before resuming it, so a
+        // co-located actor's leftover countdown never bleeds in. A
+        // fresh actor (no saved slice yet) gets a full budget.
+        let actor_ref = unsafe { &*actor_ptr };
+        cs_vm::vm::set_ticks_remaining(
+            actor_ref
+                .reduction_slice()
+                .unwrap_or_else(|| cs_vm::vm::reduction_budget().saturating_sub(1)),
+        );
+
         // cs-845.4: bump this worker's heartbeat and record which actor is
         // about to run — the resume/suspend transition the watchdog blames a
         // stall on. Sound: `actor_ptr` is valid for the same reason ACTOR_CTX
         // above is (one worker, control strictly alternates).
-        cs_actor::local_pool::heartbeat_running(unsafe { &*actor_ptr }.pid());
+        cs_actor::local_pool::heartbeat_running(actor_ref.pid());
 
         let result = co.resume(resume_input);
+
+        // cs-845.7: save the countdown back into THIS actor's state right
+        // after it suspends/returns, before a co-located actor's resume
+        // can observe (or overwrite) the shared thread_local. Budget
+        // exhaustion (`CoYield::Yield`) means the slice was fully spent —
+        // refill to a fresh full budget rather than saving the just-
+        // reloaded near-zero value, matching "your slice is spent".
+        if matches!(result, CoroutineResult::Yield(CoYield::Yield)) {
+            actor_ref.set_reduction_slice(cs_vm::vm::reduction_budget().saturating_sub(1));
+        } else {
+            actor_ref.set_reduction_slice(cs_vm::vm::ticks_remaining());
+        }
 
         // Capture the yielder the closure published on the first resume.
         if cached_yielder.is_null() {
@@ -729,6 +792,16 @@ async fn pump_coroutine(
             CoroutineResult::Yield(CoYield::IoWrite { handle, bytes }) => {
                 resume_input = CoResume::IoWrite(driver_tcp_send(handle, bytes).await);
             }
+            #[cfg(feature = "ffi-trait")]
+            CoroutineResult::Yield(CoYield::Blocking(op)) => {
+                // Run the blocking stdlib op (file I/O, subprocess wait,
+                // DNS/connect) on tokio's blocking threadpool instead of
+                // blocking this worker — releasing it for co-located actors.
+                resume_input = CoResume::Blocking(match tokio::task::spawn_blocking(op).await {
+                    Ok(res) => res,
+                    Err(e) => Err(format!("blocking op panicked: {e}")),
+                });
+            }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
                 checkin_stack(co.into_stack(), stack_class);
@@ -789,14 +862,19 @@ async fn green_source_body(
     // thread that owns their `LocalSet`), and that pool is dedicated to
     // actor bodies — so disabling JIT tiering here is a once-per-task,
     // no-restore-needed equivalent of disabling it once at worker-thread
-    // startup. See `cs_vm::vm::set_jit_enabled` doc.
-    cs_vm::vm::set_jit_enabled(false);
+    // startup. See `cs_vm::vm::set_jit_enabled` doc. cs-845.6:
+    // `CRABSCHEME_ACTOR_JIT=1` opts back in.
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // Shared-Runtime: a cheap per-actor Runtime overlaying this worker's shared
     // base (builtins + bundled libs), instead of a full `Runtime::new()` per
     // actor. The body's defines land in the per-actor overlay env; builtins /
     // libraries resolve through to the shared base. This is the green-threads
     // memory lever (N actors → one base + N small overlays).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
+    // cs-845.6: see the matching comment in `activation_body`.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // Load on the VM tier in the driver frame (no YIELDER installed yet:
     // top-level `(define …)`s don't park). Cached per source per worker — actors
     // running the same body reuse the compiled bytecode (sharing its code
@@ -807,13 +885,18 @@ async fn green_source_body(
     // so a pathologically slow compile here is watchdog-invisible. Accepted:
     // the watchdog targets blocking *bodies*, and compiles are bounded.)
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-source-green>", &source) {
-        eprintln!("spawn-source(green): loading actor source failed: {d:?}");
+        let msg = format!("spawn-source(green): loading actor source failed: {d:?}");
+        eprintln!("{msg}");
+        // cs-845.8: load-phase failure is an abnormal exit too — chain it.
+        actor.set_error_exit(msg);
         return;
     }
     let call = match resolve_and_build_call(&rt, &entry, &args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("spawn-source(green): {e}");
+            let msg = format!("spawn-source(green): {e}");
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
     };
@@ -838,15 +921,15 @@ async fn green_source_body(
     // Termination parity with the dedicated path (`scheme_source_entry`) and the
     // activation path (`activation_body`): a *Scheme-level* error (the body
     // returned `Err` — including a trap-exit `Err` from `(raw-receive)`) is
-    // surfaced loudly and the actor exits cleanly → `ExitReason::Normal` via
-    // `spawn_local_activation`'s wrapper. A *Rust panic* propagates out of this
-    // future and that wrapper's `catch_unwind` maps it to `ExitReason::Error`,
-    // which `on_actor_termination` then chains to linked actors / monitors —
-    // identical to the dedicated `spawn_async` path. (No Scheme primitive exits
-    // with a custom Error reason; abnormal exits come only from panics.) The
-    // `pump_coroutine` ClearCtx guard keeps that panic path hygienic.
+    // surfaced loudly AND recorded via `Actor::set_error_exit` (cs-845.8), so
+    // `spawn_local_activation`'s wrapper reports `ExitReason::Error` — chained
+    // to linked actors / monitors exactly as a Rust panic would be. A panic
+    // still propagates out of this future and is caught the same way (the
+    // `pump_coroutine` ClearCtx guard keeps that path hygienic).
     if let Err(e) = pump_coroutine(co, actor_ptr, StackClass::Green).await {
-        eprintln!("spawn-source(green): actor `{entry}` terminated: {e}");
+        let msg = format!("spawn-source(green): actor `{entry}` terminated: {e}");
+        eprintln!("{msg}");
+        actor.set_error_exit(msg);
     }
 }
 
@@ -959,11 +1042,16 @@ async fn driver_tcp_send(handle: i64, bytes: Vec<u8>) -> Result<(), String> {
 /// onto the actor's worker thread cleanly. The `Rc` graph is created *inside*
 /// the closure, on that thread, and never escapes it.
 fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
-    Arc::new(move |_actor, args| {
+    Arc::new(move |actor, args| {
         if let Err(e) = run_scheme_body(&source, &entry, &args) {
             // The actor terminates (the body returned/aborted). Surface the
             // reason loudly rather than dying silently — Article VI.
-            eprintln!("spawn-source: actor `{entry}` terminated: {e}");
+            let msg = format!("spawn-source: actor `{entry}` terminated: {e}");
+            eprintln!("{msg}");
+            // cs-845.8: chain the Scheme-level error to links/monitors as
+            // ExitReason::Error (previously only a Rust panic did this; a
+            // clean-return-after-logging looked identical to a Normal exit).
+            actor.set_error_exit(msg);
         }
     })
 }
@@ -975,6 +1063,10 @@ fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
 /// invoking us.
 fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<(), String> {
     let mut rt = crate::Runtime::new();
+    // cs-845.6: see the matching comment in `activation_body`.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // Run the actor body on the VM bytecode tier, not the walker — the VM is
     // ~2.8× faster than the tree-walker on this kind of code (RESP parse,
     // command dispatch, store ops, Raft logic). JIT is intentionally NOT
@@ -1174,14 +1266,15 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // contexts never reach here, so the hook stays None and
     // the dispatch loop's per-op tick is a pure counter no-op.
     let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
-    // cs-tds: actor bodies run VM-only — the JIT is deliberately dropped
-    // for actors (perf/actor-vm-jit found it hung concurrent SET, with
-    // only marginal gain elsewhere). Clearing this per-invocation lets
+    // cs-tds: actor bodies run VM-only by default — the JIT is deliberately
+    // dropped for actors (perf/actor-vm-jit found it hung concurrent SET,
+    // with only marginal gain elsewhere). Clearing this per-invocation lets
     // the Call/TailCall dispatch loop skip the tier-bump/jit_ptr checks
     // that only matter for JIT tiering; a pooled worker thread reused by
     // a non-actor caller has it restored to `true` by the Guard below.
+    // cs-845.6: `CRABSCHEME_ACTOR_JIT=1` opts back in.
     let prev_jit_enabled = cs_vm::vm::jit_enabled();
-    cs_vm::vm::set_jit_enabled(false);
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // parallel-runtime C4.5: bridge the BR sweep's yield
     // hook to cs-vm's reduction counter. The same
     // per-iteration tick the bytecode dispatch loop uses
@@ -1304,6 +1397,12 @@ enum CoYield {
     /// worker), then resume with `IoWrite(..)`. See [`cooperative_tcp_send_hook`].
     #[cfg(feature = "stdlib-net")]
     IoWrite { handle: i64, bytes: Vec<u8> },
+    /// A generic blocking stdlib op (file I/O, subprocess wait, DNS/connect) —
+    /// cs-845.3. Run `op` on a `spawn_blocking` thread (releasing the worker)
+    /// instead of blocking it in place, then resume with `Blocking(..)`. See
+    /// [`cooperative_blocking_hook`] and `cs_ffi::blocking`.
+    #[cfg(feature = "ffi-trait")]
+    Blocking(cs_ffi::blocking::BlockingOp),
 }
 
 /// What the driver passes back *into* the coroutine on resume — the coroutine's
@@ -1323,6 +1422,10 @@ enum CoResume {
     /// Resume value after an `IoWrite`: success or the write error.
     #[cfg(feature = "stdlib-net")]
     IoWrite(Result<(), String>),
+    /// Resume value after a `Blocking` op: the erased result `spawn_blocking`
+    /// produced (or a panic message if the blocking task panicked).
+    #[cfg(feature = "ffi-trait")]
+    Blocking(Result<Box<dyn std::any::Any + Send>, String>),
 }
 
 std::thread_local! {
@@ -2881,6 +2984,34 @@ pub fn cooperative_tcp_send_hook(handle: i64, bytes: &[u8]) -> Option<Result<(),
     }
 }
 
+/// Cooperative-blocking hook (cs-845.3) — the generic counterpart of
+/// [`cooperative_sleep_hook`]/[`cooperative_tcp_recv_hook`] for stdlib ops
+/// that don't have a bespoke async equivalent (file I/O, subprocess wait,
+/// DNS/connect). Matches `cs_ffi::blocking::BlockingHook`'s signature exactly
+/// so it installs directly into `cs-stdlib-fs`/`cs-stdlib-process`/
+/// `cs-stdlib-net`'s `install_cooperative_blocking`.
+///
+/// Unlike the other cooperative hooks this always returns `Some`: with no
+/// coroutine driver active on this thread (no [`YIELDER`]), it just runs
+/// `op` inline — identical to the caller doing the blocking call directly —
+/// rather than pushing that decision back onto the caller.
+#[cfg(feature = "ffi-trait")]
+pub fn cooperative_blocking_hook(
+    op: cs_ffi::blocking::BlockingOp,
+) -> Option<Result<Box<dyn std::any::Any + Send>, String>> {
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        return Some(op());
+    }
+    // Sound: see `cooperative_sleep_hook`.
+    match unsafe { (*yielder).suspend(CoYield::Blocking(op)) } {
+        CoResume::Blocking(res) => Some(res),
+        _ => Some(Err(
+            "blocking op: internal error (resumed without a result)".into(),
+        )),
+    }
+}
+
 /// `(raw-receive)` blocks until a message arrives;
 /// `(raw-receive timeout-ms)` returns `'*timeout*` if the deadline
 /// passes without one. System messages (Exit/Down) surface as
@@ -2931,8 +3062,8 @@ fn proper_list(v: &Value) -> Option<Vec<Value>> {
         match cur {
             Value::Null => return Some(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             _ => return None,
         }
@@ -2951,8 +3082,8 @@ pub fn b_beam_load_module(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     for entry in pairs {
         match entry {
             Value::Pair(p) => {
-                let k = value_to_str(&p.car.borrow(), syms, "load-module!")?;
-                let v = to_sendable_in(&p.cdr.borrow(), syms)?;
+                let k = value_to_str(&p.car(), syms, "load-module!")?;
+                let v = to_sendable_in(&p.cdr(), syms)?;
                 exports.insert(k, v);
             }
             other => {

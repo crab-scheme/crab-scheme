@@ -43,12 +43,17 @@ fn jit_tail_loop_ticks_reductions() {
     assert_eq!(rt.format_value(&v, cs_core::WriteMode::Display), "50000");
     // Pre-fix, only the ~1024 pre-tier-up VM iterations ticked, so the
     // count would cap near 1024/50 ≈ 20. With the back-edge tick every
-    // iteration ticks → ~50000/50 ≈ 1000. A threshold of 100 cleanly
-    // proves the JIT-compiled portion is ticking.
+    // iteration ticks → ~50000/50 ≈ 1000. cs-845.6 (judge fix): the old
+    // threshold of 100 had gone stale — a neutered tick still produces
+    // ~167 yields (a bit more than the naive ~20 estimate, since the VM
+    // dispatch loop itself keeps ticking on every bytecode op right up to
+    // tier-up, and per-tier-up-attempt overhead adds a few more), so 100
+    // no longer has teeth. 500 cleanly separates "no JIT-side tick"
+    // (~167) from "JIT-side tick present" (~1000).
     assert!(
-        yields > 100,
+        yields > 500,
         "JIT-compiled tail loop must tick reductions (got {yields} yields; \
-         pre-fix this caps near ~20 — only the pre-tier-up VM iterations)"
+         a neutered JIT-side tick caps near ~167 here, not the full ~1000)"
     );
 }
 

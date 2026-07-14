@@ -97,18 +97,18 @@ fn hashtable_walks_keys_values_and_custom_fns() {
     let hash_proc = Pair::new(Value::Boolean(true), Value::Null);
     let equiv_proc = Pair::new(Value::Boolean(true), Value::Null);
 
-    let ht = Hashtable {
-        items: RefCell::new(vec![
+    let ht = Hashtable::from_parts(
+        vec![
             (Value::Pair(kp1.clone()), Value::Pair(vp1.clone())),
             (Value::Pair(kp2.clone()), Value::Pair(vp2.clone())),
-        ]),
-        eq_kind: HtEqKind::Custom,
-        custom: Some(cs_core::CustomHashFns {
+        ],
+        HtEqKind::Custom,
+        Some(cs_core::CustomHashFns {
             hash: Value::Pair(hash_proc.clone()),
             equiv: Value::Pair(equiv_proc.clone()),
         }),
-        index: RefCell::new(std::collections::HashMap::new()),
-    };
+        std::collections::HashMap::new(),
+    );
 
     let got = collected_addrs(&ht);
     let mut expected = vec![
@@ -127,12 +127,12 @@ fn hashtable_walks_keys_values_and_custom_fns() {
 fn hashtable_no_custom_emits_only_kv() {
     let kp = Pair::new(Value::Boolean(true), Value::Null);
     let vp = Pair::new(Value::Boolean(false), Value::Null);
-    let ht = Hashtable {
-        items: RefCell::new(vec![(Value::Pair(kp.clone()), Value::Pair(vp.clone()))]),
-        eq_kind: HtEqKind::Eq,
-        custom: None,
-        index: RefCell::new(std::collections::HashMap::new()),
-    };
+    let ht = Hashtable::from_parts(
+        vec![(Value::Pair(kp.clone()), Value::Pair(vp.clone()))],
+        HtEqKind::Eq,
+        None,
+        std::collections::HashMap::new(),
+    );
     let got = collected_addrs(&ht);
     let mut expected = vec![Gc::as_addr(&kp), Gc::as_addr(&vp)];
     expected.sort();

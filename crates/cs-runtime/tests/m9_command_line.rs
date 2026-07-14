@@ -55,7 +55,7 @@ fn extract_string_list(v: &Value, rt: &Runtime) -> Vec<String> {
         match cur {
             Value::Null => break,
             Value::Pair(p) => {
-                let car = p.car.borrow().clone();
+                let car = p.car();
                 match car {
                     Value::String(s) => out.push(s.borrow().clone()),
                     other => panic!(
@@ -63,7 +63,7 @@ fn extract_string_list(v: &Value, rt: &Runtime) -> Vec<String> {
                         rt.format_value(&other, cs_core::WriteMode::Write)
                     ),
                 }
-                cur = p.cdr.borrow().clone();
+                cur = p.cdr();
             }
             other => panic!("improper list: {:?}", other),
         }

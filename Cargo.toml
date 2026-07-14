@@ -201,6 +201,11 @@ cs-store = { path = "crates/cs-store" }
 rocksdb = "0.21"
 
 # External crates
+# Global allocator (cs-vnf.2) — swaps the system allocator for mimalloc
+# in the CLI binary and the AOT level-3 runtime archive. Default
+# features (secure mode off) for max throughput on alloc-heavy Scheme
+# workloads.
+mimalloc = "0.1"
 logos = "0.14"
 num-bigint = "0.4"
 num-rational = "0.4"
