@@ -563,7 +563,7 @@ async fn drive_handler(
     handler: &Value,
     msg: Value,
 ) -> Result<Value, String> {
-    let rt_ptr: *mut crate::Runtime = rt;
+    let rt_ptr = CoPtr::new(rt);
     let actor_ptr: *mut cs_actor::Actor = actor;
     let handler = handler.clone();
 
@@ -574,9 +574,9 @@ async fn drive_handler(
                 // Publish the yielder FIRST, before the handler can suspend: on the
                 // first resume the driver can't pre-install it (the closure hasn't
                 // run yet), so the closure seeds it here.
-                YIELDER.with(|y| y.set(yielder as *const _));
+                YIELDER.with(|y| y.install(yielder as *const _ as *mut _));
                 // Sound: see fn doc — the driver is parked in `resume()` right now.
-                let rt = unsafe { &mut *rt_ptr };
+                let rt = unsafe { rt_ptr.get_mut() };
                 rt.apply_value(&handler, &[msg])
             },
         );
@@ -626,8 +626,8 @@ async fn pump_coroutine(
     struct ClearCtx;
     impl Drop for ClearCtx {
         fn drop(&mut self) {
-            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-            YIELDER.with(|y| y.set(std::ptr::null()));
+            ACTOR_CTX.with(|c| c.clear());
+            YIELDER.with(|y| y.clear());
         }
     }
     let _clear_ctx = ClearCtx;
@@ -639,15 +639,15 @@ async fn pump_coroutine(
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
     // co-located actor that ran during our suspend clobbered the thread-local).
-    let mut cached_yielder: *const Yielder<CoResume, CoYield> = std::ptr::null();
+    let mut cached_yielder: *mut Yielder<CoResume, CoYield> = std::ptr::null_mut();
     // The value handed to the next `resume`: ignored on the first resume; `Woke`
     // after a sleep; the mailbox result after a receive.
     let mut resume_input = CoResume::Woke;
 
     loop {
         // Install OUR actor's context for the duration of this resume only.
-        ACTOR_CTX.with(|c| c.set(actor_ptr));
-        YIELDER.with(|y| y.set(cached_yielder));
+        ACTOR_CTX.with(|c| c.install(actor_ptr));
+        YIELDER.with(|y| y.install(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
 
         let result = co.resume(resume_input);
@@ -658,8 +658,8 @@ async fn pump_coroutine(
         }
         // Clear context BEFORE any await: while we're parked, the LocalSet may
         // run a co-located actor, and it must never observe our stale pointers.
-        ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-        YIELDER.with(|y| y.set(std::ptr::null()));
+        ACTOR_CTX.with(|c| c.clear());
+        YIELDER.with(|y| y.clear());
 
         // Region-park guard (P0.1): the TLS region stack is shared by every actor
         // co-located on this worker, so suspending (any Yield arm awaits) with an
@@ -797,7 +797,7 @@ async fn green_source_body(
         }
     };
 
-    let rt_ptr: *mut crate::Runtime = &mut rt;
+    let rt_ptr = CoPtr::new(&mut rt);
     let actor_ptr: *mut cs_actor::Actor = &mut actor;
     // `co` declared after `rt`/`actor` (drop-order — see fn doc). The closure
     // seeds the yielder, then runs the WHOLE body; its (raw-receive)/(sleep)
@@ -806,9 +806,9 @@ async fn green_source_body(
         Coroutine::with_stack(
             checkout_stack(StackClass::Green),
             move |yielder, _first: CoResume| {
-                YIELDER.with(|y| y.set(yielder as *const _));
+                YIELDER.with(|y| y.install(yielder as *const _ as *mut _));
                 // Sound: the driver is parked in `resume()` right now (see fn doc).
-                let rt = unsafe { &mut *rt_ptr };
+                let rt = unsafe { rt_ptr.get_mut() };
                 rt.eval_str_via_vm("<spawn-source-green-body>", &call)
                     .map_err(|d| format!("actor body raised: {d:?}"))
             },
@@ -1144,7 +1144,7 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // worker thread inside block_in_place; the Guard clears it
     // before the closure returns or unwinds.
     let ptr: *mut cs_actor::Actor = actor;
-    ACTOR_CTX.with(|c| c.set(ptr));
+    ACTOR_CTX.with(|c| c.install(ptr));
     REDUCTIONS.with(|c| c.set(0));
     // parallel-runtime C2.2: install the reduction-yield hook
     // for this worker thread. cs-actor::tokio_yield_hook
@@ -1181,7 +1181,7 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     }
     impl Drop for Guard {
         fn drop(&mut self) {
-            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+            ACTOR_CTX.with(|c| c.clear());
             REDUCTIONS.with(|c| c.set(0));
             // Restore the previous hook (typically None) so a
             // pooled worker thread reused by a non-actor caller
@@ -1201,13 +1201,180 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     entry(actor, args);
 }
 
+// cs-845.9: checked accessor for a raw-pointer thread-local bridge.
+//
+// `ACTOR_CTX` and `YIELDER` (below) are `!Send` raw pointers threaded through a
+// `thread_local!` so deeply-nested Scheme builtins can reach a coroutine's
+// driver/actor without every call signature carrying them. The soundness
+// invariants (never null when dereferenced, installed by and only read on the
+// installing thread, reinstalled before every resume / cleared before every
+// await) are today enforced purely by comment + discipline — a real UAF/data
+// race surface if a future refactor moves a resume/clear off its documented
+// spot. `CheckedTls<T>` keeps the exact same raw-pointer, zero-indirection
+// representation in release builds (the debug-only fields disappear via
+// `#[cfg(debug_assertions)]`, so `size_of::<CheckedTls<T>>() ==
+// size_of::<*mut T>()` in release) while adding two checks in debug/test
+// builds:
+//   - **thread-id**: every non-null read is asserted to happen on the same
+//     thread that performed the most recent `install` — the pointer must
+//     never cross a thread boundary.
+//   - **generation**: a counter bumped on every `install`/`clear`. A caller
+//     that captured a generation before a suspend point can assert (via
+//     [`CheckedTls::deref_checked`]) that no intervening clear/reinstall cycle
+//     happened while it was parked — the classic "yielder installed by a
+//     previous pump iteration, read stale after a suspend" bug class.
+struct CheckedTls<T> {
+    ptr: std::cell::Cell<*mut T>,
+    #[cfg(debug_assertions)]
+    generation: std::cell::Cell<u64>,
+    #[cfg(debug_assertions)]
+    owner: std::cell::Cell<Option<std::thread::ThreadId>>,
+}
+
+// Test-only: production instances only ever live in `thread_local!` storage
+// (which needs no `Sync` bound), so a real build stays `!Sync`. The misuse
+// tests below deliberately share one instance across a `std::thread::spawn`
+// boundary (synchronized via `JoinHandle::join`) to exercise the wrong-thread
+// debug_assert — that needs a `'static` reference reachable from both
+// threads, hence `Sync` here in test builds only.
+#[cfg(test)]
+unsafe impl<T> Sync for CheckedTls<T> {}
+
+impl<T> CheckedTls<T> {
+    const fn new() -> Self {
+        CheckedTls {
+            ptr: std::cell::Cell::new(std::ptr::null_mut()),
+            #[cfg(debug_assertions)]
+            generation: std::cell::Cell::new(0),
+            #[cfg(debug_assertions)]
+            owner: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Install `ptr` for the current thread. Bumps the generation and records
+    /// the installing thread (debug builds only) — a subsequent `get`/
+    /// `deref_checked` from a different thread, or against a stale captured
+    /// generation, fails loudly instead of silently reading whatever memory
+    /// the raw pointer happens to still point at.
+    fn install(&self, ptr: *mut T) {
+        #[cfg(debug_assertions)]
+        {
+            self.generation.set(self.generation.get().wrapping_add(1));
+            self.owner.set(Some(std::thread::current().id()));
+        }
+        self.ptr.set(ptr);
+    }
+
+    /// Clear to null. Bumps the generation, same as `install` — a generation
+    /// captured before this clear is now provably stale.
+    fn clear(&self) {
+        #[cfg(debug_assertions)]
+        {
+            self.generation.set(self.generation.get().wrapping_add(1));
+        }
+        self.ptr.set(std::ptr::null_mut());
+    }
+
+    /// Raw pointer read (may be null — callers that treat null as "not
+    /// installed" keep doing so). In debug builds, any non-null read is
+    /// asserted to happen on the thread that installed it.
+    fn get(&self) -> *mut T {
+        let p = self.ptr.get();
+        #[cfg(debug_assertions)]
+        if !p.is_null() {
+            if let Some(owner) = self.owner.get() {
+                debug_assert_eq!(
+                    owner,
+                    std::thread::current().id(),
+                    "CheckedTls: dereferenced on a different thread than installed it"
+                );
+            }
+        }
+        p
+    }
+
+    /// The current generation counter (debug builds only — see the type doc).
+    /// Only exercised by the misuse tests today; kept as the seam a future
+    /// suspend-spanning caller captures before parking.
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
+    fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Like [`Self::get`], but additionally debug_asserts the generation
+    /// still matches `expected` — i.e. no `install`/`clear` happened on this
+    /// TLS slot since the caller captured `expected` (typically just before a
+    /// suspend point). In release builds this is identical to `get`.
+    /// Only exercised by the misuse tests today (see `generation`).
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
+    fn deref_checked(&self, expected: u64) -> *mut T {
+        debug_assert_eq!(
+            self.generation.get(),
+            expected,
+            "CheckedTls: stale generation — TLS was cleared/reinstalled since the caller captured it"
+        );
+        self.get()
+    }
+}
+
+/// A raw pointer captured for a coroutine closure's lifetime (the `rt_ptr`
+/// bridges in [`drive_handler`] / [`green_source_body`]): not TLS, but the
+/// same single-thread / strictly-alternating-control soundness argument
+/// applies (see those functions' safety docs). `CoPtr` keeps the bare-pointer
+/// representation in release (the owning-thread field is
+/// `#[cfg(debug_assertions)]`-only) while debug/test builds assert the
+/// dereferencing thread matches the thread that captured the pointer.
+struct CoPtr<T> {
+    ptr: *mut T,
+    #[cfg(debug_assertions)]
+    owner: std::thread::ThreadId,
+}
+
+// Test-only: production only ever moves a `CoPtr` into a same-thread
+// coroutine closure (never across a real thread boundary — `Coroutine`
+// itself has no `Send` bound, same as the raw pointer it replaces), so a
+// real build stays `!Send`. The misuse test below deliberately moves one
+// into a `std::thread::spawn` closure to exercise the wrong-thread
+// debug_assert.
+#[cfg(test)]
+unsafe impl<T> Send for CoPtr<T> {}
+
+impl<T> CoPtr<T> {
+    fn new(r: &mut T) -> Self {
+        CoPtr {
+            ptr: r as *mut T,
+            #[cfg(debug_assertions)]
+            owner: std::thread::current().id(),
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold the discipline documented at the call site: the
+    /// pointee outlives this `CoPtr`, and this is the only live reference at
+    /// the time of the call (strictly-alternating coroutine/driver control).
+    // `mut_from_ref` is the point of this type: it reproduces the raw
+    // `unsafe { &mut *rt_ptr }` it replaces, with the aliasing discipline
+    // documented above and asserted (thread-id) in debug builds.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self) -> &mut T {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.owner,
+            std::thread::current().id(),
+            "CoPtr: dereferenced on a different thread than captured it"
+        );
+        unsafe { &mut *self.ptr }
+    }
+}
+
 // ActorContext: thread-local pointer to the currently-running
 // Actor so per-actor Scheme builtins ((self), (raw-receive))
 // can find their context without it being threaded through
 // every builtin signature.
 std::thread_local! {
-    static ACTOR_CTX: std::cell::Cell<*mut cs_actor::Actor> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static ACTOR_CTX: CheckedTls<cs_actor::Actor> = const { CheckedTls::new() };
 
     /// Per-actor reduction counter (Erlang's "reductions" — a
     /// proxy for work done). Bumped by `(bump-reductions! N)`
@@ -1229,8 +1396,7 @@ std::thread_local! {
     /// (same single-thread raw-pointer discipline as `ACTOR_CTX`). Non-null only
     /// while a coroutine-driven handler is on the stack; `(sleep)` reads it to
     /// decide cooperative-suspend vs. plain `thread::sleep`.
-    static YIELDER: std::cell::Cell<*const Yielder<CoResume, CoYield>> =
-        const { std::cell::Cell::new(std::ptr::null()) };
+    static YIELDER: CheckedTls<Yielder<CoResume, CoYield>> = const { CheckedTls::new() };
 
     /// Per-worker pool of recycled coroutine stacks (mmap-backed, with a guard
     /// page). A handler that never sleeps checks a stack out, runs to `Return`,
@@ -3096,6 +3262,91 @@ pub fn beam_syms_builtins() -> Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // cs-845.9: deliberate-misuse tests for `CheckedTls` / `CoPtr` — these are
+    // debug-only guards (the fields the assertions read don't exist in a
+    // release build), so the whole module is gated the same way the checks
+    // are.
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "dereferenced on a different thread")]
+    fn checked_tls_wrong_thread_panics() {
+        static TLS: CheckedTls<i32> = CheckedTls::new();
+        let mut val = 7;
+        TLS.install(&mut val as *mut i32);
+        // Installed on this (the test) thread; reading it from a spawned
+        // thread must trip the thread-id debug_assert. Propagate the
+        // spawned thread's actual panic payload (via `resume_unwind`, not
+        // `.expect`) so `#[should_panic(expected = ..)]` sees its message.
+        if let Err(payload) = std::thread::spawn(|| {
+            let _ = TLS.get();
+        })
+        .join()
+        {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stale generation")]
+    fn checked_tls_deref_after_clear_panics() {
+        static TLS: CheckedTls<i32> = CheckedTls::new();
+        let mut val = 7;
+        TLS.install(&mut val as *mut i32);
+        let stale_gen = TLS.generation();
+        TLS.clear();
+        // `clear` bumped the generation, so asserting against the
+        // pre-clear generation must panic — this is the "deref after
+        // clear"/"stale pointer across a suspend" bug class caught.
+        let _ = TLS.deref_checked(stale_gen);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn checked_tls_reinstall_after_clear_is_fresh_generation() {
+        static TLS: CheckedTls<i32> = CheckedTls::new();
+        let mut a = 1;
+        let mut b = 2;
+        TLS.install(&mut a as *mut i32);
+        let gen_a = TLS.generation();
+        TLS.clear();
+        TLS.install(&mut b as *mut i32);
+        let gen_b = TLS.generation();
+        assert_ne!(
+            gen_a, gen_b,
+            "install after a clear must bump the generation"
+        );
+        // A caller that captured `gen_b` right after this install may
+        // legitimately deref — no panic.
+        assert_eq!(TLS.deref_checked(gen_b), &mut b as *mut i32);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "dereferenced on a different thread")]
+    fn co_ptr_wrong_thread_panics() {
+        let mut val = 7i32;
+        let co = CoPtr::new(&mut val);
+        if let Err(payload) = std::thread::spawn(move || unsafe {
+            let _ = co.get_mut();
+        })
+        .join()
+        {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn co_ptr_same_thread_is_fine() {
+        let mut val = 7i32;
+        let co = CoPtr::new(&mut val);
+        unsafe {
+            *co.get_mut() += 1;
+        }
+        assert_eq!(val, 8);
+    }
 
     #[test]
     fn round_trip_atoms() {
