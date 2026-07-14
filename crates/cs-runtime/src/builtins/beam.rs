@@ -4016,6 +4016,51 @@ mod tests {
         }
     }
 
+    /// A/B micro-benchmark: cs-845.2's `to_sendable_in_for_message` (SymbolId
+    /// fast path for base-table symbols) vs. the pre-cs-845.2 general
+    /// `to_sendable_in` path (always `Symbol(String)`, always re-interned by
+    /// name on decode) that every cross-worker `send` used before this
+    /// change. `#[ignore]` (it's a throughput measurement, not a
+    /// correctness check) — run with
+    /// `cargo test --release -p cs-runtime --features actor --lib \
+    ///  cross_worker_message_symbol_ab_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cross_worker_message_symbol_ab_bench() {
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let car = worker_a.intern("car"); // base symbol, present in both tables
+        let v = Value::Symbol(car);
+        const N: u32 = 2_000_000;
+
+        let before = std::time::Instant::now();
+        for _ in 0..N {
+            let sv = to_sendable_in(&v, &worker_a).expect("encode");
+            std::hint::black_box(from_sendable(&sv, &mut worker_b));
+        }
+        let before_elapsed = before.elapsed();
+
+        let after = std::time::Instant::now();
+        for _ in 0..N {
+            let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+            std::hint::black_box(from_sendable(&sv, &mut worker_b));
+        }
+        let after_elapsed = after.elapsed();
+
+        let before_rate = N as f64 / before_elapsed.as_secs_f64();
+        let after_rate = N as f64 / after_elapsed.as_secs_f64();
+        println!(
+            "cs-845.2 symbol fast-path A/B ({N} sends each):\n  \
+             before (to_sendable_in, string): {:>10.0} msg/s ({:?})\n  \
+             after  (to_sendable_in_for_message, id): {:>10.0} msg/s ({:?})\n  \
+             speedup: {:.2}x",
+            before_rate,
+            before_elapsed,
+            after_rate,
+            after_elapsed,
+            after_rate / before_rate
+        );
+    }
+
     #[test]
     fn cross_worker_message_send_recv_symbol_identity_via_actors() {
         // Full end-to-end wiring check, through the real `b_beam_send`
