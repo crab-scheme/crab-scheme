@@ -198,8 +198,13 @@ struct Worker {
 pub struct LocalWorkerPool {
     workers: Vec<Worker>,
     cursor: AtomicUsize,
+    /// Process-unique pool identity, tagged onto every stall event so
+    /// observers (tests especially) can tell this pool's watchdog output
+    /// apart from any other pool's in the same process.
+    pool_id: u64,
     /// The stall watchdog (cs-845.4), only spawned when
-    /// `CRABSCHEME_WORKER_WATCHDOG_MS` is set; `None` (zero cost beyond the
+    /// `CRABSCHEME_WORKER_WATCHDOG_MS` is set (or an explicit `stall_ms` is
+    /// passed to [`Self::with_watchdog`]); `None` (zero cost beyond the
     /// heartbeat stores) otherwise.
     watchdog: Option<JoinHandle<()>>,
     watchdog_shutdown: Arc<AtomicBool>,
@@ -208,8 +213,19 @@ pub struct LocalWorkerPool {
 impl LocalWorkerPool {
     /// Build a pool of `n_workers` threads (clamped to ≥ 1). Each thread
     /// stands up its own current-thread runtime + `LocalSet` and parks
-    /// waiting for jobs.
+    /// waiting for jobs. Watchdog config comes from
+    /// `CRABSCHEME_WORKER_WATCHDOG_MS` (default OFF).
     pub fn new(n_workers: usize) -> Self {
+        Self::with_watchdog(n_workers, stall_ms_from_env())
+    }
+
+    /// [`Self::new`] with an explicit watchdog threshold instead of the env
+    /// var — `Some(stall_ms)` enables the stall watchdog, `None` leaves it
+    /// off. Lets tests configure the watchdog without racy process-global
+    /// `set_var` calls.
+    pub fn with_watchdog(n_workers: usize, stall_ms: Option<u64>) -> Self {
+        static POOL_IDS: AtomicU64 = AtomicU64::new(0);
+        let pool_id = POOL_IDS.fetch_add(1, Ordering::Relaxed);
         let n = n_workers.max(1);
         let mut workers = Vec::with_capacity(n);
         for i in 0..n {
@@ -236,21 +252,28 @@ impl LocalWorkerPool {
             });
         }
         let watchdog_shutdown = Arc::new(AtomicBool::new(false));
-        let watchdog = stall_ms_from_env().map(|stall_ms| {
+        let watchdog = stall_ms.map(|stall_ms| {
             let heartbeats: Vec<Arc<WorkerHeartbeat>> =
                 workers.iter().map(|w| Arc::clone(&w.heartbeat)).collect();
             let shutdown = Arc::clone(&watchdog_shutdown);
             std::thread::Builder::new()
                 .name("cs-actor-worker-watchdog".to_string())
-                .spawn(move || watchdog_main(heartbeats, stall_ms, shutdown))
+                .spawn(move || watchdog_main(pool_id, heartbeats, stall_ms, shutdown))
                 .expect("spawn cs-actor worker watchdog thread")
         });
         Self {
             workers,
             cursor: AtomicUsize::new(0),
+            pool_id,
             watchdog,
             watchdog_shutdown,
         }
+    }
+
+    /// This pool's process-unique identity — matches the `pool_id` on stall
+    /// events emitted by this pool's watchdog.
+    pub fn pool_id(&self) -> u64 {
+        self.pool_id
     }
 
     /// Hand `job` to the next worker (round-robin). The job runs on that
@@ -297,38 +320,60 @@ impl Drop for LocalWorkerPool {
     }
 }
 
-/// One stall-episode transition, for the `#[cfg(test)]` hook below. Tests
-/// prefer this over scraping stderr — it's exact and race-free.
-#[cfg(test)]
+/// One stall-episode transition, mirrored into the [`stall_events`] hook
+/// alongside the eprintln. Observers prefer this over scraping stderr —
+/// it's exact and race-free.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-struct StallEvent {
-    worker: usize,
-    pid: Option<ActorPid>,
-    age_ms: u64,
-    recovered: bool,
+pub struct StallEvent {
+    /// Which pool's watchdog emitted this (see [`LocalWorkerPool::pool_id`]).
+    pub pool_id: u64,
+    /// Worker index within that pool.
+    pub worker: usize,
+    /// The blamed / recovering actor. `None` only on the recovery emitted
+    /// after the stalled actor already finished its `resume()` (running pid
+    /// cleared before the watchdog's next poll saw the fresh heartbeat).
+    pub pid: Option<ActorPid>,
+    /// Heartbeat age at emission. 0 on a pid-less recovery — there is no
+    /// meaningful "stall age" once the worker is idle again.
+    pub age_ms: u64,
+    /// `false` = stall warning, `true` = recovery.
+    pub recovered: bool,
 }
 
-/// Test-only sink for watchdog stall/recovery events (cs-845.4). Not
-/// compiled into non-test builds.
-#[cfg(test)]
-mod test_hooks {
+/// Observation hook for watchdog stall/recovery events (cs-845.4). Hidden,
+/// stability-exempt API: exists so tests (including cs-runtime integration
+/// tests, which can't see a `#[cfg(test)]` hook across crates) can assert on
+/// watchdog behavior without scraping stderr. Recording only happens on
+/// stall-episode transitions (rare), never on the hot path.
+#[doc(hidden)]
+pub mod stall_events {
     use super::StallEvent;
+    use std::collections::VecDeque;
     use std::sync::{Mutex, OnceLock};
 
-    fn sink() -> &'static Mutex<Vec<StallEvent>> {
-        static SINK: OnceLock<Mutex<Vec<StallEvent>>> = OnceLock::new();
-        SINK.get_or_init(|| Mutex::new(Vec::new()))
+    /// Bounded so a long-lived process with the watchdog enabled can't grow
+    /// the sink without bound; observers snapshot promptly in practice.
+    const CAP: usize = 1024;
+
+    fn sink() -> &'static Mutex<VecDeque<StallEvent>> {
+        static SINK: OnceLock<Mutex<VecDeque<StallEvent>>> = OnceLock::new();
+        SINK.get_or_init(|| Mutex::new(VecDeque::new()))
     }
 
     pub(super) fn record(ev: StallEvent) {
-        sink().lock().unwrap().push(ev);
+        let mut q = sink().lock().unwrap();
+        if q.len() >= CAP {
+            q.pop_front();
+        }
+        q.push_back(ev);
     }
 
-    /// Drain every event recorded so far (across all pools/watchdogs in this
-    /// test process — tests should use a distinct, generous stall_ms and
-    /// check `>= 1` occurrences rather than exact counts if run in parallel).
-    pub(super) fn drain() -> Vec<StallEvent> {
-        std::mem::take(&mut sink().lock().unwrap())
+    /// A copy of every event currently retained (process-wide, all pools).
+    /// Non-destructive so concurrent observers can't steal each other's
+    /// events — filter by `pool_id` and/or `pid` for your own.
+    pub fn snapshot() -> Vec<StallEvent> {
+        sink().lock().unwrap().iter().cloned().collect()
     }
 }
 
@@ -346,7 +391,12 @@ fn stall_ms_from_env() -> Option<u64> {
 /// `stall_ms / 2` and log a warning the moment a worker with a currently-
 /// running actor goes stale, then a recovery line once it ticks again.
 /// Diagnostic only — never touches the worker, never preempts.
-fn watchdog_main(heartbeats: Vec<Arc<WorkerHeartbeat>>, stall_ms: u64, shutdown: Arc<AtomicBool>) {
+fn watchdog_main(
+    pool_id: u64,
+    heartbeats: Vec<Arc<WorkerHeartbeat>>,
+    stall_ms: u64,
+    shutdown: Arc<AtomicBool>,
+) {
     let poll_every = Duration::from_millis((stall_ms / 2).max(1));
     // Per-worker "already warned, awaiting recovery" flag — local to this
     // thread, so no extra atomics on the hot path.
@@ -360,8 +410,8 @@ fn watchdog_main(heartbeats: Vec<Arc<WorkerHeartbeat>>, stall_ms: u64, shutdown:
                 if stalled[idx] {
                     stalled[idx] = false;
                     eprintln!("cs-actor watchdog: worker {idx} recovered");
-                    #[cfg(test)]
-                    test_hooks::record(StallEvent {
+                    stall_events::record(StallEvent {
+                        pool_id,
                         worker: idx,
                         pid: None,
                         age_ms: 0,
@@ -379,8 +429,8 @@ fn watchdog_main(heartbeats: Vec<Arc<WorkerHeartbeat>>, stall_ms: u64, shutdown:
                          progress, threshold {stall_ms}ms) — actor {pid} may be blocking the \
                          worker non-cooperatively"
                     );
-                    #[cfg(test)]
-                    test_hooks::record(StallEvent {
+                    stall_events::record(StallEvent {
+                        pool_id,
                         worker: idx,
                         pid: Some(pid),
                         age_ms: age,
@@ -390,8 +440,8 @@ fn watchdog_main(heartbeats: Vec<Arc<WorkerHeartbeat>>, stall_ms: u64, shutdown:
             } else if stalled[idx] {
                 stalled[idx] = false;
                 eprintln!("cs-actor watchdog: worker {idx} recovered (actor {pid})");
-                #[cfg(test)]
-                test_hooks::record(StallEvent {
+                stall_events::record(StallEvent {
+                    pool_id,
                     worker: idx,
                     pid: Some(pid),
                     age_ms: age,
@@ -510,13 +560,18 @@ mod tests {
 
     // ---------- cs-845.4: worker-stall watchdog ----------
     //
-    // `CRABSCHEME_WORKER_WATCHDOG_MS` is process-wide env state, so these
-    // three tests share one lock to avoid interleaving with each other (or
-    // with any other test in this binary that happens to touch the same
-    // var, though none currently do).
-    fn watchdog_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    // These tests configure the watchdog via the explicit `with_watchdog`
+    // constructor (no racy process-global `set_var`) and read the shared
+    // `stall_events` sink via non-destructive `snapshot()`, filtering on
+    // their own pool's `pool_id` — so they are safe to run in parallel with
+    // each other and with any other pool-constructing test in this binary.
+
+    /// This pool's events recorded so far.
+    fn my_events(pool: &LocalWorkerPool) -> Vec<StallEvent> {
+        stall_events::snapshot()
+            .into_iter()
+            .filter(|e| e.pool_id == pool.pool_id())
+            .collect()
     }
 
     /// A worker whose job closure directly simulates a non-cooperative
@@ -538,11 +593,7 @@ mod tests {
     /// produces a stall event naming the blamed pid.
     #[test]
     fn watchdog_reports_a_genuine_stall() {
-        let _guard = watchdog_env_lock().lock().unwrap();
-        test_hooks::drain(); // clear anything left by a previous test
-        std::env::set_var("CRABSCHEME_WORKER_WATCHDOG_MS", "100");
-
-        let pool = LocalWorkerPool::new(1);
+        let pool = LocalWorkerPool::with_watchdog(1, Some(100));
         let pid = ActorPid {
             node: 0,
             local_id: 42,
@@ -555,14 +606,13 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut events = Vec::new();
         while Instant::now() < deadline {
-            events = test_hooks::drain();
+            events = my_events(&pool);
             if events.iter().any(|e| !e.recovered) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(pool);
-        std::env::remove_var("CRABSCHEME_WORKER_WATCHDOG_MS");
 
         let stall = events
             .iter()
@@ -575,11 +625,7 @@ mod tests {
     /// blocking the OS thread) never trips the watchdog.
     #[test]
     fn watchdog_stays_quiet_during_cooperative_work() {
-        let _guard = watchdog_env_lock().lock().unwrap();
-        test_hooks::drain();
-        std::env::set_var("CRABSCHEME_WORKER_WATCHDOG_MS", "200");
-
-        let pool = LocalWorkerPool::new(1);
+        let pool = LocalWorkerPool::with_watchdog(1, Some(200));
         let pid = ActorPid {
             node: 0,
             local_id: 7,
@@ -597,9 +643,8 @@ mod tests {
         // Give the watchdog several poll cycles (poll_every = 100ms) to have
         // had a chance to (wrongly) fire.
         std::thread::sleep(Duration::from_millis(600));
-        let events = test_hooks::drain();
+        let events = my_events(&pool);
         drop(pool);
-        std::env::remove_var("CRABSCHEME_WORKER_WATCHDOG_MS");
 
         assert!(
             events.iter().all(|e| e.recovered),
@@ -611,11 +656,7 @@ mod tests {
     /// reports recovery.
     #[test]
     fn watchdog_reports_recovery_after_stall_clears() {
-        let _guard = watchdog_env_lock().lock().unwrap();
-        test_hooks::drain();
-        std::env::set_var("CRABSCHEME_WORKER_WATCHDOG_MS", "100");
-
-        let pool = LocalWorkerPool::new(1);
+        let pool = LocalWorkerPool::with_watchdog(1, Some(100));
         let pid = ActorPid {
             node: 0,
             local_id: 99,
@@ -623,12 +664,16 @@ mod tests {
         dispatch_blocking_job(&pool, pid, Duration::from_millis(300));
 
         // Wait long enough to see both the stall and its recovery: the
-        // block lasts 300ms, threshold is 100ms, poll every 50ms.
+        // block lasts 300ms, threshold is 100ms, poll every 50ms. Events
+        // arrive in emission order within the sink, so a recovery at a
+        // later index than a stall really did follow it.
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut saw_stall = false;
         let mut saw_recovery = false;
         while Instant::now() < deadline && !(saw_stall && saw_recovery) {
-            for e in test_hooks::drain() {
+            saw_stall = false;
+            saw_recovery = false;
+            for e in my_events(&pool) {
                 if e.recovered {
                     saw_recovery = saw_recovery || saw_stall; // recovery must follow a stall
                 } else {
@@ -638,7 +683,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(pool);
-        std::env::remove_var("CRABSCHEME_WORKER_WATCHDOG_MS");
 
         assert!(saw_stall, "expected a stall event");
         assert!(
