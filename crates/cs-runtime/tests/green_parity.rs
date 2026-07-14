@@ -10,10 +10,12 @@
 //!   in its own `(raw-receive)` loop, decoded by `driver_receive` +
 //!   `process_received` just like the blocking `primop_raw_receive`.
 //!
-//! Reasons here are all `'normal` (no Scheme primitive exits with a custom Error
-//! reason — abnormal exits come only from Rust panics, mapped to `Error` by the
-//! shared `catch_unwind` wrapper). What we verify is the *delivery*, which is the
-//! part that differs between the green and dedicated execution paths.
+//! Reasons here are all `'normal` — these bodies return cleanly, they don't
+//! raise. (cs-845.8: an uncaught Scheme error now *also* chains to
+//! links/monitors as `'error:<msg>`, the same as a Rust panic — see
+//! `beam_error_supervision.rs` for that path.) What we verify here is the
+//! *delivery*, which is the part that differs between the green and dedicated
+//! execution paths.
 
 #![cfg(feature = "actor")]
 

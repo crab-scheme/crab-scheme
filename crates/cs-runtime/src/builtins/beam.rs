@@ -523,7 +523,13 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
             Ok(Value::Boolean(false)) => break, // handler asked to stop
             Ok(_) => {}
             Err(e) => {
-                eprintln!("spawn-activation: handler `{handler}` raised: {e}");
+                let msg = format!("spawn-activation: handler `{handler}` raised: {e}");
+                eprintln!("{msg}");
+                // cs-845.8: an uncaught Scheme error is an abnormal exit —
+                // chain it to links/monitors as ExitReason::Error, same as a
+                // Rust panic would (previously this fell through to a quiet
+                // ExitReason::Normal).
+                actor.set_error_exit(msg);
                 break;
             }
         }
@@ -817,15 +823,15 @@ async fn green_source_body(
     // Termination parity with the dedicated path (`scheme_source_entry`) and the
     // activation path (`activation_body`): a *Scheme-level* error (the body
     // returned `Err` — including a trap-exit `Err` from `(raw-receive)`) is
-    // surfaced loudly and the actor exits cleanly → `ExitReason::Normal` via
-    // `spawn_local_activation`'s wrapper. A *Rust panic* propagates out of this
-    // future and that wrapper's `catch_unwind` maps it to `ExitReason::Error`,
-    // which `on_actor_termination` then chains to linked actors / monitors —
-    // identical to the dedicated `spawn_async` path. (No Scheme primitive exits
-    // with a custom Error reason; abnormal exits come only from panics.) The
-    // `pump_coroutine` ClearCtx guard keeps that panic path hygienic.
+    // surfaced loudly AND recorded via `Actor::set_error_exit` (cs-845.8), so
+    // `spawn_local_activation`'s wrapper reports `ExitReason::Error` — chained
+    // to linked actors / monitors exactly as a Rust panic would be. A panic
+    // still propagates out of this future and is caught the same way (the
+    // `pump_coroutine` ClearCtx guard keeps that path hygienic).
     if let Err(e) = pump_coroutine(co, actor_ptr, StackClass::Green).await {
-        eprintln!("spawn-source(green): actor `{entry}` terminated: {e}");
+        let msg = format!("spawn-source(green): actor `{entry}` terminated: {e}");
+        eprintln!("{msg}");
+        actor.set_error_exit(msg);
     }
 }
 
@@ -938,11 +944,16 @@ async fn driver_tcp_send(handle: i64, bytes: Vec<u8>) -> Result<(), String> {
 /// onto the actor's worker thread cleanly. The `Rc` graph is created *inside*
 /// the closure, on that thread, and never escapes it.
 fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
-    Arc::new(move |_actor, args| {
+    Arc::new(move |actor, args| {
         if let Err(e) = run_scheme_body(&source, &entry, &args) {
             // The actor terminates (the body returned/aborted). Surface the
             // reason loudly rather than dying silently — Article VI.
-            eprintln!("spawn-source: actor `{entry}` terminated: {e}");
+            let msg = format!("spawn-source: actor `{entry}` terminated: {e}");
+            eprintln!("{msg}");
+            // cs-845.8: chain the Scheme-level error to links/monitors as
+            // ExitReason::Error (previously only a Rust panic did this; a
+            // clean-return-after-logging looked identical to a Normal exit).
+            actor.set_error_exit(msg);
         }
     })
 }
