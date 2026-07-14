@@ -83,7 +83,7 @@ use rustc_hash::FxBuildHasher;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-mod local_pool;
+pub mod local_pool;
 use local_pool::LocalWorkerPool;
 
 // ---------- Mailbox backing strategy ----------
@@ -1430,7 +1430,14 @@ impl ActorSystem {
     /// rely on. Returns `false` if the chosen worker has shut down.
     #[doc(hidden)]
     pub fn run_on_local_worker(&self, job: impl FnOnce() + Send + 'static) -> bool {
-        self.local_pool().dispatch(Box::new(job))
+        self.local_pool().dispatch(|load_guard| {
+            // Not an actor: drop the LoadGuard immediately, which undoes
+            // the increment `dispatch` just made — net-zero effect on the
+            // worker's live-actor count, exactly right for a transient
+            // diagnostic job that shouldn't skew P2C placement.
+            drop(load_guard);
+            Box::new(job)
+        })
     }
 
     /// Spawn an actor whose body future may be **`!Send`** — it can hold

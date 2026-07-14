@@ -668,6 +668,13 @@ async fn pump_coroutine(
         fn drop(&mut self) {
             ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
             YIELDER.with(|y| y.set(std::ptr::null()));
+            // cs-845.4: also clear the watchdog's "currently running" pid.
+            // On the normal path this is a redundant (idempotent) repeat of
+            // the inline post-resume call below, but on a panic unwinding
+            // out of `co.resume` it's the ONLY clear — without it the worker
+            // would permanently blame the dead actor's pid and emit a
+            // perpetual spurious stall warning.
+            cs_actor::local_pool::heartbeat_idle();
         }
     }
     let _clear_ctx = ClearCtx;
@@ -701,6 +708,12 @@ async fn pump_coroutine(
                 .unwrap_or_else(|| cs_vm::vm::reduction_budget().saturating_sub(1)),
         );
 
+        // cs-845.4: bump this worker's heartbeat and record which actor is
+        // about to run — the resume/suspend transition the watchdog blames a
+        // stall on. Sound: `actor_ptr` is valid for the same reason ACTOR_CTX
+        // above is (one worker, control strictly alternates).
+        cs_actor::local_pool::heartbeat_running(actor_ref.pid());
+
         let result = co.resume(resume_input);
 
         // cs-845.7: save the countdown back into THIS actor's state right
@@ -723,6 +736,10 @@ async fn pump_coroutine(
         // run a co-located actor, and it must never observe our stale pointers.
         ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
         YIELDER.with(|y| y.set(std::ptr::null()));
+        // The resume returned (suspend or completion): this worker is no
+        // longer doing CPU-bound actor work, so it should never be blamed
+        // for a stall while cooperatively parked below.
+        cs_actor::local_pool::heartbeat_idle();
 
         // Region-park guard (P0.1): the TLS region stack is shared by every actor
         // co-located on this worker, so suspending (any Yield arm awaits) with an
@@ -863,6 +880,10 @@ async fn green_source_body(
     // running the same body reuse the compiled bytecode (sharing its code
     // chunks); only the closures + overlay bindings are per-actor. Mirrors
     // `run_scheme_body` otherwise.
+    // (cs-845.4 note: this load/compile phase runs in the driver frame,
+    // BEFORE pump_coroutine's first resume — no running-pid is recorded yet,
+    // so a pathologically slow compile here is watchdog-invisible. Accepted:
+    // the watchdog targets blocking *bodies*, and compiles are bounded.)
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-source-green>", &source) {
         let msg = format!("spawn-source(green): loading actor source failed: {d:?}");
         eprintln!("{msg}");
