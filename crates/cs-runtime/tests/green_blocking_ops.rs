@@ -2,10 +2,17 @@
 //! `tcp-connect`/`dns-resolve`, file I/O, and subprocess `run`/`run/status`.
 //!
 //! Each test forces two green actors onto a single shared `LocalSet` worker
-//! (`CRABSCHEME_ACTOR_LOCAL_WORKERS=1`): one performs the slow blocking op,
-//! the other does an independent ping/pong. If the slow op froze the worker
-//! instead of parking, the ping/pong could never complete while it's in
-//! flight — so observing the ping/pong finish proves the op cooperated.
+//! (`CRABSCHEME_ACTOR_LOCAL_WORKERS=1`): one performs the blocking op, the
+//! other does an independent ping/pong.
+//!
+//! The `(run "sleep" ...)` test carries the discrimination: it asserts
+//! ORDERING — the co-tenant's 'ping must be recorded BEFORE 'run-done.
+//! With the cooperative hooks uninstalled (inline blocking), the slow-run
+//! actor holds the worker for the whole 0.5s subprocess and 'run-done is
+//! deterministically recorded first, so the assert fails. The fs and
+//! tcp-connect tests are smoke-only: those ops are near-instant on a local
+//! machine, so an ordering assert would be flaky — they just prove the
+//! hooked ops still complete correctly from a green actor.
 
 #![cfg(all(
     feature = "actor",
@@ -68,6 +75,12 @@ fn spawn_ping(col: cs_actor::ActorPid) {
     primop_send(p, tagged("col", SendableValue::Pid(col))).unwrap();
 }
 
+/// The discriminating test: a green actor blocked ~0.5s in `(run "sleep" ...)`
+/// must PARK (releasing the shared worker) so the co-located ping actor runs
+/// and reports BEFORE the subprocess finishes. With the cooperative blocking
+/// hooks uninstalled, the inline `wait_with_output` holds the worker for the
+/// whole 0.5s and 'run-done is deterministically recorded first — this
+/// ordering assert is what fails on the old inline-blocking path.
 #[test]
 fn parked_run_does_not_freeze_a_colocated_actor() {
     force_single_worker();
@@ -76,8 +89,6 @@ fn parked_run_does_not_freeze_a_colocated_actor() {
     register_markers("test:green-run-park", 2, out.clone());
     let col = primop_spawn("test:green-run-park", vec![]).expect("spawn collector");
 
-    // `sleep 0.5` via `(run ...)` — long enough that a frozen worker would
-    // stall the co-located ping well past this test's wait window.
     let body = r#"
         (define (slow-run)
           (let ((col (cdr (raw-receive))))
@@ -91,26 +102,36 @@ fn parked_run_does_not_freeze_a_colocated_actor() {
 
     wait_until(
         Duration::from_secs(10),
-        "co-located ping was never served while a green actor parked in (run)",
-        || out.lock().unwrap().iter().any(|s| s == "ping"),
-    );
-    wait_until(
-        Duration::from_secs(10),
         "(run \"sleep\" ...) never completed",
         || out.lock().unwrap().iter().any(|s| s == "run-done"),
     );
+    let markers = out.lock().unwrap().clone();
+    let ping_idx = markers.iter().position(|s| s == "ping");
+    let done_idx = markers.iter().position(|s| s == "run-done");
+    assert!(
+        ping_idx.is_some(),
+        "co-located ping was never served: {markers:?}"
+    );
+    assert!(
+        ping_idx < done_idx,
+        "'ping must be recorded BEFORE 'run-done — inline (non-cooperative) \
+         blocking in (run) would freeze the shared worker for the whole \
+         subprocess and force run-done first; got {markers:?}"
+    );
 }
 
+/// Smoke test only: a local file read is near-instant, so an ordering assert
+/// against the ping would be flaky. This just proves `read-file-string` still
+/// completes correctly from a green actor through the cooperative blocking
+/// hook. The `(run ...)` test above carries the does-not-freeze discrimination.
 #[test]
-fn parked_read_file_string_does_not_freeze_a_colocated_actor() {
+fn green_read_file_string_completes() {
     force_single_worker();
 
     let mut path = std::env::temp_dir();
     path.push(format!("cs-845-3-blocking-fs-{}.txt", std::process::id()));
     {
         let mut f = std::fs::File::create(&path).expect("create temp file");
-        // A few hundred KB so the blocking-threadpool read has non-zero
-        // duration to overlap with the co-located ping.
         let chunk = vec![b'x'; 1024];
         for _ in 0..512 {
             f.write_all(&chunk).expect("write temp file");
@@ -137,7 +158,7 @@ fn parked_read_file_string_does_not_freeze_a_colocated_actor() {
 
     wait_until(
         Duration::from_secs(10),
-        "co-located ping was never served while a green actor parked in read-file-string",
+        "co-located ping was never served",
         || out.lock().unwrap().iter().any(|s| s == "ping"),
     );
     wait_until(
@@ -149,14 +170,17 @@ fn parked_read_file_string_does_not_freeze_a_colocated_actor() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Smoke test only: a localhost TCP handshake is near-instant, so an ordering
+/// assert against the ping would be flaky. This just proves `tcp-connect`
+/// still completes correctly from a green actor through the cooperative
+/// blocking hook. The `(run ...)` test above carries the does-not-freeze
+/// discrimination.
 #[test]
-fn parked_tcp_connect_does_not_freeze_a_colocated_actor() {
+fn green_tcp_connect_completes() {
     force_single_worker();
 
-    // A listener that accepts but never completes the handshake's first
-    // read/write — tcp-connect itself only needs the TCP handshake, which
-    // `TcpListener::accept` alone satisfies, so this mainly checks that the
-    // connect call parks rather than errors or hangs the worker.
+    // tcp-connect only needs the TCP handshake, which `TcpListener::accept`
+    // alone satisfies; the server just holds the socket open briefly.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
@@ -183,7 +207,7 @@ fn parked_tcp_connect_does_not_freeze_a_colocated_actor() {
 
     wait_until(
         Duration::from_secs(10),
-        "co-located ping was never served around a green actor's tcp-connect",
+        "co-located ping was never served",
         || out.lock().unwrap().iter().any(|s| s == "ping"),
     );
     wait_until(

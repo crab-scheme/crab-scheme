@@ -220,7 +220,7 @@ fn dns_resolve(args: &[Value]) -> Result<Value, FfiError> {
     let host = expect_string("dns-resolve", args, 0)?;
     let host_has_port = host.contains(':');
     let hook = COOPERATIVE_BLOCKING.get().copied();
-    let lookup_host = host.clone();
+    let lookup_host = host;
     let iter: Vec<std::net::SocketAddr> = cs_ffi::blocking::run_blocking(hook, move || {
         // `to_socket_addrs` accepts either "host:port" or bare "host" (the
         // latter needs a synthetic port; std requires one). Try bare first;
@@ -258,9 +258,8 @@ fn tcp_connect(args: &[Value]) -> Result<Value, FfiError> {
     let port = expect_fixnum("tcp-connect", args, 1)?;
     let addr = format!("{}:{}", host, port);
     let hook = COOPERATIVE_BLOCKING.get().copied();
-    let connect_addr = addr.clone();
     let s = cs_ffi::blocking::run_blocking(hook, move || {
-        TcpStream::connect(&connect_addr).map_err(|e| format!("tcp-connect: {}", e))
+        TcpStream::connect(&addr).map_err(|e| format!("tcp-connect: {}", e))
     })
     .map_err(FfiError::HostFailure)?;
     Ok(Value::fixnum(insert(Slot::Tcp(s))?))
