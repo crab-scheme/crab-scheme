@@ -344,7 +344,14 @@ thread_local! {
 /// statically safe).
 #[inline]
 pub(crate) fn assert_region_live(region_id: RegionId) {
-    REGION_SLAB.with(|s| {
+    // `try_with` tolerates TLS destruction during thread teardown
+    // (e.g. a `Bindings` drop running after REGION_SLAB's dtor on
+    // Linux, where thread_local dtor order differs from macOS): the
+    // slab is gone, so every region on this thread has already been
+    // torn down and there is nothing left to validate — skipping is
+    // the same answer `is_region_live` gives (`false` → drop path
+    // skips the region decrement).
+    let _ = REGION_SLAB.try_with(|s| {
         if !s.borrow().is_live(region_id) {
             panic!(
                 "cs_gc::Gc<T>: region {region_id:?} dropped while \
@@ -360,7 +367,14 @@ pub(crate) fn assert_region_live(region_id: RegionId) {
 /// freed (release-mode best-effort to avoid UB).
 #[inline]
 pub(crate) fn is_region_live(region_id: RegionId) -> bool {
-    REGION_SLAB.with(|s| s.borrow().is_live(region_id))
+    // `try_with`: during thread-teardown TLS destruction the slab is
+    // already gone, which means every region on this thread has been
+    // torn down — report "not live" so drop paths skip the region
+    // decrement instead of panicking (`cannot access a Thread Local
+    // Storage value during or after destruction`).
+    REGION_SLAB
+        .try_with(|s| s.borrow().is_live(region_id))
+        .unwrap_or(false)
 }
 
 /// Test-only accessor for the live-region-id count. Used by
@@ -475,7 +489,11 @@ impl Drop for Region {
         // after this Drop fn returns. `id` is Copy so it's
         // unaffected; the Bump arena drops last (when this fn
         // returns), freeing all allocations.
-        REGION_SLAB.with(|s| {
+        // `try_with`: a Region owned by a value dropped during thread
+        // teardown may run after REGION_SLAB's own TLS dtor; the slab
+        // (and its liveness bookkeeping) is already gone, so there is
+        // no slot left to mark dead — skip instead of panicking.
+        let _ = REGION_SLAB.try_with(|s| {
             s.borrow_mut().drop_region(self.id);
         });
     }

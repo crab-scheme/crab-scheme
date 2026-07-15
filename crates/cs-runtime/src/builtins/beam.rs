@@ -88,8 +88,8 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
         // the destination would assign new marks anyway.
         Value::Identifier { name, .. } => Ok(SendableValue::Symbol(syms.name(*name).to_string())),
         Value::Pair(p) => {
-            let head = to_sendable_in(&p.car.borrow(), syms)?;
-            let tail = to_sendable_in(&p.cdr.borrow(), syms)?;
+            let head = to_sendable_in(&p.car(), syms)?;
+            let tail = to_sendable_in(&p.cdr(), syms)?;
             Ok(SendableValue::Pair(Box::new(head), Box::new(tail)))
         }
         Value::Vector(v) => {
@@ -2910,8 +2910,8 @@ fn proper_list(v: &Value) -> Option<Vec<Value>> {
         match cur {
             Value::Null => return Some(out),
             Value::Pair(p) => {
-                out.push(p.car.borrow().clone());
-                cur = p.cdr.borrow().clone();
+                out.push(p.car());
+                cur = p.cdr();
             }
             _ => return None,
         }
@@ -2930,8 +2930,8 @@ pub fn b_beam_load_module(args: &[Value], syms: &mut SymbolTable) -> Result<Valu
     for entry in pairs {
         match entry {
             Value::Pair(p) => {
-                let k = value_to_str(&p.car.borrow(), syms, "load-module!")?;
-                let v = to_sendable_in(&p.cdr.borrow(), syms)?;
+                let k = value_to_str(&p.car(), syms, "load-module!")?;
+                let v = to_sendable_in(&p.cdr(), syms)?;
                 exports.insert(k, v);
             }
             other => {

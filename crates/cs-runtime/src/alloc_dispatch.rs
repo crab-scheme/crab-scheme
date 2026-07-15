@@ -130,12 +130,7 @@ pub fn make_bytevector_in(lifetime: Lifetime, n: usize, fill: u8) -> Result<Valu
 
 /// `(make-hashtable eq-kind)` lifetime-aware.
 pub fn make_hashtable_in(lifetime: Lifetime, eq_kind: HtEqKind) -> Result<Value, String> {
-    let ht = Hashtable {
-        items: RefCell::new(Vec::new()),
-        eq_kind,
-        custom: None,
-        index: RefCell::new(std::collections::HashMap::new()),
-    };
+    let ht = Hashtable::from_parts(Vec::new(), eq_kind, None, std::collections::HashMap::new());
     let g: Gc<Hashtable> = match lifetime {
         Lifetime::Region(_) | Lifetime::Stack => {
             let region = current_region().ok_or_else(|| no_region_err("make-hashtable"))?;

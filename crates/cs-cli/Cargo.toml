@@ -262,6 +262,11 @@ distrib = ["cs-runtime/distrib"]
 # dep (~30s clean build); enable for embedders that need L2.
 sandbox = ["cs-runtime/sandbox"]
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# cs-vnf.2 — global allocator swap. wasm32 targets keep their default
+# allocator (mimalloc's C core doesn't target wasi).
+mimalloc = { workspace = true }
+
 [dependencies]
 cs-core = { workspace = true }
 cs-diag = { workspace = true }

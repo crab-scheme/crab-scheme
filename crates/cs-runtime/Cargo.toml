@@ -55,6 +55,11 @@ tracing-cycle-collector = [
     "cs-gc/tracing-cycle-collector",
     "cs-vm/tracing-cycle-collector",
 ]
+# Forwards the cs-gc `alloc-histogram` feature (cs-i6p.1):
+# per-type allocation histogram surfaced through `(gc-stats)`'s
+# `alloc-histogram` key. Off by default — no cost on the
+# `Gc::new` hot path when disabled.
+alloc-histogram = ["cs-gc/alloc-histogram"]
 # BEAM-style actor primops. Pulls in cs-actor + cs-table + cs-hotreload
 # (tokio, dashmap) and registers (spawn, send, raw-receive, self),
 # the cs-table CRUD, and the cs-hotreload version-table primops as
