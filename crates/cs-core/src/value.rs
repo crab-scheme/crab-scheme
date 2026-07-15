@@ -545,10 +545,16 @@ impl Pair {
         if total <= baseline {
             return false;
         }
+        let addr = self.addr();
+        // Only demote a slot that participates in the cycle (see
+        // `value_reaches_container`) — a cycle through the cdr must
+        // not cost an innocent car value.
+        if !value_reaches_container(&peeked, addr) {
+            return false;
+        }
         let Some(weak) = WeakValue::from_value(&peeked) else {
             return false; // leaf (shouldn't reach: heap_strong_count returned Some)
         };
-        let addr = self.addr();
         // Insert-first ordering: the flag is only set if the entry
         // actually landed, preserving the flag⇔entry invariant. A
         // `try_with` failure (TLS teardown) declines the demote.
@@ -577,10 +583,14 @@ impl Pair {
         if total <= baseline {
             return false;
         }
+        let addr = self.addr();
+        // Participation gate — see `break_car_cycle`.
+        if !value_reaches_container(&peeked, addr) {
+            return false;
+        }
         let Some(weak) = WeakValue::from_value(&peeked) else {
             return false;
         };
-        let addr = self.addr();
         if PAIR_CDR_TOMBSTONES
             .try_with(|t| {
                 t.borrow_mut().insert(addr, weak);
@@ -1054,6 +1064,23 @@ pub fn vector_set(v: &cs_gc::Gc<RefCell<Vec<Value>>>, i: usize, val: Value) {
     v.borrow_mut()[i] = val;
 }
 
+/// `true` if `val` IS, or can reach, the heap cell at
+/// `container_addr`. The participation gate shared by every
+/// mutation-site cycle breaker: a container-rooted
+/// `cycle_check` fires when a cycle runs through ANY slot of
+/// the container, but the demote targets one specific slot —
+/// without this gate a cycle through slot A gets "broken" by
+/// destroying the innocent value in just-written slot B
+/// (found via cw-97b: record setters on the VM tier silently
+/// lost freshly built lists because the record's closure
+/// field pointed back at the record through its env).
+pub fn value_reaches_container(val: &Value, container_addr: usize) -> bool {
+    if val.heap_addr() == Some(container_addr) {
+        return true;
+    }
+    cs_gc::cycle::reaches(val, container_addr)
+}
+
 /// Cycle-break action for `v[i]`. See `Pair::break_car_cycle` for
 /// the `baseline` convention — the same reasoning applies here:
 /// `(vector-set! v i v)`'s worst-case self-reference contributes
@@ -1081,10 +1108,15 @@ pub fn vector_break_slot_cycle(
     if total <= baseline {
         return false;
     }
+    let addr = cs_gc::Gc::as_addr(v);
+    // Only demote a slot that participates in the cycle (see
+    // `value_reaches_container`).
+    if !value_reaches_container(&current, addr) {
+        return false;
+    }
     let Some(weak) = WeakValue::from_value(&current) else {
         return false;
     };
-    let addr = cs_gc::Gc::as_addr(v);
     let container_pin = cs_gc::Gc::downgrade(v);
     if VECTOR_TOMBSTONES
         .try_with(|t| {
@@ -1450,10 +1482,14 @@ impl Hashtable {
         if total <= baseline {
             return false;
         }
+        let addr = self.addr();
+        // Participation gate — see `value_reaches_container`.
+        if !value_reaches_container(&current, addr) {
+            return false;
+        }
         let Some(weak) = WeakValue::from_value(&current) else {
             return false;
         };
-        let addr = self.addr();
         if HASHTABLE_VALUE_TOMBSTONES
             .try_with(|t| {
                 t.borrow_mut().insert((addr, i), weak);
@@ -2295,9 +2331,9 @@ impl Value {
     ///
     /// Used by the parallel-runtime C4.2 `CycleChildren` walk
     /// to enumerate child container addresses for Bacon-Rajan
-    /// trial deletion. Mirrors the receiver shape of
-    /// [`heap_strong_count`].
-    #[cfg(feature = "tracing-cycle-collector")]
+    /// trial deletion, and by `value_reaches_container`'s
+    /// self-reference short-circuit. Mirrors the receiver
+    /// shape of [`heap_strong_count`].
     pub fn heap_addr(&self) -> Option<usize> {
         match self {
             Value::String(g) => Some(cs_gc::Gc::as_addr(g)),

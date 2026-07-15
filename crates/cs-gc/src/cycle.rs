@@ -369,6 +369,41 @@ where
     }
 }
 
+/// Check whether the heap cell at `target_addr` is reachable from
+/// `start`'s children. Unlike [`cycle_check`], the walk starts at an
+/// arbitrary `CycleVisit` value and the sought "root" is supplied by
+/// address rather than being the walk's origin.
+///
+/// Used by the mutation-site cycle breakers to confirm the
+/// just-written slot actually PARTICIPATES in a detected cycle before
+/// demoting it: container-rooted detection alone fires when a cycle
+/// runs through ANY slot of the container, and demoting the written
+/// slot then destroys an innocent acyclic value (found via cw-97b:
+/// record-setter writes on the VM tier silently read back as
+/// unspecified — the record held a closure in another field whose env
+/// pointed back at the record).
+///
+/// A limit-hit walk returns `false` — the caller declines the demote,
+/// which conservatively degrades to the pre-demote behavior (leak the
+/// cycle refcount-wise until Bacon-Rajan lands, ADR 0014).
+pub fn reaches<V>(start: &V, target_addr: usize) -> bool
+where
+    V: CycleVisit + ?Sized,
+{
+    let mut ctx = CycleVisitor {
+        visited: take_visited_set(),
+        found: false,
+        over_limit: false,
+        root_addr: target_addr,
+        limit: get_limit(),
+        broken: false,
+    };
+    start.visit_children(&mut ctx);
+    let found = ctx.found;
+    return_visited_set(ctx.visited);
+    found
+}
+
 // === Common leaf and container `CycleVisit` impls ===
 
 macro_rules! cycle_visit_leaf {
