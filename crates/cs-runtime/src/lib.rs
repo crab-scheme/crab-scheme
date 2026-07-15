@@ -411,7 +411,23 @@ impl Runtime {
             {
                 cs_stdlib_net::install_async_recv(builtins::beam::cooperative_tcp_recv_hook);
                 cs_stdlib_net::install_async_send(builtins::beam::cooperative_tcp_send_hook);
+                // `dns-resolve`/`tcp-connect` have no bespoke async path, so
+                // they ride the generic blocking hook (cs-845.3) instead.
+                cs_stdlib_net::install_cooperative_blocking(
+                    builtins::beam::cooperative_blocking_hook,
+                );
             }
+            // File I/O (`read-file-string`/`write-file-string`/…) and
+            // subprocess (`run`/`run/status`) have no bespoke async path
+            // either — same generic blocking hook (cs-845.3). Watch for the
+            // sleep-ms shadowing bug from before: each stdlib crate has its
+            // own hook static, so install into every one that's compiled in.
+            #[cfg(feature = "stdlib-fs")]
+            cs_stdlib_fs::install_cooperative_blocking(builtins::beam::cooperative_blocking_hook);
+            #[cfg(feature = "stdlib-process")]
+            cs_stdlib_process::install_cooperative_blocking(
+                builtins::beam::cooperative_blocking_hook,
+            );
         }
         // Cross-node transport primops (the `distrib` feature) — same Syms
         // shape, registered on the VM tier alongside the BEAM primops.

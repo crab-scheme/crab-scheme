@@ -255,6 +255,9 @@ fn soak_n_actors_m_messages_no_deadlock() {
             };
             match &msg {
                 SendableValue::Symbol(s) if s == "stop" => return,
+                // cs-845.2: a base-image symbol crosses as `{id, name}`;
+                // match on `name` the same as the plain `Symbol` arm above.
+                SendableValue::SymbolId { name, .. } if name == "stop" => return,
                 SendableValue::Pair(head, tail) => {
                     // (cons send-time payload)
                     if let SendableValue::Fixnum(ts_ns) = head.as_ref() {

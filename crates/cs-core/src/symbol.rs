@@ -84,8 +84,45 @@ impl SymbolTable {
         &self.by_id[(sym.0 - self.base_offset) as usize]
     }
 
+    /// Like [`Self::name`], but returns `None` instead of panicking when
+    /// `sym` is out of range for this table. Used by cross-worker consumers
+    /// that received an id minted by a *different* table's base image and
+    /// must verify it before trusting it — see cs-runtime's
+    /// `SendableValue::SymbolId` (cs-845.2), which discovered that two
+    /// independently-built base images sharing the same construction can
+    /// still end up different lengths (observed in practice, not just a
+    /// theoretical concern), so an id valid in one is not guaranteed valid
+    /// in the other.
+    pub fn name_checked(&self, sym: Symbol) -> Option<&str> {
+        if sym.0 < self.base_offset {
+            return self.base.as_ref().and_then(|b| b.name_checked(sym));
+        }
+        self.by_id
+            .get((sym.0 - self.base_offset) as usize)
+            .map(|s| s.as_ref())
+    }
+
     pub fn len(&self) -> usize {
         self.base_offset as usize + self.by_id.len()
+    }
+
+    /// True if `sym` resolves through the shared `base` chain (id below
+    /// this table's `base_offset`) rather than this table's own extension.
+    ///
+    /// ## Why base ids are cross-table-stable
+    ///
+    /// Every per-actor table on a worker is built with [`with_base`] over the
+    /// *same* `Rc<SymbolTable>` base image (the worker's shared builtin +
+    /// bundled-library symbols). A base id `k < base_offset` is simply an index
+    /// into that one shared base, so it names the identical symbol in any table
+    /// layered over it — no re-interning required. Extension ids (`≥
+    /// base_offset`) are private to the table that minted them: the same id
+    /// means different (or no) symbols in a sibling table. So base ids may be
+    /// copied verbatim between two such tables, extension ids may not. Used by
+    /// cs-runtime's same-worker actor fast-send path (cs-845.1), which copies a
+    /// message's symbols by id only when every one of them `is_base`.
+    pub fn is_base(&self, sym: Symbol) -> bool {
+        sym.0 < self.base_offset
     }
 
     pub fn is_empty(&self) -> bool {

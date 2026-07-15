@@ -491,14 +491,23 @@ fn rendezvous_blocking_handoff_across_actor() {
             _ => return,
         };
         let channel_sv = match msg {
-            SendableValue::Pair(head, tail) => match (*head, *tail) {
-                (SendableValue::Symbol(s), SendableValue::Pair(ch_box, nil_box))
-                    if s == "start" && matches!(*nil_box, SendableValue::Null) =>
-                {
-                    *ch_box
+            SendableValue::Pair(head, tail) => {
+                // cs-845.2: `start` crosses as `Symbol(String)` OR, if it
+                // happens to be a base-image symbol, `SymbolId { name, .. }`.
+                let is_start = match head.as_ref() {
+                    SendableValue::Symbol(s) => s == "start",
+                    SendableValue::SymbolId { name, .. } => name == "start",
+                    _ => false,
+                };
+                match *tail {
+                    SendableValue::Pair(ch_box, nil_box)
+                        if is_start && matches!(*nil_box, SendableValue::Null) =>
+                    {
+                        *ch_box
+                    }
+                    _ => return,
                 }
-                _ => return,
-            },
+            }
             _ => return,
         };
         let id = match channel_value_from_sv(&channel_sv) {
@@ -602,14 +611,23 @@ fn cross_actor_channel_delivery() {
         // Decode the message into a SendableValue tree, fish out
         // the channel-value (which is just a 2-pair).
         let channel_sv = match msg {
-            SendableValue::Pair(head, tail) => match (*head, *tail) {
-                (SendableValue::Symbol(s), SendableValue::Pair(ch_box, nil_box))
-                    if s == "start" && matches!(*nil_box, SendableValue::Null) =>
-                {
-                    *ch_box
+            SendableValue::Pair(head, tail) => {
+                // cs-845.2: `start` crosses as `Symbol(String)` OR, if it
+                // happens to be a base-image symbol, `SymbolId { name, .. }`.
+                let is_start = match head.as_ref() {
+                    SendableValue::Symbol(s) => s == "start",
+                    SendableValue::SymbolId { name, .. } => name == "start",
+                    _ => false,
+                };
+                match *tail {
+                    SendableValue::Pair(ch_box, nil_box)
+                        if is_start && matches!(*nil_box, SendableValue::Null) =>
+                    {
+                        *ch_box
+                    }
+                    _ => return,
                 }
-                _ => return,
-            },
+            }
             _ => return,
         };
         let id = match channel_value_from_sv(&channel_sv) {
@@ -687,15 +705,21 @@ fn channel_value_from_sv(sv: &SendableValue) -> Option<cs_channel::ChannelId> {
         SendableValue::Pair(h, t) => (h, t),
         _ => return None,
     };
-    match (head.as_ref(), tail.as_ref()) {
-        (SendableValue::Symbol(s), SendableValue::Pair(id_b, rest_b)) if s == "channel" => {
-            match (id_b.as_ref(), rest_b.as_ref()) {
-                (SendableValue::Fixnum(n), SendableValue::Null) if *n >= 0 => {
-                    Some(cs_channel::ChannelId(*n as u64))
-                }
-                _ => None,
+    // cs-845.2: the `channel` tag symbol crosses as `Symbol(String)` OR,
+    // if it happens to be a base-image symbol, as `SymbolId { id, name }` —
+    // match on the name either way.
+    let tag = match head.as_ref() {
+        SendableValue::Symbol(s) => s.as_str(),
+        SendableValue::SymbolId { name, .. } => name.as_str(),
+        _ => return None,
+    };
+    match (tag, tail.as_ref()) {
+        ("channel", SendableValue::Pair(id_b, rest_b)) => match (id_b.as_ref(), rest_b.as_ref()) {
+            (SendableValue::Fixnum(n), SendableValue::Null) if *n >= 0 => {
+                Some(cs_channel::ChannelId(*n as u64))
             }
-        }
+            _ => None,
+        },
         _ => None,
     }
 }

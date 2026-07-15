@@ -8,12 +8,32 @@
 
 use std::sync::Arc;
 
-use cs_core::{Number, Pair, SymbolTable, Value};
+use cs_core::{Number, Pair, Symbol, SymbolTable, Value};
 
 use cs_actor::{ActorPid, Payload};
 
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
+
+/// Whether JIT tiering should stay enabled for actor bodies. Default is
+/// `false` (JIT disabled — see the `set_jit_enabled(false)` call sites in
+/// `activation_body` / `green_source_body` / `run_actor_body`): a prior
+/// perf branch (perf/actor-vm-jit) found a JIT-tiered CPU-bound actor could
+/// starve a co-located peer on a shared `LocalSet` worker, for only a
+/// marginal (~5%) throughput gain.
+///
+/// `CRABSCHEME_ACTOR_JIT=1` opts back in (cs-845.6 investigation). Read
+/// once via `OnceLock` — actor worker threads are long-lived and the value
+/// is fixed for the process, so there's no need to re-read the env on
+/// every body invocation.
+fn actor_jit_enabled_override() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CRABSCHEME_ACTOR_JIT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 
 /// A subset of `cs_core::Value` safe to ship across actor
 /// boundaries.
@@ -52,6 +72,39 @@ pub enum SendableValue {
     /// Symbols cross as their name; the receiver re-interns into
     /// its own SymbolTable on arrival.
     Symbol(String),
+    /// cs-845.2 cross-worker fast path: a symbol already interned in the
+    /// *shared base* `SymbolTable` (see `SymbolTable::with_base` /
+    /// `SymbolTable::is_base` in cs-core) at send time, carried as `id`
+    /// (its base id on the sender) plus `name` as a verification/fallback
+    /// ground truth.
+    ///
+    /// The theory this was built on — "every worker's base is built the
+    /// same way, so a base id names the same symbol everywhere" — turned
+    /// out NOT to hold exactly in practice: two independently-built
+    /// per-worker `RuntimeImage` base tables (see `worker_runtime_image`,
+    /// one lazily built per OS thread) were observed to differ in length by
+    /// a few entries even though both loaded the identical builtin/bundled-
+    /// library set (root cause not fully chased down — plausibly a
+    /// nondeterministic-iteration-order gensym/registration path somewhere
+    /// in library loading). So `id` is a **hint, not a guarantee**:
+    /// `from_sendable` only trusts it after confirming, via
+    /// `SymbolTable::name_checked`, that the RECEIVER's own base agrees
+    /// `id` names `name`; otherwise it safely falls back to `intern(name)`.
+    /// This buys the receive-side win (an array index + string compare
+    /// instead of a hashmap intern lookup/insert) without correctness ever
+    /// depending on cross-thread base agreement.
+    ///
+    /// Only ever produced by [`to_sendable_in_for_message`] (the general
+    /// `to_sendable_in` used for spawn args / table keys always emits the
+    /// plain `Symbol(String)` form, because those consumers —
+    /// `sendable_to_datum`'s textual re-encoding, and `cs-table`'s
+    /// name-keyed `Key` — don't decode through `from_sendable` at all). A
+    /// symbol interned into an actor's own *private* extension table isn't
+    /// a base id and still crosses as plain `Symbol(String)`.
+    SymbolId {
+        id: u32,
+        name: String,
+    },
     Pair(Box<SendableValue>, Box<SendableValue>),
     Vector(Vec<SendableValue>),
     ByteVector(Vec<u8>),
@@ -62,6 +115,22 @@ pub enum SendableValue {
     // dedicated variant needed. cs-runtime/builtins/channel.rs
     // recognizes the shape on inspection and looks the ID up in
     // the process-global ChannelRegistry.
+    /// cs-845.1 same-worker fast-send path: a marker for a real
+    /// (already deep-cloned) `Value` parked in this OS thread's
+    /// `SAME_WORKER_MSGS` side-table, keyed by the receiver's PID.
+    /// `recv` is the receiving actor's PID (the queue key); `seq` is
+    /// a per-receiver monotonic stamp used only to sanity-check FIFO
+    /// order on the pop side. Only ever produced by
+    /// [`try_send_same_worker`] and only ever consumed by
+    /// [`from_sendable`] running on the *same* worker thread (the
+    /// sender checked colocation before picking this path) — both
+    /// fields are plain `Copy` integers, so this satisfies `Payload`'s
+    /// `Send`/`Sync` bound, but the referenced `Value` lives in a
+    /// thread-local and is meaningless off the thread that produced it.
+    Local {
+        recv: ActorPid,
+        seq: u64,
+    },
 }
 
 /// Project a Scheme `Value` onto a `SendableValue`. Symbols
@@ -70,6 +139,36 @@ pub enum SendableValue {
 /// and hashtables can't cross — see the SendableValue doc for
 /// the design call.
 pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, String> {
+    to_sendable_in_opts(v, syms, false)
+}
+
+/// Same projection as [`to_sendable_in`], but symbols already interned in
+/// the shared base `SymbolTable` are carried as [`SendableValue::SymbolId`]
+/// instead of a cloned name string — see that variant's doc for why this is
+/// sound. Only for consumers that reconstruct the tree via [`from_sendable`]
+/// against a `SymbolTable` sharing the same base image, which is exactly
+/// the actor cross-worker message path (`b_beam_send`'s general fallback +
+/// the receive-side `Runtime::sendable_to_value`). Do **not** use this for
+/// spawn-source args (`sendable_to_datum` re-encodes as Scheme *source
+/// text*, which needs the name) or table keys (`cs-table::Key` is
+/// name-keyed).
+pub fn to_sendable_in_for_message(v: &Value, syms: &SymbolTable) -> Result<SendableValue, String> {
+    to_sendable_in_opts(v, syms, true)
+}
+
+fn to_sendable_in_opts(
+    v: &Value,
+    syms: &SymbolTable,
+    fast_symbols: bool,
+) -> Result<SendableValue, String> {
+    let sendable_symbol = |sym: Symbol| {
+        let name = syms.name(sym).to_string();
+        if fast_symbols && syms.is_base(sym) {
+            SendableValue::SymbolId { id: sym.0, name }
+        } else {
+            SendableValue::Symbol(name)
+        }
+    };
     match v {
         Value::Null => Ok(SendableValue::Null),
         Value::Unspecified => Ok(SendableValue::Unspecified),
@@ -81,20 +180,23 @@ pub fn to_sendable_in(v: &Value, syms: &SymbolTable) -> Result<SendableValue, St
             num_to_sendable(&n)
         }
         Value::String(s) => Ok(SendableValue::String(s.borrow().clone())),
-        Value::Symbol(s) => Ok(SendableValue::Symbol(syms.name(*s).to_string())),
+        Value::Symbol(s) => Ok(sendable_symbol(*s)),
         // Identifiers cross as their name (mark dropped). Marks
         // are a per-process lexical-hygiene concept that doesn't
         // survive a cross-actor boundary -- a fresh expansion in
         // the destination would assign new marks anyway.
-        Value::Identifier { name, .. } => Ok(SendableValue::Symbol(syms.name(*name).to_string())),
+        Value::Identifier { name, .. } => Ok(sendable_symbol(*name)),
         Value::Pair(p) => {
-            let head = to_sendable_in(&p.car(), syms)?;
-            let tail = to_sendable_in(&p.cdr(), syms)?;
+            let head = to_sendable_in_opts(&p.car(), syms, fast_symbols)?;
+            let tail = to_sendable_in_opts(&p.cdr(), syms, fast_symbols)?;
             Ok(SendableValue::Pair(Box::new(head), Box::new(tail)))
         }
         Value::Vector(v) => {
-            let items: Result<Vec<_>, _> =
-                v.borrow().iter().map(|e| to_sendable_in(e, syms)).collect();
+            let items: Result<Vec<_>, _> = v
+                .borrow()
+                .iter()
+                .map(|e| to_sendable_in_opts(e, syms, fast_symbols))
+                .collect();
             Ok(SendableValue::Vector(items?))
         }
         Value::ByteVector(bv) => Ok(SendableValue::ByteVector(bv.borrow().clone())),
@@ -153,6 +255,20 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
         }
         SendableValue::String(s) => Value::string(s.clone()),
         SendableValue::Symbol(name) => Value::Symbol(syms.intern(name)),
+        // cs-845.2: `id` is only trustworthy if THIS table's own base
+        // agrees it names `name` (independently-built per-worker base
+        // images were observed to disagree in length — see the
+        // `SymbolId` doc). Verified: construct the Symbol directly, no
+        // intern lookup. Unverified: safe fallback to `intern(name)`,
+        // identical to the plain `Symbol(String)` path.
+        SendableValue::SymbolId { id, name } => {
+            let sym = Symbol(*id);
+            if syms.is_base(sym) && syms.name_checked(sym) == Some(name.as_str()) {
+                Value::Symbol(sym)
+            } else {
+                Value::Symbol(syms.intern(name))
+            }
+        }
         SendableValue::Pair(car, cdr) => {
             let car_v = from_sendable(car, syms);
             let cdr_v = from_sendable(cdr, syms);
@@ -174,7 +290,251 @@ pub fn from_sendable(s: &SendableValue, syms: &mut SymbolTable) -> Value {
             let s = format!("<pid:{}>", _pid);
             Value::Symbol(syms.intern(&s))
         }
+        SendableValue::Local { recv, seq } => take_same_worker_msg(*recv, *seq, syms),
     }
+}
+
+// ---------- cs-845.1: same-worker fast-send path ----------
+//
+// `to_sendable_in`/`from_sendable` round-trip through a fully separate
+// `SendableValue` tree so a message can cross an OS-thread boundary (the
+// mailbox `Payload` is `Arc<dyn Any + Send + Sync>`, and `Value`'s `Rc`s
+// are `!Send`). When sender and receiver are actors pinned to the *same*
+// `LocalWorkerPool` worker (see `cs_actor::ActorSystem::local_worker_of` /
+// `cs_actor::current_worker_id`), that whole projection is unnecessary
+// work: nothing ever crosses threads, so a same-thread deep clone of the
+// `Value` tree (fresh `Gc`/`RefCell` allocations, so mutating the
+// original after send can't leak into the receiver's copy) is both
+// sufficient and one tree-walk instead of two.
+//
+// Symbols are the one wrinkle: `Symbol` ids are private to a
+// `SymbolTable`, so an id from the sender's table isn't valid in the
+// receiver's — *unless* both tables are `SymbolTable::with_base` layers
+// over the identical `Rc`-shared base, which is exactly what every
+// `spawn_local_activation` actor on a given worker gets (built via
+// `Runtime::from_image(&worker_runtime_image())`, the same thread-local
+// image for the worker's whole lifetime). Base ids (`syms.is_base`) are
+// therefore safe to copy verbatim; a symbol interned into an actor's
+// *private* extension table isn't, and we don't have receiver-side
+// access to intern it correctly at send time. When the clone hits such a
+// symbol it bails out (`Ok(None)`) and the caller falls back to the
+// general `to_sendable_in`/`from_sendable` path, unchanged.
+/// Per-receiver side-queue for the same-worker fast path. `next_seq` stamps
+/// each parked message with a monotonic id (FIFO sanity check on pop);
+/// `msgs` holds the `(seq, Value)` pairs in send order. Popped front-first on
+/// receive — mailbox marker order matches queue push order on this one thread,
+/// so FIFO relative to cross-worker messages is preserved.
+#[derive(Default)]
+struct SameWorkerQueue {
+    next_seq: u64,
+    msgs: std::collections::VecDeque<(u64, Value)>,
+}
+
+std::thread_local! {
+    static SAME_WORKER_MSGS: std::cell::RefCell<std::collections::HashMap<ActorPid, SameWorkerQueue>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// RAII cleanup for one actor's same-worker fast-path side-queue, keyed by the
+/// actor's own PID (the receiver key). Registered at the top of every actor
+/// body that runs on a `LocalWorkerPool` worker ([`activation_body`] and
+/// [`green_source_body`]), so its `Drop` runs on *every* exit path — normal
+/// return, a Scheme-level error, a panic-unwind, or the future being dropped on
+/// shutdown. Dropping removes the actor's whole queue, so any fast-path
+/// messages parked for it but never received (the actor died with `Local` mail
+/// still queued) are freed instead of leaking for the worker's lifetime. It
+/// only touches the thread-local map — never `rt`/`actor` heap — so its drop
+/// order relative to `co`/`rt`/`actor` is immaterial.
+struct SameWorkerGuard(ActorPid);
+
+impl Drop for SameWorkerGuard {
+    fn drop(&mut self) {
+        SAME_WORKER_MSGS.with(|m| {
+            m.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+/// Process-wide count of sends that took the same-worker fast path.
+/// Telemetry for tests + perf analysis (a Relaxed add is negligible next
+/// to the tree clone it accounts for).
+static SAME_WORKER_FAST_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many `(send ...)`s have taken the same-worker fast path so far.
+pub fn same_worker_fast_send_count() -> u64 {
+    SAME_WORKER_FAST_SENDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pull a same-worker message back out for receiver `recv`. Only called from
+/// `from_sendable` for a `SendableValue::Local`, which — per the module doc
+/// above — is only ever handed to a receiver running on the same OS thread that
+/// produced it, so the front of `recv`'s queue is normally the matching message
+/// (`seq` confirms FIFO). Any deviation is an *unforeseen* edge, not a
+/// correctness invariant we can abort the whole worker thread over: we
+/// degrade-and-log (a benign opaque `same-worker-message-lost` symbol) so the
+/// blast radius is one dropped/garbled message, never a worker-thread panic.
+fn take_same_worker_msg(recv: ActorPid, seq: u64, syms: &mut SymbolTable) -> Value {
+    let popped = SAME_WORKER_MSGS.with(|m| {
+        m.borrow_mut()
+            .get_mut(&recv)
+            .and_then(|q| q.msgs.pop_front())
+    });
+    match popped {
+        Some((got_seq, v)) => {
+            if got_seq != seq {
+                eprintln!(
+                    "cs-845.1: same-worker message for {recv} out of order (marker seq {seq}, \
+                     queue front seq {got_seq}); FIFO invariant violated — delivering front anyway"
+                );
+            }
+            v
+        }
+        None => {
+            eprintln!(
+                "cs-845.1: same-worker message for {recv} (seq {seq}) missing on receive \
+                 (guard/ordering bug in the fast-send path); dropping message"
+            );
+            Value::Symbol(syms.intern("same-worker-message-lost"))
+        }
+    }
+}
+
+/// Deep-clone `v` into a fresh `Value` tree suitable for handing directly
+/// to a colocated receiver, reusing symbol ids where — and only where —
+/// that's sound (see the module doc above).
+///
+/// - `Ok(Some(clone))`: fast path is safe, here's the clone.
+/// - `Ok(None)`: `v` contains a non-base (per-actor-private) symbol;
+///   caller should fall back to `to_sendable_in`/`from_sendable`.
+/// - `Err(_)`: `v` contains something that can never cross an actor
+///   boundary at all (procedure/hashtable/port/promise) — same rejects as
+///   `to_sendable_in`.
+fn deep_clone_same_worker(v: &Value, syms: &SymbolTable) -> Result<Option<Value>, String> {
+    macro_rules! recur {
+        ($e:expr) => {
+            match deep_clone_same_worker($e, syms)? {
+                Some(cloned) => cloned,
+                None => return Ok(None),
+            }
+        };
+    }
+    Ok(Some(match v {
+        Value::Null => Value::Null,
+        Value::Unspecified => Value::Unspecified,
+        Value::Eof => Value::Eof,
+        Value::Boolean(b) => Value::Boolean(*b),
+        Value::Character(c) => Value::Character(*c),
+        Value::Fixnum(n) => Value::Fixnum(*n),
+        Value::Flonum(f) => Value::Flonum(*f),
+        // Immutable (no interior mutability) boxed numbers — an `Rc`
+        // clone is a legitimate deep-clone-equivalent, same as sharing
+        // any other immutable value.
+        Value::BigNumber(b) => Value::BigNumber(b.clone()),
+        Value::Rational(r) => Value::Rational(r.clone()),
+        Value::String(s) => Value::string(s.borrow().clone()),
+        Value::Symbol(sym) => {
+            if syms.is_base(*sym) {
+                Value::Symbol(*sym)
+            } else {
+                return Ok(None);
+            }
+        }
+        Value::Identifier { name, mark } => {
+            if syms.is_base(*name) {
+                // Mirrors `to_sendable_in`: mark doesn't survive the
+                // boundary, identifiers degrade to plain symbols.
+                let _ = mark;
+                Value::Symbol(*name)
+            } else {
+                return Ok(None);
+            }
+        }
+        Value::Pair(p) => {
+            let car = recur!(&p.car());
+            let cdr = recur!(&p.cdr());
+            Value::Pair(Pair::new(car, cdr))
+        }
+        Value::Vector(items) => {
+            let mut cloned = Vec::with_capacity(items.borrow().len());
+            for e in items.borrow().iter() {
+                cloned.push(recur!(e));
+            }
+            Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(cloned)))
+        }
+        Value::ByteVector(bv) => Value::ByteVector(cs_core::Gc::new(std::cell::RefCell::new(
+            bv.borrow().clone(),
+        ))),
+        Value::Procedure(_) => {
+            return Err(
+                "to_sendable: procedures cannot cross actor boundaries (also blocks procedures \
+                 as `load-module!` exports — see ADR 0034 for the architectural prerequisite)"
+                    .into(),
+            )
+        }
+        Value::Hashtable(_) => {
+            return Err(
+                "to_sendable: hashtables are per-actor; use cs-table for shared state".into(),
+            )
+        }
+        Value::Port(_) => return Err("to_sendable: ports cannot cross actor boundaries".into()),
+        Value::Promise(_) => {
+            return Err("to_sendable: promises cannot cross actor boundaries".into())
+        }
+    }))
+}
+
+/// Try the same-worker fast path for `(send pid v)`: if `target_worker` is
+/// `Some` and matches the current thread's `LocalWorkerPool` worker id,
+/// deep-clone `v` directly and reserve a per-receiver FIFO `seq`. Returns
+/// `Ok(Some((recv, seq, cloned)))` — the caller sends the `Local { recv, seq }`
+/// marker and then, *only on send success*, commits `cloned` into `recv`'s
+/// side-queue via [`commit_same_worker_msg`] (so a failed send never parks an
+/// orphan value). Returns `Ok(None)` whenever the fast path doesn't apply
+/// (different/unknown worker, or a non-base symbol in the tree) so the caller
+/// can fall back to `to_sendable_in` unchanged. `Err` propagates a genuine
+/// not-sendable rejection (procedure/hashtable/port/promise).
+fn try_send_same_worker(
+    v: &Value,
+    syms: &SymbolTable,
+    recv: ActorPid,
+    target_worker: Option<usize>,
+) -> Result<Option<(ActorPid, u64, Value)>, String> {
+    let same_worker = matches!(
+        (target_worker, cs_actor::current_worker_id()),
+        (Some(a), Some(b)) if a == b
+    );
+    if !same_worker {
+        return Ok(None);
+    }
+    let Some(cloned) = deep_clone_same_worker(v, syms)? else {
+        return Ok(None);
+    };
+    // Reserve the seq now so the marker and the (later) committed queue entry
+    // agree. A reserved-but-never-committed seq (send failed) just leaves a
+    // harmless gap; the pop side matches on the front entry, not on a dense id.
+    let seq = SAME_WORKER_MSGS.with(|m| {
+        let mut m = m.borrow_mut();
+        let q = m.entry(recv).or_default();
+        let seq = q.next_seq;
+        q.next_seq += 1;
+        seq
+    });
+    Ok(Some((recv, seq, cloned)))
+}
+
+/// Commit a deep-cloned fast-path message into receiver `recv`'s side-queue
+/// after its `Local { recv, seq }` marker was successfully delivered. Bumps the
+/// fast-send telemetry counter. Kept separate from [`try_send_same_worker`] so
+/// the parking happens strictly *after* `primop_send` succeeds.
+fn commit_same_worker_msg(recv: ActorPid, seq: u64, cloned: Value) {
+    SAME_WORKER_MSGS.with(|m| {
+        m.borrow_mut()
+            .entry(recv)
+            .or_default()
+            .msgs
+            .push_back((seq, cloned));
+    });
+    SAME_WORKER_FAST_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn num_to_sendable(n: &Number) -> Result<SendableValue, String> {
@@ -477,34 +837,51 @@ pub fn primop_spawn_activation(source: String, handler: String) -> Result<ActorP
 /// invoke the handler with `ACTOR_CTX` pointing at this actor for the
 /// duration of that synchronous call only.
 async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: String) {
+    // cs-845.1: free any same-worker fast-path mail still queued for this
+    // actor on every exit path (return / error / panic-unwind / shutdown drop).
+    let _sw_guard = SameWorkerGuard(actor.pid());
     // cs-tds: see the matching comment in `green_source_body` — this
     // future is pinned to one actor-dedicated `LocalWorkerPool` worker
     // thread for its whole life, so disabling JIT tiering here needs no
-    // restore.
-    cs_vm::vm::set_jit_enabled(false);
+    // restore. cs-845.6: `CRABSCHEME_ACTOR_JIT=1` opts back in.
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // Shared-Runtime: overlay this worker's shared base (builtins + bundled libs)
     // instead of a full Runtime::new() per actor (same lever as green_source_body).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
+    // cs-845.6: JIT only tiers a closure up if `install_jit` registered the
+    // tier-up hook on this runtime — `set_jit_enabled` alone (above) just
+    // controls whether the VM dispatch loop *consults* jit_ptr(); without
+    // this the JIT never compiles anything even with the flag on.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // VM bytecode tier for the handler (see run_scheme_body re: no JIT). The
     // handler is loaded as a VM closure; `apply_value` (below, per message)
     // delegates VM closures to the VM caller, so each invocation runs on the VM.
     // Cached per source per worker — activation actors sharing a handler body
     // reuse the compiled bytecode (closures share the cached code chunks).
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-activation>", &source) {
-        eprintln!("spawn-activation: loading actor source failed: {d:?}");
+        let msg = format!("spawn-activation: loading actor source failed: {d:?}");
+        eprintln!("{msg}");
+        // cs-845.8: load-phase failure is an abnormal exit too — chain it.
+        actor.set_error_exit(msg);
         return;
     }
     let handler_proc = match rt.lookup(&handler) {
         Some(v @ Value::Procedure(_)) => v,
         Some(other) => {
-            eprintln!(
+            let msg = format!(
                 "spawn-activation: top-level `{handler}` is {}, not a procedure",
                 other.type_name()
             );
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
         None => {
-            eprintln!("spawn-activation: no top-level `{handler}` defined in the source");
+            let msg = format!("spawn-activation: no top-level `{handler}` defined in the source");
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
     };
@@ -523,7 +900,13 @@ async fn activation_body(mut actor: cs_actor::Actor, source: String, handler: St
             Ok(Value::Boolean(false)) => break, // handler asked to stop
             Ok(_) => {}
             Err(e) => {
-                eprintln!("spawn-activation: handler `{handler}` raised: {e}");
+                let msg = format!("spawn-activation: handler `{handler}` raised: {e}");
+                eprintln!("{msg}");
+                // cs-845.8: an uncaught Scheme error is an abnormal exit —
+                // chain it to links/monitors as ExitReason::Error, same as a
+                // Rust panic would (previously this fell through to a quiet
+                // ExitReason::Normal).
+                actor.set_error_exit(msg);
                 break;
             }
         }
@@ -563,7 +946,7 @@ async fn drive_handler(
     handler: &Value,
     msg: Value,
 ) -> Result<Value, String> {
-    let rt_ptr: *mut crate::Runtime = rt;
+    let rt_ptr = CoPtr::new(rt);
     let actor_ptr: *mut cs_actor::Actor = actor;
     let handler = handler.clone();
 
@@ -574,9 +957,9 @@ async fn drive_handler(
                 // Publish the yielder FIRST, before the handler can suspend: on the
                 // first resume the driver can't pre-install it (the closure hasn't
                 // run yet), so the closure seeds it here.
-                YIELDER.with(|y| y.set(yielder as *const _));
+                YIELDER.with(|y| y.install(yielder as *const _ as *mut _));
                 // Sound: see fn doc — the driver is parked in `resume()` right now.
-                let rt = unsafe { &mut *rt_ptr };
+                let rt = unsafe { rt_ptr.get_mut() };
                 rt.apply_value(&handler, &[msg])
             },
         );
@@ -626,8 +1009,15 @@ async fn pump_coroutine(
     struct ClearCtx;
     impl Drop for ClearCtx {
         fn drop(&mut self) {
-            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-            YIELDER.with(|y| y.set(std::ptr::null()));
+            ACTOR_CTX.with(|c| c.clear());
+            YIELDER.with(|y| y.clear());
+            // cs-845.4: also clear the watchdog's "currently running" pid.
+            // On the normal path this is a redundant (idempotent) repeat of
+            // the inline post-resume call below, but on a panic unwinding
+            // out of `co.resume` it's the ONLY clear — without it the worker
+            // would permanently blame the dead actor's pid and emit a
+            // perpetual spurious stall warning.
+            cs_actor::local_pool::heartbeat_idle();
         }
     }
     let _clear_ctx = ClearCtx;
@@ -639,18 +1029,47 @@ async fn pump_coroutine(
     // The yielder pointer is stable for the coroutine's life; cache it after
     // the first resume so we can re-publish it before every later resume (a
     // co-located actor that ran during our suspend clobbered the thread-local).
-    let mut cached_yielder: *const Yielder<CoResume, CoYield> = std::ptr::null();
+    let mut cached_yielder: *mut Yielder<CoResume, CoYield> = std::ptr::null_mut();
     // The value handed to the next `resume`: ignored on the first resume; `Woke`
     // after a sleep; the mailbox result after a receive.
     let mut resume_input = CoResume::Woke;
 
     loop {
         // Install OUR actor's context for the duration of this resume only.
-        ACTOR_CTX.with(|c| c.set(actor_ptr));
-        YIELDER.with(|y| y.set(cached_yielder));
+        ACTOR_CTX.with(|c| c.install(actor_ptr));
+        YIELDER.with(|y| y.install(cached_yielder));
         REDUCTIONS.with(|c| c.set(0));
 
+        // cs-845.7: load THIS actor's own saved reduction countdown into
+        // the shared cs-vm thread_local before resuming it, so a
+        // co-located actor's leftover countdown never bleeds in. A
+        // fresh actor (no saved slice yet) gets a full budget.
+        let actor_ref = unsafe { &*actor_ptr };
+        cs_vm::vm::set_ticks_remaining(
+            actor_ref
+                .reduction_slice()
+                .unwrap_or_else(|| cs_vm::vm::reduction_budget().saturating_sub(1)),
+        );
+
+        // cs-845.4: bump this worker's heartbeat and record which actor is
+        // about to run — the resume/suspend transition the watchdog blames a
+        // stall on. Sound: `actor_ptr` is valid for the same reason ACTOR_CTX
+        // above is (one worker, control strictly alternates).
+        cs_actor::local_pool::heartbeat_running(actor_ref.pid());
+
         let result = co.resume(resume_input);
+
+        // cs-845.7: save the countdown back into THIS actor's state right
+        // after it suspends/returns, before a co-located actor's resume
+        // can observe (or overwrite) the shared thread_local. Budget
+        // exhaustion (`CoYield::Yield`) means the slice was fully spent —
+        // refill to a fresh full budget rather than saving the just-
+        // reloaded near-zero value, matching "your slice is spent".
+        if matches!(result, CoroutineResult::Yield(CoYield::Yield)) {
+            actor_ref.set_reduction_slice(cs_vm::vm::reduction_budget().saturating_sub(1));
+        } else {
+            actor_ref.set_reduction_slice(cs_vm::vm::ticks_remaining());
+        }
 
         // Capture the yielder the closure published on the first resume.
         if cached_yielder.is_null() {
@@ -658,8 +1077,12 @@ async fn pump_coroutine(
         }
         // Clear context BEFORE any await: while we're parked, the LocalSet may
         // run a co-located actor, and it must never observe our stale pointers.
-        ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
-        YIELDER.with(|y| y.set(std::ptr::null()));
+        ACTOR_CTX.with(|c| c.clear());
+        YIELDER.with(|y| y.clear());
+        // The resume returned (suspend or completion): this worker is no
+        // longer doing CPU-bound actor work, so it should never be blamed
+        // for a stall while cooperatively parked below.
+        cs_actor::local_pool::heartbeat_idle();
 
         // Region-park guard (P0.1): the TLS region stack is shared by every actor
         // co-located on this worker, so suspending (any Yield arm awaits) with an
@@ -711,6 +1134,16 @@ async fn pump_coroutine(
             #[cfg(feature = "stdlib-net")]
             CoroutineResult::Yield(CoYield::IoWrite { handle, bytes }) => {
                 resume_input = CoResume::IoWrite(driver_tcp_send(handle, bytes).await);
+            }
+            #[cfg(feature = "ffi-trait")]
+            CoroutineResult::Yield(CoYield::Blocking(op)) => {
+                // Run the blocking stdlib op (file I/O, subprocess wait,
+                // DNS/connect) on tokio's blocking threadpool instead of
+                // blocking this worker — releasing it for co-located actors.
+                resume_input = CoResume::Blocking(match tokio::task::spawn_blocking(op).await {
+                    Ok(res) => res,
+                    Err(e) => Err(format!("blocking op panicked: {e}")),
+                });
             }
             CoroutineResult::Return(outcome) => {
                 // `into_stack` asserts the coroutine is done — only valid here.
@@ -767,37 +1200,54 @@ async fn green_source_body(
     entry: String,
     args: Vec<SendableValue>,
 ) {
+    // cs-845.1: free any same-worker fast-path mail still queued for this
+    // actor on every exit path (return / error / panic-unwind / shutdown drop).
+    let _sw_guard = SameWorkerGuard(actor.pid());
     // cs-tds: this whole future lives on one `LocalWorkerPool` worker
     // thread for its entire life (tokio pins `spawn_local` tasks to the
     // thread that owns their `LocalSet`), and that pool is dedicated to
     // actor bodies — so disabling JIT tiering here is a once-per-task,
     // no-restore-needed equivalent of disabling it once at worker-thread
-    // startup. See `cs_vm::vm::set_jit_enabled` doc.
-    cs_vm::vm::set_jit_enabled(false);
+    // startup. See `cs_vm::vm::set_jit_enabled` doc. cs-845.6:
+    // `CRABSCHEME_ACTOR_JIT=1` opts back in.
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // Shared-Runtime: a cheap per-actor Runtime overlaying this worker's shared
     // base (builtins + bundled libs), instead of a full `Runtime::new()` per
     // actor. The body's defines land in the per-actor overlay env; builtins /
     // libraries resolve through to the shared base. This is the green-threads
     // memory lever (N actors → one base + N small overlays).
     let mut rt = crate::Runtime::from_image(&worker_runtime_image());
+    // cs-845.6: see the matching comment in `activation_body`.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // Load on the VM tier in the driver frame (no YIELDER installed yet:
     // top-level `(define …)`s don't park). Cached per source per worker — actors
     // running the same body reuse the compiled bytecode (sharing its code
     // chunks); only the closures + overlay bindings are per-actor. Mirrors
     // `run_scheme_body` otherwise.
+    // (cs-845.4 note: this load/compile phase runs in the driver frame,
+    // BEFORE pump_coroutine's first resume — no running-pid is recorded yet,
+    // so a pathologically slow compile here is watchdog-invisible. Accepted:
+    // the watchdog targets blocking *bodies*, and compiles are bounded.)
     if let Err(d) = rt.eval_str_via_vm_cached("<spawn-source-green>", &source) {
-        eprintln!("spawn-source(green): loading actor source failed: {d:?}");
+        let msg = format!("spawn-source(green): loading actor source failed: {d:?}");
+        eprintln!("{msg}");
+        // cs-845.8: load-phase failure is an abnormal exit too — chain it.
+        actor.set_error_exit(msg);
         return;
     }
     let call = match resolve_and_build_call(&rt, &entry, &args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("spawn-source(green): {e}");
+            let msg = format!("spawn-source(green): {e}");
+            eprintln!("{msg}");
+            actor.set_error_exit(msg);
             return;
         }
     };
 
-    let rt_ptr: *mut crate::Runtime = &mut rt;
+    let rt_ptr = CoPtr::new(&mut rt);
     let actor_ptr: *mut cs_actor::Actor = &mut actor;
     // `co` declared after `rt`/`actor` (drop-order — see fn doc). The closure
     // seeds the yielder, then runs the WHOLE body; its (raw-receive)/(sleep)
@@ -806,9 +1256,9 @@ async fn green_source_body(
         Coroutine::with_stack(
             checkout_stack(StackClass::Green),
             move |yielder, _first: CoResume| {
-                YIELDER.with(|y| y.set(yielder as *const _));
+                YIELDER.with(|y| y.install(yielder as *const _ as *mut _));
                 // Sound: the driver is parked in `resume()` right now (see fn doc).
-                let rt = unsafe { &mut *rt_ptr };
+                let rt = unsafe { rt_ptr.get_mut() };
                 rt.eval_str_via_vm("<spawn-source-green-body>", &call)
                     .map_err(|d| format!("actor body raised: {d:?}"))
             },
@@ -817,15 +1267,15 @@ async fn green_source_body(
     // Termination parity with the dedicated path (`scheme_source_entry`) and the
     // activation path (`activation_body`): a *Scheme-level* error (the body
     // returned `Err` — including a trap-exit `Err` from `(raw-receive)`) is
-    // surfaced loudly and the actor exits cleanly → `ExitReason::Normal` via
-    // `spawn_local_activation`'s wrapper. A *Rust panic* propagates out of this
-    // future and that wrapper's `catch_unwind` maps it to `ExitReason::Error`,
-    // which `on_actor_termination` then chains to linked actors / monitors —
-    // identical to the dedicated `spawn_async` path. (No Scheme primitive exits
-    // with a custom Error reason; abnormal exits come only from panics.) The
-    // `pump_coroutine` ClearCtx guard keeps that panic path hygienic.
+    // surfaced loudly AND recorded via `Actor::set_error_exit` (cs-845.8), so
+    // `spawn_local_activation`'s wrapper reports `ExitReason::Error` — chained
+    // to linked actors / monitors exactly as a Rust panic would be. A panic
+    // still propagates out of this future and is caught the same way (the
+    // `pump_coroutine` ClearCtx guard keeps that path hygienic).
     if let Err(e) = pump_coroutine(co, actor_ptr, StackClass::Green).await {
-        eprintln!("spawn-source(green): actor `{entry}` terminated: {e}");
+        let msg = format!("spawn-source(green): actor `{entry}` terminated: {e}");
+        eprintln!("{msg}");
+        actor.set_error_exit(msg);
     }
 }
 
@@ -938,11 +1388,16 @@ async fn driver_tcp_send(handle: i64, bytes: Vec<u8>) -> Result<(), String> {
 /// onto the actor's worker thread cleanly. The `Rc` graph is created *inside*
 /// the closure, on that thread, and never escapes it.
 fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
-    Arc::new(move |_actor, args| {
+    Arc::new(move |actor, args| {
         if let Err(e) = run_scheme_body(&source, &entry, &args) {
             // The actor terminates (the body returned/aborted). Surface the
             // reason loudly rather than dying silently — Article VI.
-            eprintln!("spawn-source: actor `{entry}` terminated: {e}");
+            let msg = format!("spawn-source: actor `{entry}` terminated: {e}");
+            eprintln!("{msg}");
+            // cs-845.8: chain the Scheme-level error to links/monitors as
+            // ExitReason::Error (previously only a Rust panic did this; a
+            // clean-return-after-logging looked identical to a Normal exit).
+            actor.set_error_exit(msg);
         }
     })
 }
@@ -954,6 +1409,10 @@ fn scheme_source_entry(source: String, entry: String) -> ActorEntry {
 /// invoking us.
 fn run_scheme_body(source: &str, entry: &str, args: &[SendableValue]) -> Result<(), String> {
     let mut rt = crate::Runtime::new();
+    // cs-845.6: see the matching comment in `activation_body`.
+    if actor_jit_enabled_override() {
+        let _ = rt.install_jit();
+    }
     // Run the actor body on the VM bytecode tier, not the walker — the VM is
     // ~2.8× faster than the tree-walker on this kind of code (RESP parse,
     // command dispatch, store ops, Raft logic). JIT is intentionally NOT
@@ -1077,9 +1536,26 @@ fn sendable_to_datum(s: &SendableValue, out: &mut String) -> Result<(), String> 
         SendableValue::Unspecified => {
             return Err("the unspecified value cannot be a spawn-source argument".into());
         }
+        // cs-845.1: `Local` is an internal same-worker-mailbox handle,
+        // produced only by `try_send_same_worker` and consumed only by
+        // `from_sendable`. It should never reach datum serialization
+        // (spawn-source args always go through `to_sendable_in`, not the
+        // fast-send path).
+        SendableValue::Local { .. } => {
+            return Err(
+                "internal error: a same-worker message handle escaped into datum serialization"
+                    .into(),
+            );
+        }
         SendableValue::Eof => {
             return Err("the eof object cannot be a spawn-source argument".into());
         }
+        // cs-845.2: `to_sendable_in` (what spawn-arg encoding always uses)
+        // never produces `SymbolId` — only `to_sendable_in_for_message`
+        // (the actor cross-worker message path) does. Should never reach
+        // here, but `name` is always populated, so render it rather than
+        // erroring: as safe as the plain `Symbol` arm above.
+        SendableValue::SymbolId { name, .. } => out.push_str(name),
     }
     Ok(())
 }
@@ -1144,7 +1620,7 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // worker thread inside block_in_place; the Guard clears it
     // before the closure returns or unwinds.
     let ptr: *mut cs_actor::Actor = actor;
-    ACTOR_CTX.with(|c| c.set(ptr));
+    ACTOR_CTX.with(|c| c.install(ptr));
     REDUCTIONS.with(|c| c.set(0));
     // parallel-runtime C2.2: install the reduction-yield hook
     // for this worker thread. cs-actor::tokio_yield_hook
@@ -1153,14 +1629,15 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     // contexts never reach here, so the hook stays None and
     // the dispatch loop's per-op tick is a pure counter no-op.
     let prev_hook = cs_vm::vm::install_yield_hook(Some(cs_actor::tokio_yield_hook));
-    // cs-tds: actor bodies run VM-only — the JIT is deliberately dropped
-    // for actors (perf/actor-vm-jit found it hung concurrent SET, with
-    // only marginal gain elsewhere). Clearing this per-invocation lets
+    // cs-tds: actor bodies run VM-only by default — the JIT is deliberately
+    // dropped for actors (perf/actor-vm-jit found it hung concurrent SET,
+    // with only marginal gain elsewhere). Clearing this per-invocation lets
     // the Call/TailCall dispatch loop skip the tier-bump/jit_ptr checks
     // that only matter for JIT tiering; a pooled worker thread reused by
     // a non-actor caller has it restored to `true` by the Guard below.
+    // cs-845.6: `CRABSCHEME_ACTOR_JIT=1` opts back in.
     let prev_jit_enabled = cs_vm::vm::jit_enabled();
-    cs_vm::vm::set_jit_enabled(false);
+    cs_vm::vm::set_jit_enabled(actor_jit_enabled_override());
     // parallel-runtime C4.5: bridge the BR sweep's yield
     // hook to cs-vm's reduction counter. The same
     // per-iteration tick the bytecode dispatch loop uses
@@ -1181,7 +1658,7 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     }
     impl Drop for Guard {
         fn drop(&mut self) {
-            ACTOR_CTX.with(|c| c.set(std::ptr::null_mut()));
+            ACTOR_CTX.with(|c| c.clear());
             REDUCTIONS.with(|c| c.set(0));
             // Restore the previous hook (typically None) so a
             // pooled worker thread reused by a non-actor caller
@@ -1201,13 +1678,180 @@ fn run_actor_body(actor: &mut cs_actor::Actor, entry: ActorEntry, args: Vec<Send
     entry(actor, args);
 }
 
+// cs-845.9: checked accessor for a raw-pointer thread-local bridge.
+//
+// `ACTOR_CTX` and `YIELDER` (below) are `!Send` raw pointers threaded through a
+// `thread_local!` so deeply-nested Scheme builtins can reach a coroutine's
+// driver/actor without every call signature carrying them. The soundness
+// invariants (never null when dereferenced, installed by and only read on the
+// installing thread, reinstalled before every resume / cleared before every
+// await) are today enforced purely by comment + discipline — a real UAF/data
+// race surface if a future refactor moves a resume/clear off its documented
+// spot. `CheckedTls<T>` keeps the exact same raw-pointer, zero-indirection
+// representation in release builds (the debug-only fields disappear via
+// `#[cfg(debug_assertions)]`, so `size_of::<CheckedTls<T>>() ==
+// size_of::<*mut T>()` in release) while adding two checks in debug/test
+// builds:
+//   - **thread-id**: every non-null read is asserted to happen on the same
+//     thread that performed the most recent `install` — the pointer must
+//     never cross a thread boundary.
+//   - **generation**: a counter bumped on every `install`/`clear`. A caller
+//     that captured a generation before a suspend point can assert (via
+//     [`CheckedTls::deref_checked`]) that no intervening clear/reinstall cycle
+//     happened while it was parked — the classic "yielder installed by a
+//     previous pump iteration, read stale after a suspend" bug class.
+struct CheckedTls<T> {
+    ptr: std::cell::Cell<*mut T>,
+    #[cfg(debug_assertions)]
+    generation: std::cell::Cell<u64>,
+    #[cfg(debug_assertions)]
+    owner: std::cell::Cell<Option<std::thread::ThreadId>>,
+}
+
+// Test-only: production instances only ever live in `thread_local!` storage
+// (which needs no `Sync` bound), so a real build stays `!Sync`. The misuse
+// tests below deliberately share one instance across a `std::thread::spawn`
+// boundary (synchronized via `JoinHandle::join`) to exercise the wrong-thread
+// debug_assert — that needs a `'static` reference reachable from both
+// threads, hence `Sync` here in test builds only.
+#[cfg(test)]
+unsafe impl<T> Sync for CheckedTls<T> {}
+
+impl<T> CheckedTls<T> {
+    const fn new() -> Self {
+        CheckedTls {
+            ptr: std::cell::Cell::new(std::ptr::null_mut()),
+            #[cfg(debug_assertions)]
+            generation: std::cell::Cell::new(0),
+            #[cfg(debug_assertions)]
+            owner: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Install `ptr` for the current thread. Bumps the generation and records
+    /// the installing thread (debug builds only) — a subsequent `get`/
+    /// `deref_checked` from a different thread, or against a stale captured
+    /// generation, fails loudly instead of silently reading whatever memory
+    /// the raw pointer happens to still point at.
+    fn install(&self, ptr: *mut T) {
+        #[cfg(debug_assertions)]
+        {
+            self.generation.set(self.generation.get().wrapping_add(1));
+            self.owner.set(Some(std::thread::current().id()));
+        }
+        self.ptr.set(ptr);
+    }
+
+    /// Clear to null. Bumps the generation, same as `install` — a generation
+    /// captured before this clear is now provably stale.
+    fn clear(&self) {
+        #[cfg(debug_assertions)]
+        {
+            self.generation.set(self.generation.get().wrapping_add(1));
+        }
+        self.ptr.set(std::ptr::null_mut());
+    }
+
+    /// Raw pointer read (may be null — callers that treat null as "not
+    /// installed" keep doing so). In debug builds, any non-null read is
+    /// asserted to happen on the thread that installed it.
+    fn get(&self) -> *mut T {
+        let p = self.ptr.get();
+        #[cfg(debug_assertions)]
+        if !p.is_null() {
+            if let Some(owner) = self.owner.get() {
+                debug_assert_eq!(
+                    owner,
+                    std::thread::current().id(),
+                    "CheckedTls: dereferenced on a different thread than installed it"
+                );
+            }
+        }
+        p
+    }
+
+    /// The current generation counter (debug builds only — see the type doc).
+    /// Only exercised by the misuse tests today; kept as the seam a future
+    /// suspend-spanning caller captures before parking.
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
+    fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Like [`Self::get`], but additionally debug_asserts the generation
+    /// still matches `expected` — i.e. no `install`/`clear` happened on this
+    /// TLS slot since the caller captured `expected` (typically just before a
+    /// suspend point). In release builds this is identical to `get`.
+    /// Only exercised by the misuse tests today (see `generation`).
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
+    fn deref_checked(&self, expected: u64) -> *mut T {
+        debug_assert_eq!(
+            self.generation.get(),
+            expected,
+            "CheckedTls: stale generation — TLS was cleared/reinstalled since the caller captured it"
+        );
+        self.get()
+    }
+}
+
+/// A raw pointer captured for a coroutine closure's lifetime (the `rt_ptr`
+/// bridges in [`drive_handler`] / [`green_source_body`]): not TLS, but the
+/// same single-thread / strictly-alternating-control soundness argument
+/// applies (see those functions' safety docs). `CoPtr` keeps the bare-pointer
+/// representation in release (the owning-thread field is
+/// `#[cfg(debug_assertions)]`-only) while debug/test builds assert the
+/// dereferencing thread matches the thread that captured the pointer.
+struct CoPtr<T> {
+    ptr: *mut T,
+    #[cfg(debug_assertions)]
+    owner: std::thread::ThreadId,
+}
+
+// Test-only: production only ever moves a `CoPtr` into a same-thread
+// coroutine closure (never across a real thread boundary — `Coroutine`
+// itself has no `Send` bound, same as the raw pointer it replaces), so a
+// real build stays `!Send`. The misuse test below deliberately moves one
+// into a `std::thread::spawn` closure to exercise the wrong-thread
+// debug_assert.
+#[cfg(test)]
+unsafe impl<T> Send for CoPtr<T> {}
+
+impl<T> CoPtr<T> {
+    fn new(r: &mut T) -> Self {
+        CoPtr {
+            ptr: r as *mut T,
+            #[cfg(debug_assertions)]
+            owner: std::thread::current().id(),
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold the discipline documented at the call site: the
+    /// pointee outlives this `CoPtr`, and this is the only live reference at
+    /// the time of the call (strictly-alternating coroutine/driver control).
+    // `mut_from_ref` is the point of this type: it reproduces the raw
+    // `unsafe { &mut *rt_ptr }` it replaces, with the aliasing discipline
+    // documented above and asserted (thread-id) in debug builds.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self) -> &mut T {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.owner,
+            std::thread::current().id(),
+            "CoPtr: dereferenced on a different thread than captured it"
+        );
+        unsafe { &mut *self.ptr }
+    }
+}
+
 // ActorContext: thread-local pointer to the currently-running
 // Actor so per-actor Scheme builtins ((self), (raw-receive))
 // can find their context without it being threaded through
 // every builtin signature.
 std::thread_local! {
-    static ACTOR_CTX: std::cell::Cell<*mut cs_actor::Actor> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static ACTOR_CTX: CheckedTls<cs_actor::Actor> = const { CheckedTls::new() };
 
     /// Per-actor reduction counter (Erlang's "reductions" — a
     /// proxy for work done). Bumped by `(bump-reductions! N)`
@@ -1229,8 +1873,7 @@ std::thread_local! {
     /// (same single-thread raw-pointer discipline as `ACTOR_CTX`). Non-null only
     /// while a coroutine-driven handler is on the stack; `(sleep)` reads it to
     /// decide cooperative-suspend vs. plain `thread::sleep`.
-    static YIELDER: std::cell::Cell<*const Yielder<CoResume, CoYield>> =
-        const { std::cell::Cell::new(std::ptr::null()) };
+    static YIELDER: CheckedTls<Yielder<CoResume, CoYield>> = const { CheckedTls::new() };
 
     /// Per-worker pool of recycled coroutine stacks (mmap-backed, with a guard
     /// page). A handler that never sleeps checks a stack out, runs to `Return`,
@@ -1283,6 +1926,12 @@ enum CoYield {
     /// worker), then resume with `IoWrite(..)`. See [`cooperative_tcp_send_hook`].
     #[cfg(feature = "stdlib-net")]
     IoWrite { handle: i64, bytes: Vec<u8> },
+    /// A generic blocking stdlib op (file I/O, subprocess wait, DNS/connect) —
+    /// cs-845.3. Run `op` on a `spawn_blocking` thread (releasing the worker)
+    /// instead of blocking it in place, then resume with `Blocking(..)`. See
+    /// [`cooperative_blocking_hook`] and `cs_ffi::blocking`.
+    #[cfg(feature = "ffi-trait")]
+    Blocking(cs_ffi::blocking::BlockingOp),
 }
 
 /// What the driver passes back *into* the coroutine on resume — the coroutine's
@@ -1302,6 +1951,10 @@ enum CoResume {
     /// Resume value after an `IoWrite`: success or the write error.
     #[cfg(feature = "stdlib-net")]
     IoWrite(Result<(), String>),
+    /// Resume value after a `Blocking` op: the erased result `spawn_blocking`
+    /// produced (or a panic message if the blocking task panicked).
+    #[cfg(feature = "ffi-trait")]
+    Blocking(Result<Box<dyn std::any::Any + Send>, String>),
 }
 
 std::thread_local! {
@@ -1785,8 +2438,27 @@ fn value_to_str<'a>(v: &'a Value, syms: &'a SymbolTable, who: &str) -> Result<St
 pub fn b_beam_send(args: &[Value], syms: &mut SymbolTable) -> Result<Value, String> {
     check_arity("send", args, 2)?;
     let pid = value_to_pid(&args[0], syms, "send")?;
-    let sv = to_sendable_in(&args[1], syms)?;
-    primop_send(pid, sv)?;
+    // cs-845.1: try the same-worker fast path first — skips the
+    // SendableValue projection/rebuild round-trip when sender and
+    // receiver are colocated on the same LocalWorkerPool worker. Falls
+    // back to the general cross-worker path otherwise, which (cs-845.2)
+    // uses `to_sendable_in_for_message` so base-table symbols cross as a
+    // bare id instead of a cloned name + receiver-side re-intern.
+    let target_worker = beam_state().actors.local_worker_of(pid);
+    match try_send_same_worker(&args[1], syms, pid, target_worker)? {
+        Some((recv, seq, cloned)) => {
+            // Send the marker first; only park the value once the marker was
+            // actually delivered. If `primop_send` errors (target just
+            // terminated), we return without committing, so no orphan value is
+            // left in the side-queue.
+            primop_send(pid, SendableValue::Local { recv, seq })?;
+            commit_same_worker_msg(recv, seq, cloned);
+        }
+        None => {
+            let sv = to_sendable_in_for_message(&args[1], syms)?;
+            primop_send(pid, sv)?;
+        }
+    }
     Ok(Value::Unspecified)
 }
 
@@ -2860,6 +3532,34 @@ pub fn cooperative_tcp_send_hook(handle: i64, bytes: &[u8]) -> Option<Result<(),
     }
 }
 
+/// Cooperative-blocking hook (cs-845.3) — the generic counterpart of
+/// [`cooperative_sleep_hook`]/[`cooperative_tcp_recv_hook`] for stdlib ops
+/// that don't have a bespoke async equivalent (file I/O, subprocess wait,
+/// DNS/connect). Matches `cs_ffi::blocking::BlockingHook`'s signature exactly
+/// so it installs directly into `cs-stdlib-fs`/`cs-stdlib-process`/
+/// `cs-stdlib-net`'s `install_cooperative_blocking`.
+///
+/// Unlike the other cooperative hooks this always returns `Some`: with no
+/// coroutine driver active on this thread (no [`YIELDER`]), it just runs
+/// `op` inline — identical to the caller doing the blocking call directly —
+/// rather than pushing that decision back onto the caller.
+#[cfg(feature = "ffi-trait")]
+pub fn cooperative_blocking_hook(
+    op: cs_ffi::blocking::BlockingOp,
+) -> Option<Result<Box<dyn std::any::Any + Send>, String>> {
+    let yielder = YIELDER.with(|c| c.get());
+    if yielder.is_null() {
+        return Some(op());
+    }
+    // Sound: see `cooperative_sleep_hook`.
+    match unsafe { (*yielder).suspend(CoYield::Blocking(op)) } {
+        CoResume::Blocking(res) => Some(res),
+        _ => Some(Err(
+            "blocking op: internal error (resumed without a result)".into(),
+        )),
+    }
+}
+
 /// `(raw-receive)` blocks until a message arrives;
 /// `(raw-receive timeout-ms)` returns `'*timeout*` if the deadline
 /// passes without one. System messages (Exit/Down) surface as
@@ -3096,6 +3796,92 @@ pub fn beam_syms_builtins() -> Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    // cs-845.9: deliberate-misuse tests for `CheckedTls` / `CoPtr` — these are
+    // debug-only guards (the fields the assertions read don't exist in a
+    // release build), so the whole module is gated the same way the checks
+    // are.
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "dereferenced on a different thread")]
+    fn checked_tls_wrong_thread_panics() {
+        static TLS: CheckedTls<i32> = CheckedTls::new();
+        let mut val = 7;
+        TLS.install(&mut val as *mut i32);
+        // Installed on this (the test) thread; reading it from a spawned
+        // thread must trip the thread-id debug_assert. Propagate the
+        // spawned thread's actual panic payload (via `resume_unwind`, not
+        // `.expect`) so `#[should_panic(expected = ..)]` sees its message.
+        if let Err(payload) = std::thread::spawn(|| {
+            let _ = TLS.get();
+        })
+        .join()
+        {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stale generation")]
+    fn checked_tls_deref_after_clear_panics() {
+        static TLS: CheckedTls<i32> = CheckedTls::new();
+        let mut val = 7;
+        TLS.install(&mut val as *mut i32);
+        let stale_gen = TLS.generation();
+        TLS.clear();
+        // `clear` bumped the generation, so asserting against the
+        // pre-clear generation must panic — this is the "deref after
+        // clear"/"stale pointer across a suspend" bug class caught.
+        let _ = TLS.deref_checked(stale_gen);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn checked_tls_reinstall_after_clear_is_fresh_generation() {
+        static TLS: CheckedTls<i32> = CheckedTls::new();
+        let mut a = 1;
+        let mut b = 2;
+        TLS.install(&mut a as *mut i32);
+        let gen_a = TLS.generation();
+        TLS.clear();
+        TLS.install(&mut b as *mut i32);
+        let gen_b = TLS.generation();
+        assert_ne!(
+            gen_a, gen_b,
+            "install after a clear must bump the generation"
+        );
+        // A caller that captured `gen_b` right after this install may
+        // legitimately deref — no panic.
+        assert_eq!(TLS.deref_checked(gen_b), &mut b as *mut i32);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "dereferenced on a different thread")]
+    fn co_ptr_wrong_thread_panics() {
+        let mut val = 7i32;
+        let co = CoPtr::new(&mut val);
+        if let Err(payload) = std::thread::spawn(move || unsafe {
+            let _ = co.get_mut();
+        })
+        .join()
+        {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn co_ptr_same_thread_is_fine() {
+        let mut val = 7i32;
+        let co = CoPtr::new(&mut val);
+        unsafe {
+            *co.get_mut() += 1;
+        }
+        assert_eq!(val, 8);
+    }
 
     #[test]
     fn round_trip_atoms() {
@@ -3163,6 +3949,244 @@ mod tests {
             assert_ne!(src_foo.0, dst_foo.0, "interning offsets should differ");
         } else {
             panic!("expected Symbol");
+        }
+    }
+
+    /// Two `SymbolTable`s layered (`with_base`) over the identical shared
+    /// base image, standing in for two different `LocalWorkerPool` workers'
+    /// per-actor tables — this is exactly the shape `worker_runtime_image`
+    /// produces per worker in production.
+    fn base_and_two_workers() -> (Rc<SymbolTable>, SymbolTable, SymbolTable) {
+        let mut base = SymbolTable::new();
+        base.intern("car");
+        base.intern("cdr");
+        let foo_base = base.intern("foo"); // interned into the SHARED base
+        let base = Rc::new(base);
+        let worker_a = SymbolTable::with_base(base.clone());
+        let worker_b = SymbolTable::with_base(base.clone());
+        let _ = foo_base;
+        (base, worker_a, worker_b)
+    }
+
+    #[test]
+    fn cross_worker_message_base_symbol_is_eq_by_id_no_string_roundtrip() {
+        // cs-845.2: a base-table symbol crosses as `SendableValue::SymbolId`
+        // (id + name), not plain `Symbol(String)` — assert the *projection*
+        // itself (not just the round-tripped value) so this fails the
+        // moment the fast path silently falls back to the string form.
+        let (base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let foo = worker_a.intern("foo"); // resolves to the shared base id
+        assert!(
+            worker_a.is_base(foo),
+            "foo must be a base symbol for this test to be meaningful"
+        );
+
+        let v = Value::Symbol(foo);
+        let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+        match &sv {
+            SendableValue::SymbolId { id, name } => {
+                assert_eq!(*id, foo.0);
+                assert_eq!(name, "foo");
+            }
+            other => panic!(
+                "expected SendableValue::SymbolId, got {:?} (fast path fell back)",
+                other
+            ),
+        }
+
+        // Deliver on worker B: eq? to the SAME symbol B would get by
+        // locally interning "foo" itself — no string ever crossed.
+        let delivered = from_sendable(&sv, &mut worker_b);
+        let locally_interned = worker_b.intern("foo");
+        match delivered {
+            Value::Symbol(s) => assert_eq!(
+                s, locally_interned,
+                "delivered symbol must be eq? to B's own interning of the same name"
+            ),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+        drop(base);
+    }
+
+    #[test]
+    fn cross_worker_message_extension_symbol_still_roundtrips_via_string() {
+        // A symbol private to the SENDER's own extension table (never
+        // shared with worker B) must NOT take the id-only fast path —
+        // its id is meaningless off the sender's table.
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        // Force worker_b to have already claimed a different extension
+        // symbol first, so a naive "copy the id verbatim" bug would
+        // collide with the wrong name and this test would catch it.
+        worker_b.intern("something-else-first");
+
+        let private = worker_a.intern("actor-a-private-helper");
+        assert!(
+            !worker_a.is_base(private),
+            "a freshly-interned symbol must be an extension symbol"
+        );
+
+        let v = Value::Symbol(private);
+        let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+        assert_eq!(
+            sv,
+            SendableValue::Symbol("actor-a-private-helper".into()),
+            "extension-table symbols must still cross by name"
+        );
+
+        let delivered = from_sendable(&sv, &mut worker_b);
+        match delivered {
+            Value::Symbol(s) => assert_eq!(worker_b.name(s), "actor-a-private-helper"),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cross_worker_message_stale_symbol_id_falls_back_safely() {
+        // The bug this test pins: two independently-built per-worker base
+        // images are NOT guaranteed to be byte-identical in this codebase
+        // (found empirically — see the `SymbolId` doc). If the receiver's
+        // own base disagrees that `id` names `name` (wrong name at that id,
+        // OR `id` out of range entirely), `from_sendable` MUST fall back to
+        // `intern(name)` rather than trusting the id — silently building the
+        // wrong symbol, or panicking on an out-of-bounds index, are both
+        // unacceptable.
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let foo = worker_a.intern("foo");
+        assert!(worker_a.is_base(foo));
+
+        // Case 1: id in range but names a DIFFERENT symbol on the receiver
+        // (simulates a base that grew/shrank between the two builds).
+        let wrong_name_sv = SendableValue::SymbolId {
+            id: foo.0,
+            name: "totally-different-name".into(),
+        };
+        let delivered = from_sendable(&wrong_name_sv, &mut worker_b);
+        match delivered {
+            Value::Symbol(s) => assert_eq!(
+                worker_b.name(s),
+                "totally-different-name",
+                "must fall back to interning `name`, not blindly trust a mismatched id"
+            ),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+
+        // Case 2: id far out of range for the receiver's table entirely —
+        // must not panic (this reproduces the `index out of bounds` crash
+        // this test suite hit during development).
+        let out_of_range_sv = SendableValue::SymbolId {
+            id: 999_999,
+            name: "still-fine".into(),
+        };
+        let delivered = from_sendable(&out_of_range_sv, &mut worker_b);
+        match delivered {
+            Value::Symbol(s) => assert_eq!(worker_b.name(s), "still-fine"),
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+    }
+
+    /// A/B micro-benchmark: cs-845.2's `to_sendable_in_for_message` (SymbolId
+    /// fast path for base-table symbols) vs. the pre-cs-845.2 general
+    /// `to_sendable_in` path (always `Symbol(String)`, always re-interned by
+    /// name on decode) that every cross-worker `send` used before this
+    /// change. `#[ignore]` (it's a throughput measurement, not a
+    /// correctness check) — run with
+    /// `cargo test --release -p cs-runtime --features actor --lib \
+    ///  cross_worker_message_symbol_ab_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cross_worker_message_symbol_ab_bench() {
+        let (_base, mut worker_a, mut worker_b) = base_and_two_workers();
+        let car = worker_a.intern("car"); // base symbol, present in both tables
+        let v = Value::Symbol(car);
+        const N: u32 = 2_000_000;
+
+        let before = std::time::Instant::now();
+        for _ in 0..N {
+            let sv = to_sendable_in(&v, &worker_a).expect("encode");
+            std::hint::black_box(from_sendable(&sv, &mut worker_b));
+        }
+        let before_elapsed = before.elapsed();
+
+        let after = std::time::Instant::now();
+        for _ in 0..N {
+            let sv = to_sendable_in_for_message(&v, &worker_a).expect("encode");
+            std::hint::black_box(from_sendable(&sv, &mut worker_b));
+        }
+        let after_elapsed = after.elapsed();
+
+        let before_rate = N as f64 / before_elapsed.as_secs_f64();
+        let after_rate = N as f64 / after_elapsed.as_secs_f64();
+        println!(
+            "cs-845.2 symbol fast-path A/B ({N} sends each):\n  \
+             before (to_sendable_in, string): {:>10.0} msg/s ({:?})\n  \
+             after  (to_sendable_in_for_message, id): {:>10.0} msg/s ({:?})\n  \
+             speedup: {:.2}x",
+            before_rate,
+            before_elapsed,
+            after_rate,
+            after_elapsed,
+            after_rate / before_rate
+        );
+    }
+
+    #[test]
+    fn cross_worker_message_send_recv_symbol_identity_via_actors() {
+        // Full end-to-end wiring check, through the real `b_beam_send`
+        // primop (not the unit-tested `to_sendable_in_for_message`
+        // directly): two *dedicated*-thread actors (each its own OS thread,
+        // each building its own `RuntimeImage::build()` — never in a
+        // `LocalWorkerPool`, so `local_worker_of` is always `None` and
+        // `send` between them always takes the general/cross-worker path,
+        // never the cs-845.1 same-worker fast path) exchange a base-image
+        // symbol. The receiver's `(eq? v 'car)` must be `#t`: the id `car`
+        // gets baked into `SendableValue::SymbolId` on the sender's actor
+        // thread must name the identical symbol in the receiver's
+        // independently-built base table.
+        let table = "cs-845-2-cross-worker-symbol-eq";
+        primop_make_table(table, "set").expect("make table");
+
+        // B: receive a value, record whether it's eq? to its own 'car.
+        let checker = primop_spawn_source_dedicated(
+            "(define (check key) (let ((v (raw-receive))) \
+             (table-insert! 'cs-845-2-cross-worker-symbol-eq key (eq? v (quote car)))))"
+                .into(),
+            "check".into(),
+            vec![SendableValue::String("r".into())],
+        )
+        .expect("spawn checker");
+
+        // A: receive B's pid as a message (Pid round-trips as a `<pid:..>`
+        // symbol `send` parses back), then relay a base-image symbol to B.
+        // This `(send target 'car)` call is the one that runs through
+        // `b_beam_send` on A's own dedicated thread.
+        let relay = primop_spawn_source_dedicated(
+            "(define (relay key) (let ((target (raw-receive))) (send target (quote car))))".into(),
+            "relay".into(),
+            vec![SendableValue::String("unused".into())],
+        )
+        .expect("spawn relay");
+
+        // Kick things off from the test thread (also never a LocalWorkerPool
+        // worker, so this hop is cross-worker-shaped too): tell A where B is.
+        primop_send(relay, SendableValue::Pid(checker)).expect("send checker pid to relay");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(v) = primop_table_lookup(table, &SendableValue::String("r".into()))
+                .expect("table lookup")
+            {
+                assert_eq!(
+                    v,
+                    SendableValue::Boolean(true),
+                    "a base-image symbol sent cross-worker must be eq? to the same name \
+                     interned locally on the receiver"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("cross-worker symbol relay never completed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -3664,6 +4688,220 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn same_worker_send_deep_clones_not_aliases() {
+        // cs-845.1: two spawn-source-green actors colocated on the same
+        // LocalWorkerPool worker take the fast same-worker send path
+        // (`try_send_same_worker`) instead of the SendableValue
+        // projection round-trip. Prove it preserves copy semantics: the
+        // sender mutates its list *after* sending it, and the receiver's
+        // copy must be unaffected.
+        let table = "same-worker-send-test";
+        primop_make_table(table, "set").expect("make table");
+
+        // The receiver just files whatever it's handed under the given
+        // key — a LocalWorkerPool actor so it's eligible for colocation.
+        let receiver_body = r#"
+            (define (recv)
+              (let loop ()
+                (let ((msg (raw-receive)))
+                  (table-insert! 'same-worker-send-test (car msg) (cdr msg))
+                  (loop))))
+        "#;
+        let receiver =
+            primop_spawn_source_green(receiver_body.to_string(), "recv".to_string(), vec![])
+                .expect("spawn receiver");
+
+        // The sender: waits to be handed the receiver's pid (a PID can't
+        // ride as a spawn arg — the datum bridge rejects it — so it
+        // arrives as a message, same as `ping_pong_two_actors` below),
+        // then builds a mutable list, sends it, and mutates the ORIGINAL
+        // *after* sending. If the fast path aliased instead of
+        // deep-cloning, the receiver would observe the post-mutation
+        // value (1 999 3) instead of the pre-send value (1 2 3). Also a
+        // `spawn-source-green` (LocalWorkerPool) actor, so it's eligible
+        // for colocation with `receiver`.
+        // Fixnum table keys (1 = pre-mutation copy, 2 = post-mutation
+        // original) keep the messages symbol-free, so the fast path never
+        // bails on a per-actor extension symbol — letting the counter
+        // assertion below prove the fast path really fired.
+        let sender_body = r#"
+            (define (run)
+              (let ((rpid (raw-receive)))
+                (let ((original (list 1 2 3)))
+                  (send rpid (cons 1 original))
+                  (set-car! (cdr original) 999)
+                  (send rpid (cons 2 original)))))
+        "#;
+
+        // Find a sender colocated with `receiver` by pigeonhole: spawn
+        // candidates (round-robin dispatched) until one lands on the same
+        // worker. 512 candidates comfortably exceeds any real machine's
+        // `available_parallelism()` worker count. Every candidate but the
+        // chosen one just parks forever on its `raw-receive` — harmless,
+        // torn down at process exit.
+        let mut sender = None;
+        for _ in 0..512 {
+            let candidate =
+                primop_spawn_source_green(sender_body.to_string(), "run".to_string(), vec![])
+                    .expect("spawn candidate");
+            if beam_state().actors.local_worker_of(candidate)
+                == beam_state().actors.local_worker_of(receiver)
+            {
+                sender = Some(candidate);
+                break;
+            }
+        }
+        let sender = sender.expect("failed to find a worker-colocated sender candidate");
+        let fast_sends_before = same_worker_fast_send_count();
+        primop_send(sender, SendableValue::Pid(receiver)).expect("kick off sender");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let copy = primop_table_lookup(table, &SendableValue::Fixnum(1)).expect("lookup copy");
+            let mutated = primop_table_lookup(table, &SendableValue::Fixnum(2))
+                .expect("lookup mutated-original");
+            if let (Some(copy), Some(mutated)) = (copy, mutated) {
+                let list123 = SendableValue::Pair(
+                    Box::new(SendableValue::Fixnum(1)),
+                    Box::new(SendableValue::Pair(
+                        Box::new(SendableValue::Fixnum(2)),
+                        Box::new(SendableValue::Pair(
+                            Box::new(SendableValue::Fixnum(3)),
+                            Box::new(SendableValue::Null),
+                        )),
+                    )),
+                );
+                assert_eq!(
+                    copy, list123,
+                    "receiver's copy must reflect the list as it was AT SEND TIME"
+                );
+                assert_ne!(
+                    mutated, list123,
+                    "sanity: the original really was mutated after sending"
+                );
+                // Both sends were colocated + symbol-free, so both must
+                // have taken the fast path (>= tolerates other actor
+                // tests bumping the process-wide counter concurrently).
+                assert!(
+                    same_worker_fast_send_count() >= fast_sends_before + 2,
+                    "expected the colocated sends to take the same-worker fast path"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("same-worker send/receive never completed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // cs-845.1 judge fixes: direct unit coverage of the fast-path internals
+    // (no actor runtime needed — these exercise the thread-local side-queue,
+    // the base-symbol gating, and the RAII guard on the calling thread).
+
+    fn as_fixnum(v: &Value) -> i64 {
+        match v {
+            Value::Fixnum(n) => *n,
+            other => panic!("expected fixnum, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn deep_clone_bails_on_nested_non_base_symbol() {
+        // A symbol that resolves through the shared Rc base is safe to copy
+        // verbatim (`is_base` → true); one interned into a table's private
+        // extension is not, and must force the whole clone to bail (`Ok(None)`)
+        // even when buried inside a pair or vector.
+        let base = std::rc::Rc::new({
+            let mut t = SymbolTable::new();
+            t.intern("shared-base-sym");
+            t
+        });
+        let mut ext = SymbolTable::with_base(base);
+        let base_sym = ext.intern("shared-base-sym"); // resolves in base
+        let priv_sym = ext.intern("actor-private-sym"); // extension-only
+        assert!(ext.is_base(base_sym));
+        assert!(!ext.is_base(priv_sym));
+
+        // Bare base symbol: fast path is safe.
+        assert!(matches!(
+            deep_clone_same_worker(&Value::Symbol(base_sym), &ext),
+            Ok(Some(_))
+        ));
+
+        // Non-base symbol NESTED inside a pair: must bail.
+        let nested_pair = Value::Pair(Pair::new(
+            Value::Symbol(base_sym),
+            Value::Pair(Pair::new(Value::Symbol(priv_sym), Value::Null)),
+        ));
+        assert!(matches!(
+            deep_clone_same_worker(&nested_pair, &ext),
+            Ok(None)
+        ));
+
+        // Non-base symbol NESTED inside a vector: must bail too.
+        let nested_vec = Value::Vector(cs_core::Gc::new(std::cell::RefCell::new(vec![
+            Value::Fixnum(1),
+            Value::Symbol(priv_sym),
+        ])));
+        assert!(matches!(
+            deep_clone_same_worker(&nested_vec, &ext),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn same_worker_queue_is_fifo() {
+        // Multiple fast-path messages parked for one receiver come back out in
+        // send order (front-first), with the seq stamps matching the markers.
+        let pid = ActorPid {
+            node: 0,
+            local_id: 0x5A5A_0001,
+        };
+        for n in [10_i64, 20, 30] {
+            let seq = SAME_WORKER_MSGS.with(|m| {
+                let mut m = m.borrow_mut();
+                let q = m.entry(pid).or_default();
+                let seq = q.next_seq;
+                q.next_seq += 1;
+                seq
+            });
+            commit_same_worker_msg(pid, seq, Value::Fixnum(n));
+        }
+        let mut syms = SymbolTable::new();
+        assert_eq!(as_fixnum(&take_same_worker_msg(pid, 0, &mut syms)), 10);
+        assert_eq!(as_fixnum(&take_same_worker_msg(pid, 1, &mut syms)), 20);
+        assert_eq!(as_fixnum(&take_same_worker_msg(pid, 2, &mut syms)), 30);
+        // Queue drained; a further pop degrades to the opaque lost-message
+        // symbol rather than panicking.
+        let lost = take_same_worker_msg(pid, 3, &mut syms);
+        assert!(matches!(&lost, Value::Symbol(s) if syms.name(*s) == "same-worker-message-lost"));
+        // Clean up so we don't leave a stray entry for other tests.
+        SAME_WORKER_MSGS.with(|m| {
+            m.borrow_mut().remove(&pid);
+        });
+    }
+
+    #[test]
+    fn guard_drops_pending_queue_on_actor_death() {
+        // An actor that terminates with fast-path mail still queued must not
+        // leak it: the RAII guard removes the actor's whole side-queue on drop.
+        let pid = ActorPid {
+            node: 0,
+            local_id: 0x5A5A_0002,
+        };
+        commit_same_worker_msg(pid, 0, Value::Fixnum(7));
+        assert!(SAME_WORKER_MSGS.with(|m| m.borrow().contains_key(&pid)));
+        {
+            let _guard = SameWorkerGuard(pid);
+            // guard live: entry still present.
+            assert!(SAME_WORKER_MSGS.with(|m| m.borrow().contains_key(&pid)));
+        }
+        // guard dropped: entry (and its pending value) gone.
+        assert!(!SAME_WORKER_MSGS.with(|m| m.borrow().contains_key(&pid)));
     }
 
     #[test]
