@@ -374,3 +374,81 @@ fn vector_fill_after_demotion_is_not_shadowed_by_stale_tombstone() {
 // builds the demoted hashtable directly against `cs_core::Hashtable`
 // (the same API `b_hashtable_set` uses) and defines it straight
 // into `vm_env`, which requires access to that private field.
+
+#[test]
+fn innocent_slot_survives_cycle_through_other_slot() {
+    // cw-97b regression: container-rooted cycle detection fires when
+    // a cycle runs through ANY slot, but the mutation-site demote
+    // targets the slot just written. Without the participation gate
+    // (`value_reaches_container`), a cycle through slot A destroys
+    // the innocent acyclic value freshly written into slot B — found
+    // in the field as record setters (vector-backed) silently losing
+    // writes under the VM tier. Covers all three container types.
+    let mut rt = Runtime::new();
+
+    // vector: cycle v -> w -> v through slot 0; innocent write to slot 1
+    rt.eval_str(
+        "<vec_setup>",
+        r"
+        (define v (vector #f #f))
+        (define w (vector v))
+        (vector-set! v 0 w)
+        (define x (list 1 2))
+        (define x2 x) (define x3 x)   ; strong count above the demote baseline
+        (vector-set! v 1 x)
+        (set! x #f) (set! x2 #f) (set! x3 #f)
+        ",
+    )
+    .expect("eval ok");
+    let got = rt
+        .eval_str("<vec_verify>", "(equal? (vector-ref v 1) '(1 2))")
+        .expect("ref");
+    assert!(
+        matches!(got, cs_core::Value::Boolean(true)),
+        "innocent vector slot lost to a cycle through another slot: {got:?}"
+    );
+
+    // pair: cycle p -> q -> p through cdr; innocent write to car
+    rt.eval_str(
+        "<pair_setup>",
+        r"
+        (define p (cons #f #f))
+        (define q (cons p '()))
+        (set-cdr! p q)
+        (define y (list 3 4))
+        (define y2 y) (define y3 y)
+        (set-car! p y)
+        (set! y #f) (set! y2 #f) (set! y3 #f)
+        ",
+    )
+    .expect("eval ok");
+    let got = rt
+        .eval_str("<pair_verify>", "(equal? (car p) '(3 4))")
+        .expect("car");
+    assert!(
+        matches!(got, cs_core::Value::Boolean(true)),
+        "innocent car lost to a cycle through cdr: {got:?}"
+    );
+
+    // hashtable: cycle through one value; innocent write to another
+    rt.eval_str(
+        "<ht_setup>",
+        r"
+        (define h (make-eq-hashtable))
+        (define hv (vector h))
+        (hashtable-set! h 'cyc hv)
+        (define z (list 5 6))
+        (define z2 z) (define z3 z)
+        (hashtable-set! h 'val z)
+        (set! z #f) (set! z2 #f) (set! z3 #f)
+        ",
+    )
+    .expect("eval ok");
+    let got = rt
+        .eval_str("<ht_verify>", "(equal? (hashtable-ref h 'val #f) '(5 6))")
+        .expect("ht-ref");
+    assert!(
+        matches!(got, cs_core::Value::Boolean(true)),
+        "innocent hashtable value lost to a cycle through another entry: {got:?}"
+    );
+}
